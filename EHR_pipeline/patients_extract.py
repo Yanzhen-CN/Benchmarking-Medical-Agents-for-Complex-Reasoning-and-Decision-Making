@@ -11,7 +11,7 @@ BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
 ADMISSIONS_FILE = RAW_DATA_DIR / "hosp" / "admissions.csv"
 PATIENTS_FILE = RAW_DATA_DIR / "hosp" / "patients.csv"
 
-MIN_VISITS = 4
+MIN_VISITS = 3
 
 
 # Load data
