@@ -8,8 +8,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent  # 如果脚本在 LongTermBen
 RAW_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
 BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
 
-ADMISSIONS_FILE = RAW_DATA_DIR / "admissions.csv"
-PATIENTS_FILE = RAW_DATA_DIR / "patients.csv"
+ADMISSIONS_FILE = RAW_DATA_DIR / "hosp" / "admissions.csv"
+PATIENTS_FILE = RAW_DATA_DIR / "hosp" / "patients.csv"
 
 MIN_VISITS = 4
 
@@ -26,6 +26,13 @@ visit_group = (
     .groupby("subject_id")["hadm_id"]
     .agg(list)
     .reset_index()
+)
+# extract race from first admissions
+admissions_sorted = admissions.sort_values("admittime")
+race_map = (
+    admissions_sorted
+    .groupby("subject_id")["race"]
+    .first()
 )
 
 # Count number of visits per patient
@@ -82,7 +89,7 @@ for _, row in patient_index.iterrows():
     patient_json = {
         "patient_id": pid,
         "gender": meta.get("gender"),
-        "race": meta.get("race"),
+        "race": race_map.get(subj),
         # anchor_age is used as age at first visit
         "age_first_visit": int(meta.get("anchor_age")),
     }
