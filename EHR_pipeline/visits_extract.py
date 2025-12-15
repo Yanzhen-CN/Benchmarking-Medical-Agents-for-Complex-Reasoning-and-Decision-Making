@@ -9,7 +9,7 @@ BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
 
 ADMISSIONS_FILE = RAW_DATA_DIR / "hosp"/ "admissions.csv"
 NOTES_FILE = RAW_DATA_DIR / "note" / "discharge.csv"
-PATIENT_INDEX_FILE = BENCH_DATA_DIR / "hosp"/ "patient_index.csv"
+PATIENT_INDEX_FILE = BENCH_DATA_DIR / "patient_index.csv"
 
 DEMO_MODE = True
 DEMO_N = 5
