@@ -7,7 +7,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
 BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
 
-ADMISSIONS_FILE = RAW_DATA_DIR / "hosp"/ "admissions.csv"
+ADMISSIONS_FILE = RAW_DATA_DIR / "hosp" / "admissions.csv"
 NOTES_FILE = RAW_DATA_DIR / "note" / "discharge.csv"
 PATIENT_INDEX_FILE = BENCH_DATA_DIR / "patient_index.csv"
 
@@ -15,6 +15,7 @@ DEMO_MODE = True
 DEMO_N = 5
 
 # Load data
+print("Loading source data...")
 admissions = pd.read_csv(
     ADMISSIONS_FILE,
     parse_dates=["admittime", "dischtime"]
@@ -24,70 +25,100 @@ notes = pd.read_csv(NOTES_FILE)
 
 # Optional demo mode
 if DEMO_MODE:
+    print(f"[DEMO MODE] Processing first {DEMO_N} patients.")
     patient_index = patient_index.head(DEMO_N)
 
-# Build visits skeleton
+# Build visits and integrate into patient JSON
+print("Building visits and updating patient JSON files...")
+patients_processed = 0
+total_visits_created = 0
+patients_with_full_notes = 0
+
 for _, row in patient_index.iterrows():
     pid = row["patient_id"]
     subj = row["subject_id"]
-
-    # Filter admissions for this patient
+    
+    # Path to the patient's primary JSON file
+    patient_json_path = BENCH_DATA_DIR / "patients" / f"{pid}.json"
+    
+    # Load existing patient.json generated in Step 1
+    if not patient_json_path.exists():
+        print(f"Warning: Patient file {patient_json_path} not found. Skipping.")
+        continue
+        
+    with open(patient_json_path) as f:
+        patient_data = json.load(f)
+    
+    # Filter admissions for this patient and sort by time
     patient_adm = admissions[admissions["subject_id"] == subj].copy()
     patient_adm = patient_adm.sort_values("admittime").reset_index(drop=True)
-
-    # Create visits directory
-    visits_dir = BENCH_DATA_DIR / "patients" / pid / "visits"
-    visits_dir.mkdir(parents=True, exist_ok=True)
-
-    visit_list = []
-    for i, adm_row in enumerate(patient_adm.itertuples()):
-        visit_id = f"{pid}-V{i+1}"
+    
+    # Build the visits list for this patient
+    visits_list = []
+    has_full_note = True  # Initialize to True, will be set to False if any visit lacks a note
+    
+    for i, adm_row in enumerate(patient_adm.itertuples(), start=1):
+        visit_id = f"{pid}-V{i}"
         hadm_id = int(adm_row.hadm_id)
-
+        
         # Extract discharge summary as ground truth note
         note_rows = notes[notes["hadm_id"] == hadm_id]
         if len(note_rows) > 0:
             ground_truth_note = note_rows.iloc[0]["text"]
-            has_note = True
+            current_visit_has_note = True
         else:
             ground_truth_note = None
-            has_note = False
-
-        visit_json = {
+            current_visit_has_note = False
+            has_full_note = False  # At least one visit lacks a note
+        
+        # Create the visit object according to our target schema
+        visit_obj = {
             "visit_id": visit_id,
             "hadm_id": hadm_id,
             "admit_time": adm_row.admittime.strftime("%Y-%m-%d %H:%M:%S"),
             "discharge_time": adm_row.dischtime.strftime("%Y-%m-%d %H:%M:%S"),
-            "ground_truth_note": ground_truth_note,
-            "has_note": has_note
-            # admission_info, discharge_info, summary -> 后续 Step (LLM)
-            # event_stream -> Step 3
+            "admission_type": str(adm_row.admission_type) if hasattr(adm_row, 'admission_type') else None,
+            "admission_info": {
+                # Populate with fields from admissions.csv as needed
+                "admission_location": str(adm_row.admission_location) if hasattr(adm_row, 'admission_location') else None,
+                "insurance": str(adm_row.insurance) if hasattr(adm_row, 'insurance') else None,
+                # Add other admission-related fields here
+            },
+            "discharge_info": {
+                # Will be populated in a later step if needed
+            },
+            "event_stream": [],  # To be populated by Step 3
+            "summary": {},       # To be populated by a later summarization step
+            "ground_truth_note": ground_truth_note
         }
-
-        visit_file = visits_dir / f"V{i+1}.json"
-        with open(visit_file, "w") as f:
-            json.dump(visit_json, f, indent=2)
-
-        visit_list.append(visit_json)
-
-    # Build patient-level support flags
-    patient_json_path = BENCH_DATA_DIR / "patients" / pid / "patient.json"
-
-    # Load existing patient.json generated in Step 1
-    with open(patient_json_path) as f:
-        patient_json = json.load(f)
-
-    # Add support flags
-    patient_json["support"] = {
-        "event_stream": True,  # 所有 patient 默认可用
-        "has_full_note": all(v["has_note"] for v in visit_list)  # 全部 visit 有 note 才为 True
+        
+        visits_list.append(visit_obj)
+        total_visits_created += 1
+    
+    # Update the patient data structure
+    patient_data["visits"] = visits_list
+    
+    # Add support flags at the patient level
+    patient_data["support"] = {
+        "event_stream": True,  # All patients have event streams (to be populated)
+        "has_full_note": has_full_note
     }
+    
+    # Save the updated patient data back to the same JSON file
+    with open(patient_json_path, 'w') as f:
+        json.dump(patient_data, f, indent=2, ensure_ascii=False)
+    
+    patients_processed += 1
+    if has_full_note:
+        patients_with_full_notes += 1
 
-    # Save updated patient.json
-    with open(patient_json_path, "w") as f:
-        json.dump(patient_json, f, indent=2)
-
-print(
-    f"Step 2 complete: visits skeleton + ground truth + flags built"
-    f"{f' (demo mode: first {DEMO_N} samples)' if DEMO_MODE else ''}."
-)
+# Summary
+print("\n" + "="*50)
+print("STEP 2 COMPLETE")
+print(f"  Patients processed: {patients_processed}")
+print(f"  Total visits created: {total_visits_created}")
+print(f"  Patients with notes for all visits: {patients_with_full_notes}")
+print(f"  Output updated in: {BENCH_DATA_DIR / 'patients'}")
+if DEMO_MODE:
+    print(f"  Mode: DEMO (first {DEMO_N} patients)")
+print("="*50)
