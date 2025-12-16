@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import pandas as pd
+from note_slicing import split_note_to_adm_discharge
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
@@ -68,10 +69,17 @@ def main():
 
             note_text = discharge_map.get((subject_id, hadm_id))
             v["ground_truth_note"] = note_text  # 找不到则为 None
+            if not note_text:
+                # 没有 note，就保持 admission_note/discharge_note 为 None
+                v.setdefault("admission_info", {})["admission_note"] = None
+                v.setdefault("discharge_info", {})["discharge_note"] = None
+                continue
 
-            # 如果你也想同步写入 discharge_info.discharge_note，可以打开下面两行
-            # if "discharge_info" in v:
-            #     v["discharge_info"]["discharge_note"] = note_text
+            parsed = split_note_to_adm_discharge(note_text)
+
+            # 关键：写回到你 JSON 里对应位置
+            v.setdefault("admission_info", {})["admission_note"] = parsed.get("admission_info")
+            v.setdefault("discharge_info", {})["discharge_note"] = parsed.get("discharge_info")
 
             if note_text is not None:
                 updated += 1
