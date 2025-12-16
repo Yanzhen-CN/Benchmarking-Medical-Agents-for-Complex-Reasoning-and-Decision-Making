@@ -63,6 +63,31 @@ def _filter_by_hadm(df: pd.DataFrame, hadm_ids: Set[int]) -> pd.DataFrame:
     return df[df["hadm_id"].isin(hadm_ids)].copy()
 
 
+def assign_visit_ids(visits: List[Dict[str, Any]]) -> None:
+    """
+    Assign visit_id (V1, V2, ...) in-place.
+
+    Rule:
+      - Use the original order in patient["visits"] for stability.
+      - If you want chronological visit_id later, sort visits by admittime first.
+    """
+    for i, v in enumerate(visits, start=1):
+        v["visit_id"] = f"V{i}"
+
+
+def assign_event_ids(events: List[Dict[str, Any]], patient_id: str, visit_id: str) -> None:
+    """
+    Assign event_id (P0001-V1-E001) in-place, based on the final sorted event_stream.
+
+    Rule:
+      event_id = {patient_id}-{visit_id}-E{seq}
+      where seq is 1..N within the visit.
+    """
+    for i, e in enumerate(events, start=1):
+        width = max(2, len(str(i)))  # E01..E99
+        e["event_id"] = f"{patient_id}-{visit_id}-E{i:0{width}d}"
+
+
 # ============================================================
 # Table loading
 # ============================================================
@@ -387,7 +412,14 @@ def main():
         with open(pf, "r", encoding="utf-8") as f:
             patient = json.load(f)
 
-        for visit in patient.get("visits", []):
+        # Keep patient_id aligned with the file naming convention: Pxxxx.json -> "Pxxxx"
+        patient_id = patient.get("patient_id") or pf.stem
+        patient["patient_id"] = patient_id
+
+        visits = patient.get("visits", [])
+        assign_visit_ids(visits)
+
+        for visit in visits:
             hadm_id = int(visit["hadm_id"])
             events: List[Dict[str, Any]] = []
 
@@ -395,14 +427,17 @@ def main():
             events.extend(build_lab_events(lab_df, hadm_id))
             events.extend(build_vital_events(vital_df, hadm_id))
 
-            # Keep other event types as one-record-per-event
+            # Keep other event types as one-record-per-event (then sort globally by timestamp)
             events.extend(build_med_events(med_df, hadm_id))
             events.extend(build_imaging_events(img_df, hadm_id))
             events.extend(build_procedure_events(proc_df, hadm_id))
 
-            # Drop events without timestamps and sort chronologically.
+            # Drop events without timestamps and sort deterministically.
             events = [e for e in events if e.get("timestamp") is not None]
-            events.sort(key=lambda x: x["timestamp"])
+            events.sort(key=lambda x: (x["timestamp"], str(x.get("type", ""))))
+
+            # Assign Pxxxx-Vy-E01 style ids after sorting.
+            assign_event_ids(events, patient_id=patient_id, visit_id=visit["visit_id"])
 
             visit["event_stream"] = events
 
@@ -412,7 +447,7 @@ def main():
 
         print(f"Updated {pf.name}")
 
-    print("STEP 2 COMPLETE: event_stream populated.")
+    print("STEP 2 COMPLETE: event_stream populated with visit_id and event_id.")
 
 
 if __name__ == "__main__":
