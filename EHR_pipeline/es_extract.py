@@ -18,27 +18,53 @@ def load_patient_files():
 
 def load_events():
     print("Loading event tables...")
-
+    # lab
     lab_df = pd.read_csv(
         RAW_DATA_DIR / "labevents_extract.csv",
         parse_dates=["charttime"]
     )
 
+    d_lab = pd.read_csv(
+        RAW_DATA_DIR / "hosp" / "d_labitems.csv"
+    )
+
+    lab_df = lab_df.merge(
+        d_lab[["itemid", "label", "category", "fluid"]],
+        on="itemid",
+        how="left"
+    )
+
+    # vital
     vital_df = pd.read_csv(
         RAW_DATA_DIR / "chartevents_extract.csv",
         parse_dates=["charttime"]
     )
 
+    d_items = pd.read_csv(
+        RAW_DATA_DIR / "icu" / "d_items.csv"
+    )
+
+    vital_df = vital_df.merge(
+        d_items[
+            ["itemid", "label", "unitname", "lownormalvalue", "highnormalvalue"]
+        ],
+        on="itemid",
+        how="left"
+    )
+    
+    # med
     med_df = pd.read_csv(
         RAW_DATA_DIR / "hosp" / "prescriptions.csv",
         parse_dates=["starttime"]
     )
 
+    # image
     img_df = pd.read_csv(
         RAW_DATA_DIR / "note" / "radiology.csv",
         parse_dates=["charttime"]
     )
 
+    # procedure
     proc_df = pd.read_csv(
         RAW_DATA_DIR / "hosp" / "procedures_icd.csv"
     )
