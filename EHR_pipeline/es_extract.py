@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 
@@ -13,17 +13,17 @@ DEMO_N = 5
 
 
 # ============================================================
-# Utility helpers
+# Utilities
 # ============================================================
 def _fmt_ts(x) -> Optional[str]:
-    """Format a pandas Timestamp/datetime into a normalized string."""
+    """Convert datetime-like value to a normalized timestamp string."""
     if x is None or pd.isna(x):
         return None
     return pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _nan_to_none(x):
-    """Convert NaN/NA to None for strict JSON output."""
+    """Convert NaN/NA to None for strict JSON serialization."""
     return None if pd.isna(x) else x
 
 
@@ -35,7 +35,7 @@ def load_patient_files() -> List[Path]:
 
 
 def collect_hadm_ids(patient_files: List[Path]) -> Set[int]:
-    """Collect hadm_id set from the selected patient JSON files."""
+    """Collect the set of hadm_id values referenced by selected patient JSONs."""
     hadm_ids: Set[int] = set()
     for pf in patient_files:
         with open(pf, "r", encoding="utf-8") as f:
@@ -52,7 +52,7 @@ def collect_hadm_ids(patient_files: List[Path]) -> Set[int]:
 
 
 def _filter_by_hadm(df: pd.DataFrame, hadm_ids: Set[int]) -> pd.DataFrame:
-    """Filter dataframe rows by hadm_id cohort set (robust casting)."""
+    """Filter a dataframe to the cohort hadm_ids, with robust casting."""
     if df.empty or "hadm_id" not in df.columns:
         return df
 
@@ -68,12 +68,13 @@ def _filter_by_hadm(df: pd.DataFrame, hadm_ids: Set[int]) -> pd.DataFrame:
 # ============================================================
 def load_events(hadm_ids: Set[int]):
     """
-    Load extracted event tables and filter to the cohort hadm_ids.
+    Load extracted event tables and filter them to the cohort.
 
-    Notes:
-      - We assume lab/vital extracts are already size-controlled.
-      - We still apply usecols/dtype for stability and performance.
-      - warning is normalized to an integer column (warning_int).
+    Design choices:
+      - Use usecols/dtype to reduce unnecessary I/O and stabilize parsing.
+      - Normalize vital 'warning' into an integer column 'warning_int' to avoid
+        string-vs-int comparisons (e.g., '1' vs 1).
+      - Prefer extracted medication/imaging files if present.
     """
     print("Loading event tables...")
 
@@ -98,12 +99,7 @@ def load_events(hadm_ids: Set[int]):
     d_lab = pd.read_csv(
         RAW_DATA_DIR / "hosp" / "d_labitems.csv",
         usecols=["itemid", "label", "category", "fluid"],
-        dtype={
-            "itemid": "Int64",
-            "label": "string",
-            "category": "string",
-            "fluid": "string",
-        },
+        dtype={"itemid": "Int64", "label": "string", "category": "string", "fluid": "string"},
         low_memory=False,
     )
     lab_df = lab_df.merge(d_lab, on="itemid", how="left")
@@ -119,17 +115,13 @@ def load_events(hadm_ids: Set[int]):
             "hadm_id": "Int64",
             "itemid": "Int64",
             "value": "string",
-            # Read as string first to avoid mixed '1'/'1.0'/1 issues.
+            # Read as string first; normalize to int to handle mixed representations.
             "warning": "string",
         },
         low_memory=False,
     )
     vital_df = _filter_by_hadm(vital_df, hadm_ids)
-
-    # Normalize warning to integer (0/1).
-    vital_df["warning_int"] = (
-        pd.to_numeric(vital_df["warning"], errors="coerce").fillna(0).astype(int)
-    )
+    vital_df["warning_int"] = pd.to_numeric(vital_df["warning"], errors="coerce").fillna(0).astype(int)
 
     d_items = pd.read_csv(
         RAW_DATA_DIR / "icu" / "d_items.csv",
@@ -157,7 +149,7 @@ def load_events(hadm_ids: Set[int]):
         dtype={
             "hadm_id": "Int64",
             "drug": "string",
-            # Mixed types column -> enforce string to avoid DtypeWarning.
+            # Mixed-type column in MIMIC; enforce string to avoid dtype warnings.
             "dose_val_rx": "string",
             "dose_unit_rx": "string",
             "route": "string",
@@ -167,7 +159,7 @@ def load_events(hadm_ids: Set[int]):
     med_df = _filter_by_hadm(med_df, hadm_ids)
 
     # ----------------------------
-    # Imaging reports (prefer extracted if available)
+    # Imaging (prefer extracted if available)
     # ----------------------------
     img_path = RAW_DATA_DIR / "radiology_extract.csv"
     if not img_path.exists():
@@ -183,7 +175,7 @@ def load_events(hadm_ids: Set[int]):
     img_df = _filter_by_hadm(img_df, hadm_ids)
 
     # ----------------------------
-    # Procedures (with chartdate)
+    # Procedures (add timestamp via chartdate)
     # ----------------------------
     proc_df = pd.read_csv(
         RAW_DATA_DIR / "hosp" / "procedures_icd.csv",
@@ -206,32 +198,31 @@ def load_events(hadm_ids: Set[int]):
 
 
 # ============================================================
-# Event builders (merged-by-timestamp panels)
+# Event builders (merge by timestamp only)
 # ============================================================
-def build_lab_panel_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
+def build_lab_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
     """
-    Build merged lab panels.
+    Build lab events merged strictly by charttime.
 
-    Grouping rule:
-      - (charttime, fluid) -> one lab_panel event
-    Rationale:
-      - Avoid exploding the context with many single-item lab events.
-      - fluid helps separate different specimen types at the same timestamp.
+    Output format:
+      - One event per unique charttime
+      - Each event contains an 'items' list of lab measurements
     """
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
 
     rows = rows.dropna(subset=["charttime"])
-    events: List[Dict[str, Any]] = []
 
-    for (ct, fluid), g in rows.groupby(["charttime", "fluid"], dropna=False):
+    events: List[Dict[str, Any]] = []
+    for ct, g in rows.groupby("charttime"):
         items = []
         for r in g.to_dict("records"):
             items.append(
                 {
                     "name": _nan_to_none(r.get("label")),
                     "category": _nan_to_none(r.get("category")),
+                    "fluid": _nan_to_none(r.get("fluid")),
                     "value_num": _nan_to_none(r.get("valuenum")),
                     "value_text": _nan_to_none(r.get("value")),
                     "unit": _nan_to_none(r.get("valueuom")),
@@ -242,8 +233,7 @@ def build_lab_panel_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any
         events.append(
             {
                 "timestamp": _fmt_ts(ct),
-                "type": "lab_panel",
-                "fluid": _nan_to_none(fluid),
+                "type": "lab",
                 "items": items,
             }
         )
@@ -251,40 +241,41 @@ def build_lab_panel_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any
     return events
 
 
-def build_vital_panel_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
+def build_vital_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
     """
-    Build merged vital panels.
+    Build vital events merged strictly by charttime.
 
-    Grouping rule:
-      - charttime -> one vital_panel event
     Notes:
-      - The event-level flag is set if any item at that timestamp is warning.
+      - Each item can carry a per-item flag.
+      - The event-level flag is set to 'warning' if any item is warning.
     """
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
 
     rows = rows.dropna(subset=["charttime"])
-    events: List[Dict[str, Any]] = []
 
+    events: List[Dict[str, Any]] = []
     for ct, g in rows.groupby("charttime"):
         any_warning = bool((g["warning_int"] == 1).any()) if "warning_int" in g.columns else False
 
         items = []
         for r in g.to_dict("records"):
+            item_warning = (int(r.get("warning_int", 0)) == 1) if r.get("warning_int") is not None else False
             items.append(
                 {
                     "name": _nan_to_none(r.get("label")),
                     "value_num": _nan_to_none(r.get("valuenum")),
                     "value_text": _nan_to_none(r.get("value")),
                     "unit": _nan_to_none(r.get("unitname")),
+                    "flag": "warning" if item_warning else None,
                 }
             )
 
         events.append(
             {
                 "timestamp": _fmt_ts(ct),
-                "type": "vital_panel",
+                "type": "vital",
                 "flag": "warning" if any_warning else None,
                 "items": items,
             }
@@ -294,12 +285,13 @@ def build_vital_panel_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, A
 
 
 def build_med_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """Build medication events (one row -> one event)."""
+    """Build medication events (one record -> one event)."""
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
 
     rows = rows.dropna(subset=["starttime"])
+
     events = []
     for r in rows.to_dict("records"):
         events.append(
@@ -316,12 +308,13 @@ def build_med_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
 
 
 def build_imaging_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """Build imaging report events (one row -> one event)."""
+    """Build imaging events (one record -> one event)."""
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
 
     rows = rows.dropna(subset=["charttime"])
+
     events = []
     for r in rows.to_dict("records"):
         events.append(
@@ -339,7 +332,7 @@ def build_procedure_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any
     Build procedure events.
 
     Timestamp rule:
-      - Use chartdate with a default time of 00:00:00 (date-level precision in MIMIC).
+      - Use chartdate with default time 00:00:00 (date-level precision).
     """
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
@@ -363,7 +356,6 @@ def build_procedure_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any
                 "name": _nan_to_none(title),
             }
         )
-
     return events
 
 
@@ -384,19 +376,22 @@ def main():
             hadm_id = int(visit["hadm_id"])
             events: List[Dict[str, Any]] = []
 
-            events.extend(build_lab_panel_events(lab_df, hadm_id))
-            events.extend(build_vital_panel_events(vital_df, hadm_id))
+            # Merge-by-time for lab/vital
+            events.extend(build_lab_events(lab_df, hadm_id))
+            events.extend(build_vital_events(vital_df, hadm_id))
+
+            # Keep other event types as one-record-per-event
             events.extend(build_med_events(med_df, hadm_id))
             events.extend(build_imaging_events(img_df, hadm_id))
             events.extend(build_procedure_events(proc_df, hadm_id))
 
-            # Remove events without timestamps and sort by time.
+            # Drop events without timestamps and sort chronologically.
             events = [e for e in events if e.get("timestamp") is not None]
             events.sort(key=lambda x: x["timestamp"])
 
             visit["event_stream"] = events
 
-        # Enforce strict JSON (do not allow NaN).
+        # Enforce strict JSON output (do not allow NaN values).
         with open(pf, "w", encoding="utf-8") as f:
             json.dump(patient, f, indent=2, ensure_ascii=False, allow_nan=False)
 
