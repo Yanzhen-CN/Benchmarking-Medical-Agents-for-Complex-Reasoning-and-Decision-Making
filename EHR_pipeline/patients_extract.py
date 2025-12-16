@@ -109,10 +109,9 @@ def main():
             visit_obj = {
                 "visit_id": f"{pid}-V{visit_idx}",
                 "hadm_id": hadm_id,
-                "admit_time": adm_row.admittime.strftime("%Y-%m-%d %H:%M:%S"),
-                "discharge_time": adm_row.dischtime.strftime("%Y-%m-%d %H:%M:%S"),
 
                 "admission_info": {
+                    "admission_time": adm_row.admittime.strftime("%Y-%m-%d %H:%M:%S"),
                     "admission_type": str(adm_row.admission_type),
                     "admission_location": str(adm_row.admission_location),
                     "insurance": str(adm_row.insurance),
@@ -120,6 +119,7 @@ def main():
                 },
 
                 "discharge_info": {
+                    "discharge_time": adm_row.dischtime.strftime("%Y-%m-%d %H:%M:%S"),
                     "discharge_location": str(adm_row.discharge_location),
                     "discharge_note": None
                 },
