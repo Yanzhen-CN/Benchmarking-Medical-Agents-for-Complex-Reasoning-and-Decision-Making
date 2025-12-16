@@ -32,17 +32,17 @@ def load_events():
     )
 
     med_df = pd.read_csv(
-        RAW_EVENT_DIR / "prescriptions_extract.csv",
+        RAW_EVENT_DIR / "hosp"/ "prescriptions.csv",
         parse_dates=["starttime"]
     )
 
     img_df = pd.read_csv(
-        RAW_EVENT_DIR / "radiology_extract.csv",
+        RAW_EVENT_DIR / "note"/ "radiology_extract.csv",
         parse_dates=["charttime"]
     )
 
     proc_df = pd.read_csv(
-        RAW_EVENT_DIR / "procedures_extract.csv",
+        RAW_EVENT_DIR / "hosp"/ "procedures_extract.csv",
         parse_dates=["charttime"]
     )
 
