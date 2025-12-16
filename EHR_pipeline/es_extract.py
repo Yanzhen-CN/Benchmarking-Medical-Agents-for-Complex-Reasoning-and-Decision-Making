@@ -285,25 +285,40 @@ def build_vital_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
 
 
 def build_med_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """Build medication events (one record -> one event)."""
+    """
+    Build medication events merged strictly by starttime.
+
+    Output format:
+      - One event per unique starttime
+      - Each event contains an 'items' list of administered/started medications
+    """
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
 
     rows = rows.dropna(subset=["starttime"])
 
-    events = []
-    for r in rows.to_dict("records"):
+    events: List[Dict[str, Any]] = []
+    for st, g in rows.groupby("starttime"):
+        items = []
+        for r in g.to_dict("records"):
+            items.append(
+                {
+                    "name": _nan_to_none(r.get("drug")),
+                    "dose": _nan_to_none(r.get("dose_val_rx")),
+                    "unit": _nan_to_none(r.get("dose_unit_rx")),
+                    "route": _nan_to_none(r.get("route")),
+                }
+            )
+
         events.append(
             {
-                "timestamp": _fmt_ts(r.get("starttime")),
+                "timestamp": _fmt_ts(st),
                 "type": "medication",
-                "name": _nan_to_none(r.get("drug")),
-                "dose": _nan_to_none(r.get("dose_val_rx")),
-                "unit": _nan_to_none(r.get("dose_unit_rx")),
-                "route": _nan_to_none(r.get("route")),
+                "items": items,
             }
         )
+
     return events
 
 
