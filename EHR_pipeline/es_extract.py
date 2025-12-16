@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-RAW_EVENT_DIR = ROOT_DIR / "EHR_pipeline" / "raw_event"
+RAW_EVENT_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
 BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
 
 DEMO_MODE = True
