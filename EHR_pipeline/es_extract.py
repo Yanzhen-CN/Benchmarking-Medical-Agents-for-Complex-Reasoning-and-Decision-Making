@@ -37,12 +37,12 @@ def load_events():
     )
 
     img_df = pd.read_csv(
-        RAW_EVENT_DIR / "note"/ "radiology_extract.csv",
+        RAW_EVENT_DIR / "note"/ "radiology.csv",
         parse_dates=["charttime"]
     )
 
     proc_df = pd.read_csv(
-        RAW_EVENT_DIR / "hosp"/ "procedures_extract.csv",
+        RAW_EVENT_DIR / "hosp"/ "procedures.csv",
         parse_dates=["charttime"]
     )
 
