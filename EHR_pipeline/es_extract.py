@@ -437,9 +437,12 @@ def main():
             events.sort(key=lambda x: (x["timestamp"], str(x.get("type", ""))))
 
             # Assign Pxxxx-Vy-E01 style ids after sorting.
-            assign_event_ids(events, patient_id=patient_id, visit_id=visit["visit_id"])
+            new_events = []
+            for i, e in enumerate(events, start=1):
+                eid = f"{patient_id}-{visit['visit_id']}-E{i:03d}"
+                new_events.append({"event_id": eid, **e})  # id first, then original fields
 
-            visit["event_stream"] = events
+            visit["event_stream"] = new_events
 
         # Enforce strict JSON output (do not allow NaN values).
         with open(pf, "w", encoding="utf-8") as f:
