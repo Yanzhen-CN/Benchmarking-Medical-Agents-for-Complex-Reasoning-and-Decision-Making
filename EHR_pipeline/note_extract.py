@@ -78,8 +78,8 @@ def main():
             parsed = split_note_to_adm_discharge(note_text)
 
             # 关键：写回到你 JSON 里对应位置
-            v.setdefault("admission_info", {})["admission_note"] = parsed.get("admission_info")
-            v.setdefault("discharge_info", {})["discharge_note"] = parsed.get("discharge_info")
+            v.setdefault("admission_info", {})["admission_note"] = parsed.get("admission_note")
+            v.setdefault("discharge_info", {})["discharge_note"] = parsed.get("discharge_note")
 
             if note_text is not None:
                 updated += 1

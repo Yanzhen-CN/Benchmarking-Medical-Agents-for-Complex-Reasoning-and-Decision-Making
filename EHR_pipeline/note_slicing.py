@@ -95,7 +95,7 @@ def split_note_to_adm_discharge(text: str) -> Dict[str, Any]:
             discharge_physical_exam = _clean(pe_block[m.start():])
 
     # Build outputs using your new schema
-    admission_info = {
+    admission_note = {
         "allergies": sections.get("Allergies"),
         "attending": sections.get("Attending"),
         "chief_complaint": sections.get("Chief Complaint"),
@@ -104,7 +104,7 @@ def split_note_to_adm_discharge(text: str) -> Dict[str, Any]:
         "family_history": sections.get("Family History"),
     }
 
-    discharge_info = {
+    discharge_note = {
         "procedures": sections.get("Major Surgical or Invasive Procedure"),
         "physical_exam": discharge_physical_exam,
         "hospital_course": sections.get("Brief Hospital Course"),
@@ -115,7 +115,7 @@ def split_note_to_adm_discharge(text: str) -> Dict[str, Any]:
         "followup_instructions": sections.get("Followup Instructions"),
     }
 
-    return {"admission_info": admission_info, "discharge_info": discharge_info}
+    return {"admission_info": admission_note, "discharge_info": discharge_note}
 
 
 def _assert_contains(s: Optional[str], needle: str, msg: str) -> None:
