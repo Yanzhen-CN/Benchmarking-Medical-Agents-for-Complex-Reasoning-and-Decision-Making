@@ -12,12 +12,84 @@ DIAGNOSES_FILE = RAW_DATA_DIR / "hosp" / "diagnoses_icd.csv"
 D_ICD_FILE = RAW_DATA_DIR / "hosp" / "d_icd_diagnoses.csv"
 
 MIN_VISITS = 3
+ANALYZE_MODE = True   # True: only analyze cohort + export stats (no JSON)
 DEMO_MODE = True
 DEMO_N = 5
+
+
+def analyze_and_export_cohort(admissions: pd.DataFrame) -> None:
+    """
+    Analyze cohort size for different visit thresholds and export CSV outputs
+    similar to patient_index.
+
+    Outputs under: bench_data/cohort_analysis/
+      - subject_index_all.csv
+      - visit_threshold_stats.csv
+      - subject_index_eligible_min_visits.csv
+    """
+    out_dir = BENCH_DATA_DIR / "cohort_analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # patient-index-like: subject_id -> [hadm_id list], n_visits
+    visit_group = admissions.groupby("subject_id")["hadm_id"].agg(list).reset_index()
+    visit_group["n_visits"] = visit_group["hadm_id"].apply(len)
+    visit_group = visit_group.sort_values("subject_id").reset_index(drop=True)
+
+    # export: all subjects
+    subject_index_all = visit_group.copy()
+    subject_index_all["visit_ids"] = subject_index_all["hadm_id"].apply(
+        lambda xs: ";".join(str(x) for x in xs)
+    )
+    subject_index_all = subject_index_all[["subject_id", "n_visits", "visit_ids"]]
+    subject_index_all.to_csv(out_dir / "subject_index_all.csv", index=False)
+
+    # export: threshold stats visit >= k
+    total_patients = int(len(visit_group))
+    max_visits = int(visit_group["n_visits"].max()) if total_patients else 0
+
+    # choose ks: 1..min(max,20) + some larger cutoffs + MIN_VISITS
+    ks = list(range(1, min(max_visits, 20) + 1))
+    for k in [MIN_VISITS, 25, 30, 40, 50, 75, 100]:
+        if 1 <= k <= max_visits and k not in ks:
+            ks.append(k)
+    ks = sorted(ks)
+
+    rows = []
+    for k in ks:
+        cnt = int((visit_group["n_visits"] >= k).sum())
+        pct = (cnt / total_patients * 100.0) if total_patients else 0.0
+        rows.append({"min_visits": k, "n_patients": cnt, "percent": round(pct, 4)})
+
+    stats_df = pd.DataFrame(rows)
+    stats_df.to_csv(out_dir / "visit_threshold_stats.csv", index=False)
+
+    # export: eligible cohort for MIN_VISITS
+    eligible = visit_group[visit_group["n_visits"] >= MIN_VISITS].copy()
+    eligible["visit_ids"] = eligible["hadm_id"].apply(lambda xs: ";".join(str(x) for x in xs))
+    eligible = eligible[["subject_id", "n_visits", "visit_ids"]]
+    eligible.to_csv(out_dir / "subject_index_eligible_min_visits.csv", index=False)
+
+    # console summary
+    eligible_cnt = int(len(eligible))
+    pct = (eligible_cnt / total_patients * 100.0) if total_patients else 0.0
+    print("\n=== ANALYZE_MODE OUTPUT ===")
+    print(f"Total patients (>=1 visit): {total_patients}")
+    print(f"Eligible patients (n_visits >= {MIN_VISITS}): {eligible_cnt} ({pct:.2f}%)")
+    print(f"[Saved] {out_dir / 'subject_index_all.csv'}")
+    print(f"[Saved] {out_dir / 'visit_threshold_stats.csv'}")
+    print(f"[Saved] {out_dir / 'subject_index_eligible_min_visits.csv'}")
+
 
 def main():
     print("Loading source data...")
     admissions = pd.read_csv(ADMISSIONS_FILE, parse_dates=["admittime", "dischtime"])
+
+    # ✅ analyze-only path
+    if ANALYZE_MODE:
+        analyze_and_export_cohort(admissions)
+        return
+
+    # ---- your original pipeline below ----
     patients = pd.read_csv(PATIENTS_FILE)
 
     diagnoses = pd.read_csv(DIAGNOSES_FILE)
@@ -155,6 +227,7 @@ def main():
     hadm_mapping_df.to_csv(BENCH_DATA_DIR / "hadm_mapping.csv", index=False)
 
     print("STEP 1 COMPLETE")
+
 
 if __name__ == "__main__":
     main()
