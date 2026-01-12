@@ -8,7 +8,9 @@ TS_FMT = "%Y-%m-%d %H:%M:%S"
 ROOT = Path(__file__).resolve().parent
 INPUT_DIR = ROOT / "bench_data" / "patients"
 
-
+## converts a formatted eventstream json file into a list of sequences of json items
+## reads a json file in the ROOT / "bench_data" / "patients" that matches P*.json
+## output is written to the same directory with suffix _sequenced.json
 
 def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
