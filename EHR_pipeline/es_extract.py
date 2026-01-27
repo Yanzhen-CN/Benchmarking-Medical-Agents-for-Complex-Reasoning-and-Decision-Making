@@ -187,7 +187,7 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
         parse_dates=["charttime", "scheduletime"],
         dtype={
             "hadm_id": "Int64",
-            "emar_id": object,
+            "emar_id": "string",
             "medication": "string",
             "event_txt": "string",
         },
@@ -202,12 +202,11 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     emar_detail_df = pd.read_csv(
         emar_detail_path,
         usecols=[
-            "hadm_id", "emar_id", "dose_given", "dose_given_unit", 
+            "emar_id", "dose_given", "dose_given_unit", 
             "dose_due", "dose_due_unit", "route"
         ],
         dtype={
-            "hadm_id": "Int64",
-            "emar_id": object,
+            "emar_id": "string",
             "dose_given": "string",
             "dose_given_unit": "string",
             "dose_due": "string",
@@ -219,7 +218,7 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     emar_detail_df = _filter_by_hadm(emar_detail_df, hadm_ids)
 
     # merge
-    med_df = emar_df.merge(emar_detail_df, on=["hadm_id", "emar_id"], how="left")
+    med_df = emar_df.merge(emar_detail_df, on="emar_id", how="left")
 
     # Event time: prefer charttime, fallback to scheduletime
     med_df["event_time"] = med_df["charttime"].fillna(med_df["scheduletime"])
@@ -451,7 +450,7 @@ def build_med_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
                     "name": _nan_to_none(r.get("medication")),
                     "dose": _nan_to_none(dose),
                     "unit": _nan_to_none(unit),
-                    "route": _nan_to_none(r.get("route")),
+                    # "route": _nan_to_none(r.get("route")),
                     "status": _nan_to_none(r.get("event_txt")),
                 }
             )
@@ -537,12 +536,12 @@ def main():
             events: List[Dict[str, Any]] = []
 
             # build event stream
-            # events.extend(build_lab_events(lab_df, hadm_id))
-            # events.extend(build_vital_events(vital_df, hadm_id))
+            events.extend(build_lab_events(lab_df, hadm_id))
+            events.extend(build_vital_events(vital_df, hadm_id))
             # events.extend(build_pres_events(pres_df, hadm_id))
             events.extend(build_med_events(med_df,hadm_id))
-            # events.extend(build_imaging_events(img_df, hadm_id))
-            # events.extend(build_procedure_events(proc_df, hadm_id))
+            events.extend(build_imaging_events(img_df, hadm_id))
+            events.extend(build_procedure_events(proc_df, hadm_id))
 
             # Drop events without timestamps and sort deterministically.
             events = [e for e in events if e.get("timestamp") is not None]
