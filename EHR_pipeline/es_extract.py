@@ -176,16 +176,6 @@ def load_prescriptions(hadm_ids: Set[int]) -> pd.DataFrame:
 def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     """
     Load eMAR administration records and join with eMAR_detail to get dose/route.
-
-    Output columns used downstream:
-      - hadm_id
-      - emar_id
-      - charttime / scheduletime -> event_time
-      - medication
-      - event_txt (status)
-      - dose_given / dose_given_unit
-      - dose_due / dose_due_unit
-      - route
     """
     emar_path = RAW_DATA_DIR / "emar_extract.csv"
     if not emar_path.exists():
@@ -212,13 +202,8 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     emar_detail_df = pd.read_csv(
         emar_detail_path,
         usecols=[
-            "hadm_id",
-            "emar_id",
-            "dose_given",
-            "dose_given_unit",
-            "dose_due",
-            "dose_due_unit",
-            "route",
+            "hadm_id", "emar_id", "dose_given", "dose_given_unit", 
+            "dose_due", "dose_due_unit", "route"
         ],
         dtype={
             "hadm_id": "Int64",
@@ -233,28 +218,19 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     )
     emar_detail_df = _filter_by_hadm(emar_detail_df, hadm_ids)
 
-    # Join header + detail (detail can be multi-row per emar_id; we keep rows and dedup later)
+    # merge
     med_df = emar_df.merge(emar_detail_df, on=["hadm_id", "emar_id"], how="left")
 
     # Event time: prefer charttime, fallback to scheduletime
     med_df["event_time"] = med_df["charttime"].fillna(med_df["scheduletime"])
 
-    # Drop exact duplicates to avoid obvious repeated rows after join
     med_df = med_df.drop_duplicates(
         subset=[
-            "hadm_id",
-            "emar_id",
-            "event_time",
-            "medication",
-            "event_txt",
-            "dose_given",
-            "dose_given_unit",
-            "dose_due",
-            "dose_due_unit",
-            "route",
+            "hadm_id", "emar_id", "event_time", "medication", "event_txt",
+            "dose_given", "dose_given_unit", "dose_due", "dose_due_unit", "route"
         ]
     )
-
+    med_df = _filter_by_hadm(med_df, hadm_ids)
     return med_df
 
 def load_imaging(hadm_ids: Set[int]) -> pd.DataFrame:
