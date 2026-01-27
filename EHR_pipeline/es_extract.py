@@ -197,7 +197,7 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
         parse_dates=["charttime", "scheduletime"],
         dtype={
             "hadm_id": "Int64",
-            "emar_id": "Int64",
+            "emar_id": "string",
             "medication": "string",
             "event_txt": "string",
         },
@@ -222,7 +222,7 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
         ],
         dtype={
             "hadm_id": "Int64",
-            "emar_id": "Int64",
+            "emar_id": "string",
             "dose_given": "string",
             "dose_given_unit": "string",
             "dose_due": "string",
