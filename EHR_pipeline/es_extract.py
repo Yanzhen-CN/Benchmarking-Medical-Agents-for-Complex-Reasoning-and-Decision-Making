@@ -194,7 +194,7 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
         low_memory=False,
     )
     emar_df = _filter_by_hadm(emar_df, hadm_ids)
-
+    print("load emar susccess")
     emar_detail_path = RAW_DATA_DIR / "emar_detail_extract.csv"
     if not emar_detail_path.exists():
         emar_detail_path = RAW_DATA_DIR / "hosp" / "emar_detail.csv"
@@ -537,12 +537,12 @@ def main():
             events: List[Dict[str, Any]] = []
 
             # build event stream
-            events.extend(build_lab_events(lab_df, hadm_id))
-            events.extend(build_vital_events(vital_df, hadm_id))
+            # events.extend(build_lab_events(lab_df, hadm_id))
+            # events.extend(build_vital_events(vital_df, hadm_id))
             # events.extend(build_pres_events(pres_df, hadm_id))
             events.extend(build_med_events(med_df,hadm_id))
-            events.extend(build_imaging_events(img_df, hadm_id))
-            events.extend(build_procedure_events(proc_df, hadm_id))
+            # events.extend(build_imaging_events(img_df, hadm_id))
+            # events.extend(build_procedure_events(proc_df, hadm_id))
 
             # Drop events without timestamps and sort deterministically.
             events = [e for e in events if e.get("timestamp") is not None]
