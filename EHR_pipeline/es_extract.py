@@ -585,7 +585,7 @@ def main():
     vital_df = load_vital(hadm_ids)
     # pres_df = load_prescriptions(hadm_ids)
     # emar_df = load_emar(hadm_ids)
-    med_df = load_integrated_medications(hadm_id)
+    med_df = load_integrated_medications(hadm_ids)
     img_df = load_imaging(hadm_ids)
     proc_df = load_procedures(hadm_ids)
 
