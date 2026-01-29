@@ -91,6 +91,7 @@ def load_lab(hadm_ids: Set[int]):
     # ----------------------------
     # Lab events (extracted)
     # ----------------------------
+    print("  - Loading lab data...")
     lab_df = pd.read_csv(
         RAW_DATA_DIR / "labevents_extract.csv",
         usecols=["hadm_id", "itemid", "charttime", "valuenum", "value", "valueuom", "flag"],
@@ -118,7 +119,8 @@ def load_lab(hadm_ids: Set[int]):
 def load_vital(hadm_ids: Set[int]):
     # ----------------------------
     # Vital events (extracted)
-    # ----------------------------
+    # --------------------------
+    print("  - Loading vital data...")
     vital_df = pd.read_csv(
         RAW_DATA_DIR / "chartevents_extract.csv",
         usecols=["hadm_id", "itemid", "charttime", "valuenum", "value", "warning"],
@@ -152,6 +154,7 @@ def load_prescriptions(hadm_ids: Set[int]) -> pd.DataFrame:
     # ----------------------------
     # Prescriptions (prefer extracted if available)
     # ----------------------------
+    print("  - Loading prescription data...")
     pres_path = RAW_DATA_DIR / "prescriptions_extract.csv"
     if not pres_path.exists():
         pres_path = RAW_DATA_DIR / "hosp" / "prescriptions.csv"
@@ -177,6 +180,7 @@ def load_emar(hadm_ids: Set[int]) -> pd.DataFrame:
     """
     Load eMAR administration records and join with eMAR_detail to get dose/route.
     """
+    print("  - Loading emar data...")
     emar_path = RAW_DATA_DIR / "emar_extract.csv"
     if not emar_path.exists():
         emar_path = RAW_DATA_DIR / "hosp" / "emar.csv"
@@ -194,7 +198,6 @@ def load_emar(hadm_ids: Set[int]) -> pd.DataFrame:
         low_memory=False,
     )
     emar_df = _filter_by_hadm(emar_df, hadm_ids)
-    print("load emar susccess")
     emar_detail_path = RAW_DATA_DIR / "emar_detail_extract.csv"
     if not emar_detail_path.exists():
         emar_detail_path = RAW_DATA_DIR / "hosp" / "emar_detail.csv"
@@ -234,28 +237,63 @@ def load_emar(hadm_ids: Set[int]) -> pd.DataFrame:
 
 def load_integrated_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     """
-    Load Prescriptions and eMAR, then merge them into a single 'med_df'.
-    
-    Logic:
-    1. Load raw tables.
-    2. Aggregate eMAR events by 'poe_id' (e.g., merge "Administered", "Held").
-    3. Left Join eMAR info onto Prescriptions (Prescription is the master event).
-    4. Fill missing eMAR status with 'Unknown'.
+    Standalone function to load Prescriptions and eMAR, 
+    and merge them into a single integrated DataFrame.
     """
-    print("  - Loading and merging medication data...")
-    
-    pres_df = load_prescriptions(hadm_ids)
-    emar_df = load_emar(hadm_ids)
+    print("Loading Medication Data (Prescriptions + eMAR)...")
+
+    # -------------------------------------------------------
+    # 1. Load Prescriptions (The Master Table)
+    # -------------------------------------------------------
+    pres_path = RAW_DATA_DIR / "prescriptions_extract.csv"
+    if not pres_path.exists():
+        pres_path = RAW_DATA_DIR / "hosp" / "prescriptions.csv"
+
+    pres_df = pd.read_csv(
+        pres_path,
+        usecols=["hadm_id", "starttime", "stoptime", "drug", "dose_val_rx", "dose_unit_rx", "route", "poe_id"],
+        parse_dates=["starttime", "stoptime"],
+        dtype={
+            "hadm_id": "Int64",
+            "drug": "string",
+            "dose_val_rx": "string",
+            "dose_unit_rx": "string",
+            "route": "string",
+            "poe_id": "string" 
+        },
+        low_memory=False,
+    )
+    pres_df = _filter_by_hadm(pres_df, hadm_ids)
 
     if pres_df.empty:
         return pd.DataFrame()
 
-    # 1. Aggregate eMAR statuses
-    # If a poe_id has multiple records, combine them (e.g., "Administered, Held")
+    # -------------------------------------------------------
+    # 2. Load eMAR (The Status Table)
+    # -------------------------------------------------------
+    emar_path = RAW_DATA_DIR / "emar_extract.csv"
+    if not emar_path.exists():
+        emar_path = RAW_DATA_DIR / "hosp" / "emar.csv"
+
+    emar_df = pd.read_csv(
+        emar_path,
+        usecols=["hadm_id", "poe_id", "event_txt"],
+        dtype={
+            "hadm_id": "Int64",
+            "poe_id": "string",
+            "event_txt": "string",
+        },
+        low_memory=False,
+    )
+    emar_df = _filter_by_hadm(emar_df, hadm_ids)
+
+    # -------------------------------------------------------
+    # 3. Merge Logic
+    # -------------------------------------------------------
+    
+    # 3.1 Aggregate eMAR statuses (Same poe_id -> multiple statuses)
     if not emar_df.empty:
-        # Ensure string type for joining
         emar_df['event_txt'] = emar_df['event_txt'].astype(str)
-        
         emar_agg = emar_df.groupby('poe_id')['event_txt'].apply(
             lambda x: ', '.join(sorted(set(x)))
         ).reset_index()
@@ -263,14 +301,14 @@ def load_integrated_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     else:
         emar_agg = pd.DataFrame(columns=['poe_id', 'execution_status'])
 
-    # 2. Merge (Left Join)
-    # Ensure keys are strings to prevent mismatch
+    # 3.2 Left Join (Prescription is Master)
+    # Ensure join keys are strings
     pres_df['poe_id'] = pres_df['poe_id'].astype(str)
     emar_agg['poe_id'] = emar_agg['poe_id'].astype(str)
 
     med_df = pres_df.merge(emar_agg, on='poe_id', how='left')
 
-    # 3. Handle missing status
+    # 3.3 Fill missing statuses
     med_df['execution_status'] = med_df['execution_status'].fillna('Unknown')
 
     return med_df
@@ -279,6 +317,7 @@ def load_imaging(hadm_ids: Set[int]) -> pd.DataFrame:
     # ----------------------------
     # Imaging (prefer extracted if available)
     # ----------------------------
+    print("  - Loading imaging data...")
     img_path = RAW_DATA_DIR / "radiology_extract.csv"
     if not img_path.exists():
         img_path = RAW_DATA_DIR / "note" / "radiology.csv"
@@ -298,6 +337,7 @@ def load_procedures(hadm_ids: Set[int]) -> pd.DataFrame:
     # ----------------------------
     # Procedures (add timestamp via chartdate)
     # ----------------------------
+    print("  - Loading procedure data...")
     proc_df = pd.read_csv(
         RAW_DATA_DIR / "hosp" / "procedures_icd.csv",
         usecols=["hadm_id", "icd_code", "icd_version", "chartdate"],
@@ -329,6 +369,7 @@ def build_lab_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
       - One event per unique charttime
       - Each event contains an 'items' list of lab measurements
     """
+    print("  - building lab events...")
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
@@ -370,6 +411,7 @@ def build_vital_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
       - Each item can carry a per-item flag.
       - The event-level flag is set to 'warning' if any item is warning.
     """
+    print("  - building vital events...")
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
@@ -413,6 +455,7 @@ def build_pres_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
       - One event per unique starttime
       - Each event contains an 'items' list of administered/started prescription
     """
+    print("  - building prescription events...")
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
@@ -447,6 +490,7 @@ def build_emar_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
     medication events: derived from hosp.emar (+ emar_detail) (administration)
     merged by event_time into items list.
     """
+    print("  - building emar events...")
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
@@ -489,6 +533,7 @@ def build_med_events(med_df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]
     """
     Construct medication events from the integrated DataFrame.
     """
+    print("  - building medication events...")
     subset = med_df[med_df["hadm_id"] == hadm_id]
     
     events = []
@@ -524,6 +569,7 @@ def build_med_events(med_df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]
 
 def build_imaging_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
     """Build imaging events (one record -> one event)."""
+    print("  - building imaging events...")
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
@@ -549,6 +595,7 @@ def build_procedure_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any
     Timestamp rule:
       - Use chartdate with default time 00:00:00 (date-level precision).
     """
+    print("  - building procedure events...")
     rows = df[df["hadm_id"] == hadm_id].copy()
     if rows.empty:
         return []
