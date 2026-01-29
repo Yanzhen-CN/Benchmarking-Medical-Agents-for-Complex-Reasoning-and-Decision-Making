@@ -173,7 +173,7 @@ def load_prescriptions(hadm_ids: Set[int]) -> pd.DataFrame:
     pres_df = _filter_by_hadm(pres_df, hadm_ids)
     return pres_df
 
-def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
+def load_emar(hadm_ids: Set[int]) -> pd.DataFrame:
     """
     Load eMAR administration records and join with eMAR_detail to get dose/route.
     """
@@ -218,18 +218,61 @@ def load_medications(hadm_ids: Set[int]) -> pd.DataFrame:
     emar_detail_df = _filter_by_hadm(emar_detail_df, hadm_ids)
 
     # merge
-    med_df = emar_df.merge(emar_detail_df, on="emar_id", how="left")
+    emar_df = emar_df.merge(emar_detail_df, on="emar_id", how="left")
 
     # Event time: prefer charttime, fallback to scheduletime
-    med_df["event_time"] = med_df["charttime"].fillna(med_df["scheduletime"])
+    emar_df["event_time"] = emar_df["charttime"].fillna(emar_df["scheduletime"])
 
-    med_df = med_df.drop_duplicates(
+    emar_df = emar_df.drop_duplicates(
         subset=[
             "hadm_id", "emar_id", "event_time", "medication", "event_txt",
             "dose_given", "dose_given_unit", "dose_due", "dose_due_unit", "route"
         ]
     )
-    med_df = _filter_by_hadm(med_df, hadm_ids)
+    emar_df = _filter_by_hadm(emar_df, hadm_ids)
+    return emar_df
+
+def load_integrated_medications(hadm_ids: Set[int]) -> pd.DataFrame:
+    """
+    Load Prescriptions and eMAR, then merge them into a single 'med_df'.
+    
+    Logic:
+    1. Load raw tables.
+    2. Aggregate eMAR events by 'poe_id' (e.g., merge "Administered", "Held").
+    3. Left Join eMAR info onto Prescriptions (Prescription is the master event).
+    4. Fill missing eMAR status with 'Unknown'.
+    """
+    print("  - Loading and merging medication data...")
+    
+    pres_df = load_prescriptions(hadm_ids)
+    emar_df = load_emar(hadm_ids)
+
+    if pres_df.empty:
+        return pd.DataFrame()
+
+    # 1. Aggregate eMAR statuses
+    # If a poe_id has multiple records, combine them (e.g., "Administered, Held")
+    if not emar_df.empty:
+        # Ensure string type for joining
+        emar_df['event_txt'] = emar_df['event_txt'].astype(str)
+        
+        emar_agg = emar_df.groupby('poe_id')['event_txt'].apply(
+            lambda x: ', '.join(sorted(set(x)))
+        ).reset_index()
+        emar_agg.rename(columns={'event_txt': 'execution_status'}, inplace=True)
+    else:
+        emar_agg = pd.DataFrame(columns=['poe_id', 'execution_status'])
+
+    # 2. Merge (Left Join)
+    # Ensure keys are strings to prevent mismatch
+    pres_df['poe_id'] = pres_df['poe_id'].astype(str)
+    emar_agg['poe_id'] = emar_agg['poe_id'].astype(str)
+
+    med_df = pres_df.merge(emar_agg, on='poe_id', how='left')
+
+    # 3. Handle missing status
+    med_df['execution_status'] = med_df['execution_status'].fillna('Unknown')
+
     return med_df
 
 def load_imaging(hadm_ids: Set[int]) -> pd.DataFrame:
@@ -273,29 +316,6 @@ def load_procedures(hadm_ids: Set[int]) -> pd.DataFrame:
     proc_df = proc_df.merge(d_proc, on=["icd_code", "icd_version"], how="left")
     return proc_df
 
-# ============================================================
-# Table loading
-# ============================================================
-def load_events(hadm_ids: Set[int]):
-    """
-    Load extracted event tables and filter them to the cohort.
-
-    Design choices:
-      - Use usecols/dtype to reduce unnecessary I/O and stabilize parsing.
-      - Normalize vital 'warning' into an integer column 'warning_int' to avoid
-        string-vs-int comparisons (e.g., '1' vs 1).
-      - Prefer extracted prescription/medication/imaging files if present.
-    """
-    print("Loading event tables...")
-
-    lab_df = load_lab(hadm_ids)
-    vital_df = load_vital(hadm_ids)
-    # pres_df = load_prescriptions(hadm_ids)
-    med_df = load_medications(hadm_ids)
-    img_df = load_imaging(hadm_ids)
-    proc_df = load_procedures(hadm_ids)
-
-    return lab_df, vital_df, med_df, img_df, proc_df
 
 
 # ============================================================
@@ -422,7 +442,7 @@ def build_pres_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
 
     return events
 
-def build_med_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
+def build_emar_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
     """
     medication events: derived from hosp.emar (+ emar_detail) (administration)
     merged by event_time into items list.
@@ -455,8 +475,51 @@ def build_med_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
                 }
             )
 
-        events.append({"timestamp": _fmt_ts(t), "type": "medication", "items": items})
+        events.append(
+            {
+                "timestamp": _fmt_ts(t),
+                "type": "emar",
+                "items": items
+            }
+        )
 
+    return events
+
+def build_med_events(med_df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
+    """
+    Construct medication events from the integrated DataFrame.
+    """
+    subset = med_df[med_df["hadm_id"] == hadm_id]
+    
+    events = []
+    for _, row in subset.iterrows():
+        start_time = row.get("starttime")
+        
+        # Skip invalid times
+        if pd.isna(start_time):
+            continue
+
+        # Format dose string (Val + Unit)
+        dose_val = row.get("dose_val_rx")
+        dose_unit = row.get("dose_unit_rx")
+        dose_str = f"{dose_val} {dose_unit}" if pd.notna(dose_val) and pd.notna(dose_unit) else str(dose_val)
+        if dose_str == "nan": 
+            dose_str = None
+
+        # Build event
+        evt = {
+            "type": "MEDICATION",
+            "timestamp": _fmt_ts(start_time),
+            "end_timestamp": _fmt_ts(row.get("stoptime")),
+            "drug": _nan_to_none(row.get("drug")),
+            "route": _nan_to_none(row.get("route")),
+            "dose": _nan_to_none(dose_str),
+            "poe_id": _nan_to_none(row.get("poe_id")),
+            "status": row.get("execution_status")  # This is the integrated column
+        }
+        
+        events.append(evt)
+        
     return events
 
 def build_imaging_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
@@ -518,7 +581,13 @@ def main():
     patient_files = load_patient_files()
     hadm_ids = collect_hadm_ids(patient_files)
 
-    lab_df, vital_df, med_df, img_df, proc_df = load_events(hadm_ids)
+    lab_df = load_lab(hadm_ids)
+    vital_df = load_vital(hadm_ids)
+    # pres_df = load_prescriptions(hadm_ids)
+    # emar_df = load_emar(hadm_ids)
+    med_df = load_integrated_medications(hadm_id)
+    img_df = load_imaging(hadm_ids)
+    proc_df = load_procedures(hadm_ids)
 
     for pf in patient_files:
         with open(pf, "r", encoding="utf-8") as f:
@@ -539,7 +608,8 @@ def main():
             events.extend(build_lab_events(lab_df, hadm_id))
             events.extend(build_vital_events(vital_df, hadm_id))
             # events.extend(build_pres_events(pres_df, hadm_id))
-            events.extend(build_med_events(med_df,hadm_id))
+            # events.extend(build_emar_events(emar_df,hadm_id))
+            events.extend(build_med_events(med_df, hadm_id))
             events.extend(build_imaging_events(img_df, hadm_id))
             events.extend(build_procedure_events(proc_df, hadm_id))
 
