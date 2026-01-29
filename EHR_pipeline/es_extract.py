@@ -1,685 +1,404 @@
 import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-
+import os
+import gc
 import pandas as pd
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Union
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 
+# ============================================================
+# Configuration & Constants
+# ============================================================
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
 BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
 
 DEMO_MODE = True
-DEMO_N = 5
-
+DEMO_N = 10
+MAX_WORKERS = min(8, os.cpu_count() or 1) 
 
 # ============================================================
-# Utilities
+# Utility Functions
 # ============================================================
-def _fmt_ts(x) -> Optional[str]:
-    """Convert datetime-like value to a normalized timestamp string."""
+
+def _fmt_ts(x: Any) -> Optional[str]:
+    """Normalize datetime to string format."""
     if x is None or pd.isna(x):
         return None
     return pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S")
 
+def _nan_to_none(x: Any) -> Any:
+    """Convert NaN to None for valid JSON serialization."""
+    if pd.isna(x):
+        return None
+    return x
 
-def _nan_to_none(x):
-    """Convert NaN/NA to None for strict JSON serialization."""
-    return None if pd.isna(x) else x
-
+def _find_data_file(filename_stem: str, raw_subfolder: str) -> Path:
+    """
+    Smart path finder:
+    1. Checks for {stem}_extract.csv (Optimized file)
+    2. Checks for {raw_subfolder}/{stem}.csv (Original MIMIC file)
+    """
+    # Priority 1: Extracted file in root or raw_data
+    extract_name = f"{filename_stem}_extract.csv"
+    if (RAW_DATA_DIR / extract_name).exists():
+        return RAW_DATA_DIR / extract_name
+    
+    # Priority 2: Raw file in subfolder (hosp, icu, note)
+    raw_name = f"{filename_stem}.csv"
+    raw_path = RAW_DATA_DIR / raw_subfolder / raw_name
+    if raw_path.exists():
+        return raw_path
+        
+    raise FileNotFoundError(f"Could not find {extract_name} OR {raw_subfolder}/{raw_name}")
 
 def load_patient_files() -> List[Path]:
-    """Load patient JSON files from bench_data/patients."""
+    """Load patient JSON files."""
     patients_dir = BENCH_DATA_DIR / "patients"
     files = sorted(patients_dir.glob("P*.json"))
-    return files[:DEMO_N] if DEMO_MODE else files
+    if DEMO_MODE:
+        return files[:DEMO_N]
+    return files
 
-
-def collect_hadm_ids(patient_files: List[Path]) -> Set[int]:
-    """Collect the set of hadm_id values referenced by selected patient JSONs."""
-    hadm_ids: Set[int] = set()
+def get_cohort_hadm_ids(patient_files: List[Path]) -> Set[int]:
+    """Scan patient files to get relevant hadm_ids."""
+    hadm_ids = set()
     for pf in patient_files:
-        with open(pf, "r", encoding="utf-8") as f:
-            patient = json.load(f)
-        for v in patient.get("visits", []):
-            hid = v.get("hadm_id")
-            if hid is None:
-                continue
-            try:
-                hadm_ids.add(int(hid))
-            except Exception:
-                pass
+        try:
+            with open(pf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for v in data.get("visits", []):
+                if v.get("hadm_id"):
+                    hadm_ids.add(int(v["hadm_id"]))
+        except Exception:
+            continue
     return hadm_ids
 
+def df_to_map(df: pd.DataFrame) -> Dict[int, pd.DataFrame]:
+    """Group giant DataFrame by hadm_id into a dictionary for O(1) access."""
+    if df is None or df.empty:
+        return {}
+    return {hid: group for hid, group in df.groupby("hadm_id")}
 
-def _filter_by_hadm(df: pd.DataFrame, hadm_ids: Set[int]) -> pd.DataFrame:
-    """Filter a dataframe to the cohort hadm_ids, with robust casting."""
-    if df.empty or "hadm_id" not in df.columns:
-        return df
+# ============================================================
+# Data Loaders (With Fallback Logic)
+# ============================================================
 
-    df = df.copy()
-    df["hadm_id"] = pd.to_numeric(df["hadm_id"], errors="coerce")
-    df = df.dropna(subset=["hadm_id"])
-    df["hadm_id"] = df["hadm_id"].astype(int)
-    return df[df["hadm_id"].isin(hadm_ids)].copy()
-
-
-def assign_visit_ids(visits: List[Dict[str, Any]]) -> None:
-    """
-    Assign visit_id (V1, V2, ...) in-place.
-
-    Rule:
-      - Use the original order in patient["visits"] for stability.
-      - If you want chronological visit_id later, sort visits by admittime first.
-    """
-    for i, v in enumerate(visits, start=1):
-        v["visit_id"] = f"V{i}"
-
-
-def assign_event_ids(events: List[Dict[str, Any]], patient_id: str, visit_id: str) -> None:
-    """
-    Assign event_id (P0001-V1-E001) in-place, based on the final sorted event_stream.
-
-    Rule:
-      event_id = {patient_id}-{visit_id}-E{seq}
-      where seq is 1..N within the visit.
-    """
-    for i, e in enumerate(events, start=1):
-        width = max(2, len(str(i)))  # E01..E99
-        e["event_id"] = f"{patient_id}-{visit_id}-E{i:0{width}d}"
-
-def load_lab(hadm_ids: Set[int]):
-    # ----------------------------
-    # Lab events (extracted)
-    # ----------------------------
-    print("  - Loading lab data...")
-    lab_df = pd.read_csv(
-        RAW_DATA_DIR / "labevents_extract.csv",
+def load_lab_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    print("  [Loader] Loading Lab Events...")
+    # Logic: Labs are usually extracted, but we check just in case
+    fpath = _find_data_file("labevents", "hosp")
+    
+    df = pd.read_csv(
+        fpath,
         usecols=["hadm_id", "itemid", "charttime", "valuenum", "value", "valueuom", "flag"],
         parse_dates=["charttime"],
-        dtype={
-            "hadm_id": "Int64",
-            "itemid": "Int64",
-            "value": "string",
-            "valueuom": "string",
-            "flag": "string",
-        },
-        low_memory=False,
+        low_memory=False
     )
-    lab_df = _filter_by_hadm(lab_df, hadm_ids)
+    df = df[df["hadm_id"].isin(cohort_ids)].copy()
+    
+    # Load definitions
+    d_path = _find_data_file("d_labitems", "hosp")
+    d_lab = pd.read_csv(d_path, usecols=["itemid", "label", "category", "fluid"])
+    
+    return df.merge(d_lab, on="itemid", how="left")
 
-    d_lab = pd.read_csv(
-        RAW_DATA_DIR / "hosp" / "d_labitems.csv",
-        usecols=["itemid", "label", "category", "fluid"],
-        dtype={"itemid": "Int64", "label": "string", "category": "string", "fluid": "string"},
-        low_memory=False,
-    )
-    lab_df = lab_df.merge(d_lab, on="itemid", how="left")
-    return lab_df
-
-def load_vital(hadm_ids: Set[int]):
-    # ----------------------------
-    # Vital events (extracted)
-    # --------------------------
-    print("  - Loading vital data...")
-    vital_df = pd.read_csv(
-        RAW_DATA_DIR / "chartevents_extract.csv",
+def load_vital_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    print("  [Loader] Loading Vital Signs...")
+    fpath = _find_data_file("chartevents", "icu")
+    
+    # Note: Raw chartevents is huge. Ensure usecols is strict.
+    df = pd.read_csv(
+        fpath,
         usecols=["hadm_id", "itemid", "charttime", "valuenum", "value", "warning"],
         parse_dates=["charttime"],
-        dtype={
-            "hadm_id": "Int64",
-            "itemid": "Int64",
-            "value": "string",
-            # Read as string first; normalize to int to handle mixed representations.
-            "warning": "string",
-        },
-        low_memory=False,
+        low_memory=False
     )
-    vital_df = _filter_by_hadm(vital_df, hadm_ids)
-    vital_df["warning_int"] = pd.to_numeric(vital_df["warning"], errors="coerce").fillna(0).astype(int)
+    df = df[df["hadm_id"].isin(cohort_ids)].copy()
+    
+    d_path = _find_data_file("d_items", "icu")
+    d_items = pd.read_csv(d_path, usecols=["itemid", "label", "unitname"])
+    
+    return df.merge(d_items, on="itemid", how="left")
 
-    d_items = pd.read_csv(
-        RAW_DATA_DIR / "icu" / "d_items.csv",
-        usecols=["itemid", "label", "unitname", "lownormalvalue", "highnormalvalue"],
-        dtype={"itemid": "Int64", "label": "string", "unitname": "string"},
-        low_memory=False,
-    )
-    vital_df = vital_df.merge(
-        d_items[["itemid", "label", "unitname", "lownormalvalue", "highnormalvalue"]],
-        on="itemid",
-        how="left",
-    )
-    return vital_df
-
-def load_prescriptions(hadm_ids: Set[int]) -> pd.DataFrame:
-    # ----------------------------
-    # Prescriptions (prefer extracted if available)
-    # ----------------------------
-    print("  - Loading prescription data...")
-    pres_path = RAW_DATA_DIR / "prescriptions_extract.csv"
-    if not pres_path.exists():
-        pres_path = RAW_DATA_DIR / "hosp" / "prescriptions.csv"
-
-    pres_df = pd.read_csv(
-        pres_path,
-        usecols=["hadm_id", "starttime", "drug", "dose_val_rx", "dose_unit_rx", "route"],
-        parse_dates=["starttime"],
-        dtype={
-            "hadm_id": "Int64",
-            "drug": "string",
-            # Mixed-type column in MIMIC; enforce string to avoid dtype warnings.
-            "dose_val_rx": "string",
-            "dose_unit_rx": "string",
-            "route": "string",
-        },
-        low_memory=False,
-    )
-    pres_df = _filter_by_hadm(pres_df, hadm_ids)
-    return pres_df
-
-def load_emar(hadm_ids: Set[int]) -> pd.DataFrame:
-    """
-    Load eMAR administration records and join with eMAR_detail to get dose/route.
-    """
-    print("  - Loading emar data...")
-    emar_path = RAW_DATA_DIR / "emar_extract.csv"
-    if not emar_path.exists():
-        emar_path = RAW_DATA_DIR / "hosp" / "emar.csv"
-
-    emar_df = pd.read_csv(
-        emar_path,
-        usecols=["hadm_id", "emar_id", "charttime", "scheduletime", "medication", "event_txt"],
-        parse_dates=["charttime", "scheduletime"],
-        dtype={
-            "hadm_id": "Int64",
-            "emar_id": "string",
-            "medication": "string",
-            "event_txt": "string",
-        },
-        low_memory=False,
-    )
-    emar_df = _filter_by_hadm(emar_df, hadm_ids)
-    emar_detail_path = RAW_DATA_DIR / "emar_detail_extract.csv"
-    if not emar_detail_path.exists():
-        emar_detail_path = RAW_DATA_DIR / "hosp" / "emar_detail.csv"
-
-    emar_detail_df = pd.read_csv(
-        emar_detail_path,
-        usecols=[
-            "emar_id", "dose_given", "dose_given_unit", 
-            "dose_due", "dose_due_unit", "route"
-        ],
-        dtype={
-            "emar_id": "string",
-            "dose_given": "string",
-            "dose_given_unit": "string",
-            "dose_due": "string",
-            "dose_due_unit": "string",
-            "route": "string",
-        },
-        low_memory=False,
-    )
-    emar_detail_df = _filter_by_hadm(emar_detail_df, hadm_ids)
-
-    # merge
-    emar_df = emar_df.merge(emar_detail_df, on="emar_id", how="left")
-
-    # Event time: prefer charttime, fallback to scheduletime
-    emar_df["event_time"] = emar_df["charttime"].fillna(emar_df["scheduletime"])
-
-    emar_df = emar_df.drop_duplicates(
-        subset=[
-            "hadm_id", "emar_id", "event_time", "medication", "event_txt",
-            "dose_given", "dose_given_unit", "dose_due", "dose_due_unit", "route"
-        ]
-    )
-    emar_df = _filter_by_hadm(emar_df, hadm_ids)
-    return emar_df
-
-def load_integrated_medications(hadm_ids: Set[int]) -> pd.DataFrame:
-    """
-    Standalone function to load Prescriptions and eMAR, 
-    and merge them into a single integrated DataFrame.
-    """
-    print("Loading Medication Data (Prescriptions + eMAR)...")
-
-    # -------------------------------------------------------
-    # 1. Load Prescriptions (The Master Table)
-    # -------------------------------------------------------
-    pres_path = RAW_DATA_DIR / "prescriptions_extract.csv"
-    if not pres_path.exists():
-        pres_path = RAW_DATA_DIR / "hosp" / "prescriptions.csv"
-
-    pres_df = pd.read_csv(
+def load_med_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    print("  [Loader] Loading Medications...")
+    
+    # 1. Prescriptions (Try extract, then raw hosp/prescriptions.csv)
+    pres_path = _find_data_file("prescriptions", "hosp")
+    pres = pd.read_csv(
         pres_path,
         usecols=["hadm_id", "starttime", "stoptime", "drug", "dose_val_rx", "dose_unit_rx", "route", "poe_id"],
         parse_dates=["starttime", "stoptime"],
-        dtype={
-            "hadm_id": "Int64",
-            "drug": "string",
-            "dose_val_rx": "string",
-            "dose_unit_rx": "string",
-            "route": "string",
-            "poe_id": "string" 
-        },
-        low_memory=False,
+        low_memory=False
     )
-    pres_df = _filter_by_hadm(pres_df, hadm_ids)
-
-    if pres_df.empty:
-        return pd.DataFrame()
-
-    # -------------------------------------------------------
-    # 2. Load eMAR (The Status Table)
-    # -------------------------------------------------------
-    emar_path = RAW_DATA_DIR / "emar_extract.csv"
-    if not emar_path.exists():
-        emar_path = RAW_DATA_DIR / "hosp" / "emar.csv"
-
-    emar_df = pd.read_csv(
-        emar_path,
-        usecols=["hadm_id", "poe_id", "event_txt"],
-        dtype={
-            "hadm_id": "Int64",
-            "poe_id": "string",
-            "event_txt": "string",
-        },
-        low_memory=False,
-    )
-    emar_df = _filter_by_hadm(emar_df, hadm_ids)
-
-    # -------------------------------------------------------
-    # 3. Merge Logic
-    # -------------------------------------------------------
+    pres = pres[pres["hadm_id"].isin(cohort_ids)].copy()
     
-    # 3.1 Aggregate eMAR statuses (Same poe_id -> multiple statuses)
-    if not emar_df.empty:
-        emar_df['event_txt'] = emar_df['event_txt'].astype(str)
-        emar_agg = emar_df.groupby('poe_id')['event_txt'].apply(
-            lambda x: ', '.join(sorted(set(x)))
-        ).reset_index()
-        emar_agg.rename(columns={'event_txt': 'execution_status'}, inplace=True)
-    else:
-        emar_agg = pd.DataFrame(columns=['poe_id', 'execution_status'])
+    # 2. eMAR (Try extract, then raw hosp/emar.csv)
+    # Note: Not all datasets use eMAR, so we wrap in try/except or simple check
+    try:
+        emar_path = _find_data_file("emar", "hosp")
+        emar = pd.read_csv(emar_path, usecols=["poe_id", "event_txt"], low_memory=False)
+        
+        # Aggregate status
+        emar["event_txt"] = emar["event_txt"].astype(str)
+        emar_agg = emar.groupby("poe_id")["event_txt"].apply(lambda x: ", ".join(sorted(set(x)))).reset_index()
+        emar_agg.rename(columns={"event_txt": "status"}, inplace=True)
+        
+        # Merge
+        pres["poe_id"] = pres["poe_id"].astype(str)
+        emar_agg["poe_id"] = emar_agg["poe_id"].astype(str)
+        merged = pres.merge(emar_agg, on="poe_id", how="left")
+        merged["status"] = merged["status"].fillna("Ordered")
+        return merged
+        
+    except FileNotFoundError:
+        print("  [Warning] eMAR file not found. Skipping eMAR merge.")
+        pres["status"] = "Ordered"
+        return pres
 
-    # 3.2 Left Join (Prescription is Master)
-    # Ensure join keys are strings
-    pres_df['poe_id'] = pres_df['poe_id'].astype(str)
-    emar_agg['poe_id'] = emar_agg['poe_id'].astype(str)
-
-    med_df = pres_df.merge(emar_agg, on='poe_id', how='left')
-
-    # 3.3 Fill missing statuses
-    med_df['execution_status'] = med_df['execution_status'].fillna('Unknown')
-
-    return med_df
-
-def load_imaging(hadm_ids: Set[int]) -> pd.DataFrame:
-    # ----------------------------
-    # Imaging (prefer extracted if available)
-    # ----------------------------
-    print("  - Loading imaging data...")
-    img_path = RAW_DATA_DIR / "radiology_extract.csv"
-    if not img_path.exists():
-        img_path = RAW_DATA_DIR / "note" / "radiology.csv"
-
-    img_df = pd.read_csv(
-        img_path,
-        usecols=["hadm_id", "charttime", "text"],
-        parse_dates=["charttime"],
-        dtype={"hadm_id": "Int64", "text": "string"},
-        low_memory=False,
-    )
-    img_df = _filter_by_hadm(img_df, hadm_ids)
-    return img_df
-
-
-def load_procedures(hadm_ids: Set[int]) -> pd.DataFrame:
-    # ----------------------------
-    # Procedures (add timestamp via chartdate)
-    # ----------------------------
-    print("  - Loading procedure data...")
-    proc_df = pd.read_csv(
-        RAW_DATA_DIR / "hosp" / "procedures_icd.csv",
+def load_proc_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    print("  [Loader] Loading Procedures...")
+    # Likely raw: hosp/procedures_icd.csv
+    fpath = _find_data_file("procedures_icd", "hosp")
+    
+    df = pd.read_csv(
+        fpath,
         usecols=["hadm_id", "icd_code", "icd_version", "chartdate"],
         parse_dates=["chartdate"],
-        dtype={"hadm_id": "Int64", "icd_code": "string", "icd_version": "Int64"},
-        low_memory=False,
+        low_memory=False
     )
-    proc_df = _filter_by_hadm(proc_df, hadm_ids)
+    df = df[df["hadm_id"].isin(cohort_ids)].copy()
+    
+    d_path = _find_data_file("d_icd_procedures", "hosp")
+    d_proc = pd.read_csv(d_path, usecols=["icd_code", "icd_version", "long_title"])
+    
+    return df.merge(d_proc, on=["icd_code", "icd_version"], how="left")
 
-    d_proc = pd.read_csv(
-        RAW_DATA_DIR / "hosp" / "d_icd_procedures.csv",
-        usecols=["icd_code", "icd_version", "long_title"],
-        dtype={"icd_code": "string", "icd_version": "Int64", "long_title": "string"},
-        low_memory=False,
+def load_img_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    print("  [Loader] Loading Radiology...")
+    # Likely raw: note/radiology.csv
+    fpath = _find_data_file("radiology", "note")
+    
+    df = pd.read_csv(
+        fpath,
+        usecols=["hadm_id", "charttime", "text"],
+        parse_dates=["charttime"],
+        low_memory=False
     )
-    proc_df = proc_df.merge(d_proc, on=["icd_code", "icd_version"], how="left")
-    return proc_df
-
-
+    return df[df["hadm_id"].isin(cohort_ids)].copy()
 
 # ============================================================
-# Event builders (merge by timestamp only)
+# Event Builders
 # ============================================================
-def build_lab_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """
-    Build lab events merged strictly by charttime.
 
-    Output format:
-      - One event per unique charttime
-      - Each event contains an 'items' list of lab measurements
-    """
-    print("  - building lab events...")
-    rows = df[df["hadm_id"] == hadm_id].copy()
-    if rows.empty:
-        return []
-
-    rows = rows.dropna(subset=["charttime"])
-
-    events: List[Dict[str, Any]] = []
-    for ct, g in rows.groupby("charttime"):
-        items = []
-        for r in g.to_dict("records"):
-            items.append(
-                {
-                    "name": _nan_to_none(r.get("label")),
-                    "category": _nan_to_none(r.get("category")),
-                    "fluid": _nan_to_none(r.get("fluid")),
-                    "value_num": _nan_to_none(r.get("valuenum")),
-                    "value_text": _nan_to_none(r.get("value")),
-                    "unit": _nan_to_none(r.get("valueuom")),
-                    "flag": _nan_to_none(r.get("flag")),
-                }
-            )
-
-        events.append(
-            {
-                "timestamp": _fmt_ts(ct),
-                "type": "lab",
-                "items": items,
-            }
-        )
-
+def build_lab_events(df: pd.DataFrame) -> List[Dict]:
+    if df is None or df.empty: return []
+    events = []
+    for row in df.to_dict("records"):
+        if pd.isna(row.get("charttime")): continue
+        events.append({
+            "type": "LAB",
+            "timestamp": _fmt_ts(row["charttime"]),
+            "name": _nan_to_none(row.get("label")),
+            "value": _nan_to_none(row.get("valuenum")),
+            "value_text": _nan_to_none(row.get("value")),
+            "unit": _nan_to_none(row.get("valueuom")),
+            "flag": _nan_to_none(row.get("flag")),
+            "category": _nan_to_none(row.get("category"))
+        })
     return events
 
-
-def build_vital_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """
-    Build vital events merged strictly by charttime.
-
-    Notes:
-      - Each item can carry a per-item flag.
-      - The event-level flag is set to 'warning' if any item is warning.
-    """
-    print("  - building vital events...")
-    rows = df[df["hadm_id"] == hadm_id].copy()
-    if rows.empty:
-        return []
-
-    rows = rows.dropna(subset=["charttime"])
-
-    events: List[Dict[str, Any]] = []
-    for ct, g in rows.groupby("charttime"):
-        any_warning = bool((g["warning_int"] == 1).any()) if "warning_int" in g.columns else False
-
-        items = []
-        for r in g.to_dict("records"):
-            item_warning = (int(r.get("warning_int", 0)) == 1) if r.get("warning_int") is not None else False
-            items.append(
-                {
-                    "name": _nan_to_none(r.get("label")),
-                    "value_num": _nan_to_none(r.get("valuenum")),
-                    "value_text": _nan_to_none(r.get("value")),
-                    "unit": _nan_to_none(r.get("unitname")),
-                    "flag": "warning" if item_warning else None,
-                }
-            )
-
-        events.append(
-            {
-                "timestamp": _fmt_ts(ct),
-                "type": "vital",
-                "flag": "warning" if any_warning else None,
-                "items": items,
-            }
-        )
-
+def build_vital_events(df: pd.DataFrame) -> List[Dict]:
+    if df is None or df.empty: return []
+    events = []
+    for row in df.to_dict("records"):
+        if pd.isna(row.get("charttime")): continue
+        # Warning might be '1', 1, or True depending on source
+        warn_val = row.get("warning")
+        is_warning = (str(warn_val) == "1") or (warn_val == 1)
+        
+        events.append({
+            "type": "VITAL",
+            "timestamp": _fmt_ts(row["charttime"]),
+            "name": _nan_to_none(row.get("label")),
+            "value": _nan_to_none(row.get("valuenum")),
+            "unit": _nan_to_none(row.get("unitname")),
+            "warning": is_warning
+        })
     return events
 
-
-def build_pres_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
+def build_med_events(df: pd.DataFrame) -> List[Dict]:
     """
-    Build presscription events merged strictly by starttime.
-
-    Output format:
-      - One event per unique starttime
-      - Each event contains an 'items' list of administered/started prescription
+    Optimized: Aggregates medications administered at the same starttime into a single event.
     """
-    print("  - building prescription events...")
-    rows = df[df["hadm_id"] == hadm_id].copy()
-    if rows.empty:
-        return []
-
-    rows = rows.dropna(subset=["starttime"])
-
-    events: List[Dict[str, Any]] = []
-    for st, g in rows.groupby("starttime"):
-        items = []
-        for r in g.to_dict("records"):
-            items.append(
-                {
-                    "name": _nan_to_none(r.get("drug")),
-                    "dose": _nan_to_none(r.get("dose_val_rx")),
-                    "unit": _nan_to_none(r.get("dose_unit_rx")),
-                    "route": _nan_to_none(r.get("route")),
-                }
-            )
-
-        events.append(
-            {
-                "timestamp": _fmt_ts(st),
-                "type": "prescription",
-                "items": items,
-            }
-        )
-
-    return events
-
-def build_emar_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """
-    medication events: derived from hosp.emar (+ emar_detail) (administration)
-    merged by event_time into items list.
-    """
-    print("  - building emar events...")
-    rows = df[df["hadm_id"] == hadm_id].copy()
-    if rows.empty:
-        return []
-
-    rows = rows.dropna(subset=["event_time"])
-
-    events: List[Dict[str, Any]] = []
-
-    for t, g in rows.groupby("event_time"):
-        items = []
-        for r in g.to_dict("records"):
-            # Prefer dose_given; fallback to dose_due
-            dose = r.get("dose_given")
-            unit = r.get("dose_given_unit")
-            if dose is None or pd.isna(dose):
-                dose = r.get("dose_due")
-                unit = r.get("dose_due_unit")
-
-            items.append(
-                {
-                    "name": _nan_to_none(r.get("medication")),
-                    "dose": _nan_to_none(dose),
-                    "unit": _nan_to_none(unit),
-                    # "route": _nan_to_none(r.get("route")),
-                    "status": _nan_to_none(r.get("event_txt")),
-                }
-            )
-
-        events.append(
-            {
-                "timestamp": _fmt_ts(t),
-                "type": "emar",
-                "items": items
-            }
-        )
-
-    return events
-
-def build_med_events(med_df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """
-    Construct medication events from the integrated DataFrame.
-    """
-    print("  - building medication events...")
-    subset = med_df[med_df["hadm_id"] == hadm_id]
+    if df is None or df.empty: return []
+    
+    df = df.dropna(subset=["starttime"]).copy()
     
     events = []
-    for _, row in subset.iterrows():
-        start_time = row.get("starttime")
-        
-        # Skip invalid times
-        if pd.isna(start_time):
-            continue
-
-        # Format dose string (Val + Unit)
-        dose_val = row.get("dose_val_rx")
-        dose_unit = row.get("dose_unit_rx")
-        dose_str = f"{dose_val} {dose_unit}" if pd.notna(dose_val) and pd.notna(dose_unit) else str(dose_val)
-        if dose_str == "nan": 
+    for start_ts, group in df.groupby("starttime"):
+        items = []
+        for r in group.to_dict("records"):
+            dose_val = r.get("dose_val_rx")
+            dose_unit = r.get("dose_unit_rx")
             dose_str = None
-
-        # Build event
-        evt = {
+            if pd.notna(dose_val):
+                dose_str = f"{dose_val} {r.get('dose_unit_rx', '')}".strip()
+            
+            items.append({
+                "drug": _nan_to_none(r.get("drug")),
+                "route": _nan_to_none(r.get("route")),
+                "dose": _nan_to_none(dose_str),
+                "status": r.get("status"),
+                "end_timestamp": _fmt_ts(r.get("stoptime")) 
+            })
+            
+        events.append({
             "type": "MEDICATION",
-            "timestamp": _fmt_ts(start_time),
-            "end_timestamp": _fmt_ts(row.get("stoptime")),
-            "drug": _nan_to_none(row.get("drug")),
-            "route": _nan_to_none(row.get("route")),
-            "dose": _nan_to_none(dose_str),
-            "poe_id": _nan_to_none(row.get("poe_id")),
-            "status": row.get("execution_status")  # This is the integrated column
-        }
-        
-        events.append(evt)
+            "timestamp": _fmt_ts(start_ts),
+            "items": items
+        })
         
     return events
 
-def build_imaging_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """Build imaging events (one record -> one event)."""
-    print("  - building imaging events...")
-    rows = df[df["hadm_id"] == hadm_id].copy()
-    if rows.empty:
-        return []
-
-    rows = rows.dropna(subset=["charttime"])
-
+def build_proc_events(df: pd.DataFrame) -> List[Dict]:
+    if df is None or df.empty: return []
     events = []
-    for r in rows.to_dict("records"):
-        events.append(
-            {
-                "timestamp": _fmt_ts(r.get("charttime")),
-                "type": "imaging",
-                "content": _nan_to_none(r.get("text")),
-            }
-        )
+    for row in df.to_dict("records"):
+        ts = row.get("chartdate")
+        if pd.isna(ts): continue
+        ts_str = pd.Timestamp(ts).strftime("%Y-%m-%d 00:00:00")
+        
+        events.append({
+            "type": "PROCEDURE",
+            "timestamp": ts_str,
+            "name": _nan_to_none(row.get("long_title")),
+            "code": _nan_to_none(row.get("icd_code"))
+        })
     return events
 
-
-def build_procedure_events(df: pd.DataFrame, hadm_id: int) -> List[Dict[str, Any]]:
-    """
-    Build procedure events.
-
-    Timestamp rule:
-      - Use chartdate with default time 00:00:00 (date-level precision).
-    """
-    print("  - building procedure events...")
-    rows = df[df["hadm_id"] == hadm_id].copy()
-    if rows.empty:
-        return []
-
+def build_img_events(df: pd.DataFrame) -> List[Dict]:
+    if df is None or df.empty: return []
     events = []
-    for r in rows.to_dict("records"):
-        title = r.get("long_title")
-        if title is None or pd.isna(title):
-            continue
-
-        chartdate = r.get("chartdate")
-        ts = None
-        if chartdate is not None and not pd.isna(chartdate):
-            ts = pd.Timestamp(chartdate).strftime("%Y-%m-%d 00:00:00")
-
-        events.append(
-            {
-                "timestamp": ts,
-                "type": "procedure",
-                "name": _nan_to_none(title),
-            }
-        )
+    for row in df.to_dict("records"):
+        if pd.isna(row.get("charttime")): continue
+        events.append({
+            "type": "IMAGING",
+            "timestamp": _fmt_ts(row["charttime"]),
+            "report": _nan_to_none(row.get("text"))
+        })
     return events
 
-
 # ============================================================
-# Main
+# Worker Process
 # ============================================================
-def main():
-    patient_files = load_patient_files()
-    hadm_ids = collect_hadm_ids(patient_files)
 
-    lab_df = load_lab(hadm_ids)
-    vital_df = load_vital(hadm_ids)
-    # pres_df = load_prescriptions(hadm_ids)
-    # emar_df = load_emar(hadm_ids)
-    med_df = load_integrated_medications(hadm_ids)
-    img_df = load_imaging(hadm_ids)
-    proc_df = load_procedures(hadm_ids)
-
-    for pf in patient_files:
-        with open(pf, "r", encoding="utf-8") as f:
+def process_patient(file_path: Path, data_maps: Dict[str, Dict]) -> str:
+    """Worker function: Process one patient using shared data maps."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
             patient = json.load(f)
-
-        # Keep patient_id aligned with the file naming convention: Pxxxx.json -> "Pxxxx"
-        patient_id = patient.get("patient_id") or pf.stem
-        patient["patient_id"] = patient_id
-
+        
+        pid = patient.get("patient_id", file_path.stem)
+        
         visits = patient.get("visits", [])
-        assign_visit_ids(visits)
-
+        for i, v in enumerate(visits, 1):
+            if "visit_id" not in v:
+                v["visit_id"] = f"V{i}"
+        
         for visit in visits:
-            hadm_id = int(visit["hadm_id"])
-            events: List[Dict[str, Any]] = []
+            hid = int(visit.get("hadm_id", -1))
+            if hid == -1: continue
+            
+            # O(1) Data Retrieval
+            events = []
+            events.extend(build_lab_events(data_maps["lab"].get(hid)))
+            events.extend(build_vital_events(data_maps["vital"].get(hid)))
+            events.extend(build_med_events(data_maps["med"].get(hid)))
+            events.extend(build_proc_events(data_maps["proc"].get(hid)))
+            events.extend(build_img_events(data_maps["img"].get(hid)))
+            
+            # Sort & ID
+            events = [e for e in events if e.get("timestamp")]
+            events.sort(key=lambda x: (x["timestamp"], x["type"]))
+            
+            final_stream = []
+            for idx, evt in enumerate(events, 1):
+                pad = max(2, len(str(idx)))
+                eid = f"{pid}-{visit['visit_id']}-E{idx}"
+                evt_with_id = {"event_id": eid}
+                evt_with_id.update(evt)
+                final_stream.append(evt_with_id)
+            
+            visit["event_stream"] = final_stream
+            
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(patient, f, indent=2, ensure_ascii=False)
+            
+        return f"Success: {pid}"
 
-            # build event stream
-            events.extend(build_lab_events(lab_df, hadm_id))
-            events.extend(build_vital_events(vital_df, hadm_id))
-            # events.extend(build_pres_events(pres_df, hadm_id))
-            # events.extend(build_emar_events(emar_df,hadm_id))
-            events.extend(build_med_events(med_df, hadm_id))
-            events.extend(build_imaging_events(img_df, hadm_id))
-            events.extend(build_procedure_events(proc_df, hadm_id))
+    except Exception as e:
+        return f"Error: {file_path.name} - {str(e)}"
 
-            # Drop events without timestamps and sort deterministically.
-            events = [e for e in events if e.get("timestamp") is not None]
-            events.sort(key=lambda x: (x["timestamp"], str(x.get("type", ""))))
+# ============================================================
+# Main Execution
+# ============================================================
 
-            # Assign Pxxxx-Vy-E01 style ids after sorting.
-            new_events = []
-            for i, e in enumerate(events, start=1):
-                eid = f"{patient_id}-{visit['visit_id']}-E{i}"
-                new_events.append({"event_id": eid, **e})  # id first, then original fields
+def main():
+    print(">>> Starting Robust Event Extraction")
+    
+    # 1. Patients
+    patient_files = load_patient_files()
+    cohort_ids = get_cohort_hadm_ids(patient_files)
+    print(f">>> Found {len(patient_files)} patients covering {len(cohort_ids)} admissions.")
+    
+    if not cohort_ids:
+        print("No admissions found. Exiting.")
+        return
 
-            visit["event_stream"] = new_events
+    # 2. Parallel Loading (Handles Raw vs Extracted automatically)
+    print(">>> Step 1: Loading Data (Parallel IO)...")
+    with ThreadPoolExecutor(max_workers=5) as io_pool:
+        f_lab = io_pool.submit(load_lab_data, cohort_ids)
+        f_vital = io_pool.submit(load_vital_data, cohort_ids)
+        f_med = io_pool.submit(load_med_data, cohort_ids)
+        f_proc = io_pool.submit(load_proc_data, cohort_ids)
+        f_img = io_pool.submit(load_img_data, cohort_ids)
+        
+        try:
+            raw_lab = f_lab.result()
+            raw_vital = f_vital.result()
+            raw_med = f_med.result()
+            raw_proc = f_proc.result()
+            raw_img = f_img.result()
+        except Exception as e:
+            print(f"!!! Critical Loader Error: {e}")
+            return
 
-        # Enforce strict JSON output (do not allow NaN values).
-        with open(pf, "w", encoding="utf-8") as f:
-            json.dump(patient, f, indent=2, ensure_ascii=False, allow_nan=False)
-
-        print(f"Updated {pf.name}")
-
-    print("STEP 2 COMPLETE: event_stream populated with visit_id and event_id.")
-
+    # 3. Indexing
+    print(">>> Step 2: Indexing Data Maps...")
+    data_maps = {
+        "lab": df_to_map(raw_lab),
+        "vital": df_to_map(raw_vital),
+        "med": df_to_map(raw_med),
+        "proc": df_to_map(raw_proc),
+        "img": df_to_map(raw_img)
+    }
+    
+    del raw_lab, raw_vital, raw_med, raw_proc, raw_img
+    gc.collect()
+    
+    # 4. Processing
+    print(f">>> Step 3: Processing with {MAX_WORKERS} workers...")
+    worker_fn = partial(process_patient, data_maps=data_maps)
+    
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(worker_fn, patient_files))
+        
+    success_count = sum(1 for r in results if r.startswith("Success"))
+    print(f"\n>>> Done. Success: {success_count}/{len(results)}")
 
 if __name__ == "__main__":
     main()
