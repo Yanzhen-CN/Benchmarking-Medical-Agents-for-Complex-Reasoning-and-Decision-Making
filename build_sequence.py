@@ -1,7 +1,10 @@
 from config import BuildConfig
 from util.logUtil import setup_logger
 logger = setup_logger()
-from EHR_pipeline import events_preprocess, note_extract, patients_extract, es_extract, convert
+from EHR_pipeline import (
+    events_preprocess, note_extract, patients_extract, es_extract, convert, build_context
+)
+    
 # from context_builder import build_context
 config = BuildConfig()
 
@@ -21,7 +24,8 @@ def main():
     # note_extract.extract_notes()
     logger.info("Step 4: Data cleaning and finalizing")
     convert.batch_convert()
-    # build_context.build_context()
+    logger.info("Step 5: Building context for each patient")
+    build_context.build_context()
 
 if __name__ == "__main__":
     main()

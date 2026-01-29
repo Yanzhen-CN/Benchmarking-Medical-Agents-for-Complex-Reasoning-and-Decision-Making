@@ -120,7 +120,7 @@ def convert_single_patient(json_path: Path) -> Optional[Path]:
             event_stream.append(_make_event(
                 event_id_str=f"{patient_id}-{visit_label}-E{visit_internal_counter}", # <--- 修改点
                 event_type=e_type,
-                timestamp=event.get("charttime"),
+                timestamp=event.get("charttime", event.get("timestamp")),
                 content=e_content,
                 visit_label=visit_label
             ))

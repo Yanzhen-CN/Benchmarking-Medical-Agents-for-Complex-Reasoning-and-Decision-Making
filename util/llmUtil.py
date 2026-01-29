@@ -62,7 +62,7 @@ class _RateLimiter:
         self.sem.release()
 
 def _retry_sleep(attempt: int) -> None:
-    time_to_wait = random.random() * 5 * (2 ** attempt)
+    time_to_wait = min(random.random() * 5 * (2 ** attempt), 30)
     logger.info(f"Sleep {time_to_wait}s before retrying after attempt {attempt}...")
     time.sleep(time_to_wait)
 

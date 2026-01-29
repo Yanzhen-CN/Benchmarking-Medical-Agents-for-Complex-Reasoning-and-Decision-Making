@@ -124,7 +124,7 @@ class ContextConfig:
     def __init__(self):
         build = BuildConfig()
         self.MAX_WORKERS: int = 16
-        self.SEQUENCE_IN_PATH: Path = build.eventStreamExtract.PATIENT_PATH
+        self.SEQUENCE_IN_PATH: Path = build.eventStreamExtract.PATIENT_SEQUENCE_PATH
         self.CONTEXT_OUT_DIR: Path = build.paths.BENCH_DATA_DIR / "context"
         
         self.USE_LLM_FOR_IMAGE_DESC: bool = True
