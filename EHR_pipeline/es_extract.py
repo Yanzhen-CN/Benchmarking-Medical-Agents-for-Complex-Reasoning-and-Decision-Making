@@ -550,7 +550,7 @@ def main():
             # Assign Pxxxx-Vy-E01 style ids after sorting.
             new_events = []
             for i, e in enumerate(events, start=1):
-                eid = f"{patient_id}-{visit['visit_id']}-E{i:03d}"
+                eid = f"{patient_id}-{visit['visit_id']}-E{i}"
                 new_events.append({"event_id": eid, **e})  # id first, then original fields
 
             visit["event_stream"] = new_events
