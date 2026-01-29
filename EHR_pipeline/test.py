@@ -230,24 +230,37 @@ def build_vital_events(df: pd.DataFrame) -> List[Dict]:
     return events
 
 def build_med_events(df: pd.DataFrame) -> List[Dict]:
+    """
+    Optimized: Aggregates medications administered at the same starttime into a single event.
+    """
     if df is None or df.empty: return []
+    
+    df = df.dropna(subset=["starttime"]).copy()
+    
     events = []
-    for row in df.to_dict("records"):
-        if pd.isna(row.get("starttime")): continue
-        
-        dose_val = row.get("dose_val_rx")
-        dose_unit = row.get("dose_unit_rx")
-        dose_str = f"{dose_val} {dose_unit}" if pd.notna(dose_val) else None
-
+    for start_ts, group in df.groupby("starttime"):
+        items = []
+        for r in group.to_dict("records"):
+            dose_val = r.get("dose_val_rx")
+            dose_unit = r.get("dose_unit_rx")
+            dose_str = None
+            if pd.notna(dose_val):
+                dose_str = f"{dose_val} {r.get('dose_unit_rx', '')}".strip()
+            
+            items.append({
+                "drug": _nan_to_none(r.get("drug")),
+                "route": _nan_to_none(r.get("route")),
+                "dose": _nan_to_none(dose_str),
+                "status": r.get("status"),
+                "end_timestamp": _fmt_ts(r.get("stoptime")) 
+            })
+            
         events.append({
             "type": "MEDICATION",
-            "timestamp": _fmt_ts(row["starttime"]),
-            "end_timestamp": _fmt_ts(row.get("stoptime")),
-            "drug": _nan_to_none(row.get("drug")),
-            "route": _nan_to_none(row.get("route")),
-            "dose": dose_str,
-            "status": row.get("status")
+            "timestamp": _fmt_ts(start_ts),
+            "items": items
         })
+        
     return events
 
 def build_proc_events(df: pd.DataFrame) -> List[Dict]:
@@ -314,7 +327,7 @@ def process_patient(file_path: Path, data_maps: Dict[str, Dict]) -> str:
             final_stream = []
             for idx, evt in enumerate(events, 1):
                 pad = max(2, len(str(idx)))
-                eid = f"{pid}-{visit['visit_id']}-E{idx:0{pad}d}"
+                eid = f"{pid}-{visit['visit_id']}-E{idx}"
                 evt_with_id = {"event_id": eid}
                 evt_with_id.update(evt)
                 final_stream.append(evt_with_id)
