@@ -1,94 +1,199 @@
+import os
 import json
 from pathlib import Path
+from typing import Dict, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
-from note_slicing import split_note_to_adm_discharge
+import polars as pl
+from tqdm import tqdm
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-RAW_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
-BENCH_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "bench_data"
-PATIENT_DIR = BENCH_DATA_DIR / "patients"
-PATIENT_INDEXES = BENCH_DATA_DIR / "patient_index.csv"
+from EHR_pipeline.note_slicing import split_note_to_adm_discharge
+from util.logUtil import setup_logger
+from config import BuildConfig
 
-DISCHARGE_NOTE_PATH = RAW_DATA_DIR / "note" / "discharge.csv"
+logger = setup_logger()
+config = BuildConfig()
+
+PATIENT_DIR = Path(config.noteExtract.PATIENT_OUTPUT_PATH)
+PATIENT_INDEXES = Path(config.noteExtract.PATIENT_INDEXES_PATH)
+DISCHARGE_NOTE_PATH = Path(config.noteExtract.DISCHARGE_NOTES_PATH)
 
 
-def build_discharge_map(discharge_df: pd.DataFrame) -> dict[tuple[int, int], str]:
-    """
-    返回 (subject_id, hadm_id) -> text
-    若同一 (subject_id, hadm_id) 有多条记录：
-    - 有 charttime 列则按时间取最后一条
-    - 否则保留第一条
-    """
-    df = discharge_df.copy()
+# ============================================================
+# Polars discharge map builder (fast, avoids full sort)
+# ============================================================
+def build_discharge_map_polars(
+    discharge_csv: Path,
+    subject_ids: List[int],
+) -> Dict[Tuple[int, int], str]:
+    cols = pl.read_csv(str(discharge_csv), n_rows=1).columns
+    has_charttime = "charttime" in cols
 
-    # 统一类型，避免 int/str 匹配失败
-    df["subject_id"] = pd.to_numeric(df["subject_id"], errors="coerce").astype("Int64")
-    df["hadm_id"] = pd.to_numeric(df["hadm_id"], errors="coerce").astype("Int64")
+    use_cols = ["subject_id", "hadm_id", "text"] + (["charttime"] if has_charttime else [])
 
-    df = df.dropna(subset=["subject_id", "hadm_id", "text"])
-    df["subject_id"] = df["subject_id"].astype(int)
-    df["hadm_id"] = df["hadm_id"].astype(int)
+    lf = (
+        pl.scan_csv(str(discharge_csv), ignore_errors=True)
+        .select([c for c in use_cols if c in cols])
+        .with_columns([
+            pl.col("subject_id").cast(pl.Int64, strict=False),
+            pl.col("hadm_id").cast(pl.Int64, strict=False),
+            pl.col("text").cast(pl.Utf8, strict=False),
+        ])
+        .filter(
+            pl.col("subject_id").is_in(subject_ids)
+            & pl.col("subject_id").is_not_null()
+            & pl.col("hadm_id").is_not_null()
+            & pl.col("text").is_not_null()
+            & (pl.col("text").str.len_chars() > 0)
+        )
+    )
 
-    if "charttime" in df.columns:
-        df["charttime"] = pd.to_datetime(df["charttime"], errors="coerce")
-        df = df.sort_values("charttime")
-        df = df.drop_duplicates(subset=["subject_id", "hadm_id"], keep="last")
+    if has_charttime:
+        lf = lf.with_columns(
+            pl.col("charttime").cast(pl.Utf8, strict=False).str.to_datetime(strict=False)
+        )
+        # ✅ group 内按 charttime 排序取 last，避免全表 sort
+        lf = (
+            lf.group_by(["subject_id", "hadm_id"])
+            .agg(pl.col("text").sort_by("charttime").last().alias("text"))
+        )
     else:
-        df = df.drop_duplicates(subset=["subject_id", "hadm_id"], keep="first")
+        lf = (
+            lf.group_by(["subject_id", "hadm_id"])
+            .agg(pl.first("text").alias("text"))
+        )
 
-    return df.set_index(["subject_id", "hadm_id"])["text"].to_dict()
+    df = lf.collect(streaming=True)
+
+    out: Dict[Tuple[int, int], str] = {}
+    for sid, hid, text in df.iter_rows():
+        out[(int(sid), int(hid))] = text
+    return out
 
 
-def main():
-    patient_indexes = pd.read_csv(PATIENT_INDEXES)
-    discharge_df = pd.read_csv(DISCHARGE_NOTE_PATH)
+# ============================================================
+# Worker (thread-safe: only reads discharge_map + edits its own file)
+# ============================================================
+def process_one_patient_thread(
+    subject_id: int,
+    patient_id: str,
+    discharge_map: Dict[Tuple[int, int], str],
+) -> Tuple[str, int, int]:
+    patient_file = PATIENT_DIR / f"{patient_id}.json"
+    if not patient_file.exists():
+        return f"{patient_id}.json", 0, 0
 
-    discharge_map = build_discharge_map(discharge_df)
+    with open(patient_file, "r", encoding="utf-8") as f:
+        patient_data = json.load(f)
 
-    for _, row in patient_indexes.iterrows():
-        subject_id = (row["subject_id"])
-        patient_id = str(row["patient_id"]).strip()
-        patient_file = PATIENT_DIR / f"{patient_id}.json"
-        if not patient_file.exists():
-            print(f"Patient file {patient_file} does not exist. Skipping.")
+    try:
+        file_subj = int(patient_data["patient_info"]["subject_id"])
+    except Exception:
+        return patient_file.name, 0, 0
+
+    if file_subj != subject_id:
+        return patient_file.name, 0, 0
+
+    ok_visits = 0
+    missing_visits = 0
+    changed = False  # ✅ 没变化就不写，省 IO
+
+    for v in patient_data.get("visits", []):
+        hadm_raw = v.get("hadm_id")
+        if hadm_raw is None:
+            continue
+        try:
+            hadm_id = int(hadm_raw)
+        except Exception:
             continue
 
-        with open(patient_file, "r") as f:
-            patient_data = json.load(f)
+        note_text = discharge_map.get((subject_id, hadm_id))
 
-        if int(patient_data["patient_info"]["subject_id"]) != subject_id:
-            print(f"Subject ID mismatch in {patient_file}. Skipping.")
-            continue
+        if v.get("ground_truth_note") != note_text:
+            v["ground_truth_note"] = note_text
+            changed = True
 
-        updated = 0
-        for v in patient_data.get("visits", []):
-            hadm_id = v.get("hadm_id")
-            if hadm_id is None:
-                continue
-            hadm_id = int(hadm_id)
-
-            note_text = discharge_map.get((subject_id, hadm_id))
-            v["ground_truth_note"] = note_text  # 找不到则为 None
-            if not note_text:
-                # 没有 note，就保持 admission_note/discharge_note 为 None
+        if not note_text:
+            missing_visits += 1
+            if v.get("admission_info", {}).get("admission_note") is not None:
                 v.setdefault("admission_info", {})["admission_note"] = None
+                changed = True
+            if v.get("discharge_info", {}).get("discharge_note") is not None:
                 v.setdefault("discharge_info", {})["discharge_note"] = None
-                continue
+                changed = True
+            continue
 
-            parsed = split_note_to_adm_discharge(note_text)
+        parsed = split_note_to_adm_discharge(note_text)
+        adm = parsed.get("admission_info")
+        dis = parsed.get("discharge_info")
 
-            # 关键：写回到你 JSON 里对应位置
-            v.setdefault("admission_info", {})["admission_note"] = parsed.get("admission_note")
-            v.setdefault("discharge_info", {})["discharge_note"] = parsed.get("discharge_note")
+        if v.get("admission_info", {}).get("admission_note") != adm:
+            v.setdefault("admission_info", {})["admission_note"] = adm
+            changed = True
+        if v.get("discharge_info", {}).get("discharge_note") != dis:
+            v.setdefault("discharge_info", {})["discharge_note"] = dis
+            changed = True
 
-            if note_text is not None:
-                updated += 1
+        ok_visits += 1
 
-        with open(patient_file, "w") as f:
-            json.dump(patient_data, f, ensure_ascii=False, indent=2)
+    if changed:
+        tmp_path = patient_file.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            # no indent for speed
+            json.dump(patient_data, f, ensure_ascii=False, allow_nan=False,indent=2)
+        tmp_path.replace(patient_file)
 
-        print(f"{patient_file.name}: updated {updated} visit ground_truth_note")
+    return patient_file.name, ok_visits, missing_visits
+
+
+# ============================================================
+# Main
+# ============================================================
+def extract_notes():
+    patient_indexes = pd.read_csv(PATIENT_INDEXES, usecols=["subject_id", "patient_id"])
+    patient_indexes["subject_id"] = pd.to_numeric(patient_indexes["subject_id"], errors="coerce").astype("Int64")
+    patient_indexes = patient_indexes.dropna(subset=["subject_id", "patient_id"])
+    patient_indexes["subject_id"] = patient_indexes["subject_id"].astype(int)
+    patient_indexes["patient_id"] = patient_indexes["patient_id"].astype(str).str.strip()
+
+    subject_ids = patient_indexes["subject_id"].unique().tolist()
+    logger.info(f"patient_indexes: {len(patient_indexes)} rows, unique subject_id={len(subject_ids)}")
+
+    logger.info("Building discharge_map (polars scan_csv + group_by)...")
+    discharge_map = build_discharge_map_polars(DISCHARGE_NOTE_PATH, subject_ids)
+    logger.info(f"Discharge map size: {len(discharge_map)}")
+
+    # ✅ threads: for IO heavy workloads it's great; for CPU heavy, modest threads is best
+    total = len(patient_indexes)
+    req_workers = int(getattr(getattr(config, "run", None), "NUM_WORKERS", 16) or 16)
+    max_workers = max(1, min(req_workers, total, 32))  # cap 32 to avoid IO thrash
+    logger.info(f"Concurrent processing: ThreadPoolExecutor max_workers={max_workers}")
+
+    ok_patients = 0
+    ok_visits = 0
+    missing_visits = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = []
+        for row in patient_indexes.itertuples(index=False):
+            futs.append(
+                ex.submit(process_one_patient_thread, int(row.subject_id), str(row.patient_id), discharge_map)
+            )
+
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Processing patients (threads)"):
+            try:
+                fname, okv, miss = fut.result(timeout=300)
+                ok_patients += 1
+                ok_visits += okv
+                missing_visits += miss
+            except Exception as e:
+                logger.error(f"Error processing patient: {e}")
+    logger.success("DONE")
+    logger.info(f"Patients processed: {ok_patients}")
+    logger.info(f"Visits updated (have note): {ok_visits}")
+    logger.info(f"Visits missing note: {missing_visits}")
 
 
 if __name__ == "__main__":
-    main()
+    extract_notes()

@@ -1,119 +1,104 @@
+# STEP 0 / 预处理：只抽取异常生命体征 & 异常化验结果
+
+
+from __future__ import annotations
+
+from pathlib import Path
+import polars as pl
 import pandas as pd
 from pathlib import Path
-import sys
+from tqdm import tqdm
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-RAW_DATA_DIR = ROOT_DIR / "EHR_pipeline" / "raw_data"
+from util.logUtil import setup_logger
+logger = setup_logger()
+from config import BuildConfig
+config = BuildConfig()
 
-def extract_abnormal_data():
-    """Global preprocessing: extract only abnormal records from chartevents and labevents"""
-    print("Starting preprocessing, extracting abnormal records...")
+def _write_empty_like(input_csv: Path, output_csv: Path) -> None:
+    """
+    Create an empty CSV with the same header as input_csv.
+    Useful when no rows match filters (keeps downstream consistent).
+    """
+    header_df = pd.read_csv(input_csv, nrows=0)
+    header_df.to_csv(output_csv, index=False)
+
+
+
+
+def extract_abnormal_data() -> None:
+    logger.info("Starting preprocessing (polars): extracting abnormal records")
+
+    # ============================================================
+    # 1) chartevents: warning == 1
+    # ============================================================
+    logger.info("1) Processing vital signs: icu/chartevents.csv (warning==1)")
     
-    # 1. Process vital signs data (chartevents.csv) - warning == 1
-    print("\n1. Processing vital signs data (warning=1)...")
-    vital_path = RAW_DATA_DIR / "icu/chartevents.csv"
-    
-    if vital_path.exists():
-        vital_chunks = []
-        total_rows = 0
-        processed_rows = 0
-        
-        # Process in chunks for memory efficiency
-        for chunk in pd.read_csv(
-            vital_path,
-            chunksize=2_000_000,
-            low_memory=False
-        ):
-            total_rows += len(chunk)
-            
-            # Handle potential data type issues with warning column
-            # Convert to string and strip whitespace for consistent comparison
-            if 'warning' in chunk.columns:
-                chunk['warning_clean'] = chunk['warning'].astype(str).str.strip()
-                
-                # Filter for warning=1 (including variants like '1', '1.0')
-                filtered = chunk[
-                    (chunk['warning_clean'] == '1') | 
-                    (chunk['warning_clean'] == '1.0')
-                ]
-                filtered = filtered.drop(columns=['warning_clean'])
-                
-                if not filtered.empty:
-                    vital_chunks.append(filtered)
-                    processed_rows += len(filtered)
-            else:
-                print("Warning: 'warning' column not found in chartevents.csv")
-                break
-        
-        if vital_chunks:
-            vital_df = pd.concat(vital_chunks, ignore_index=True)
-            output_path = RAW_DATA_DIR / "chartevents_extract.csv"
-            vital_df.to_csv(output_path, index=False)
-            print(f"   Original rows: {total_rows:,}")
-            print(f"   Extracted {len(vital_df):,} rows with warning=1")
-            print(f"   Saved to: {output_path}")
-        else:
-            print(f"   No records with warning=1 found in {total_rows:,} rows")
-            # Create empty extract file for consistency
-            pd.DataFrame(columns=pd.read_csv(vital_path, nrows=0).columns).to_csv(
-                RAW_DATA_DIR / "chartevents_extract.csv", index=False
-            )
+    vital_path = config.eventExtract.CHARTEVENTS_IN_PATH
+    vital_out = config.eventExtract.CHARTEVENTS_OUT_PATH
+
+    if not vital_path.exists():
+        logger.error(f"File not found: {vital_path}")
     else:
-        print(f"   File not found: {vital_path}")
-    
-    # 2. Process lab data (labevents.csv) - flag == 'abnormal'
-    print("\n2. Processing lab data (flag='abnormal')...")
-    lab_path = RAW_DATA_DIR / "hosp/labevents.csv"
-    
-    if lab_path.exists():
-        lab_chunks = []
-        total_rows = 0
-        processed_rows = 0
-        
-        for chunk in pd.read_csv(
-            lab_path,
-            chunksize=2_000_000,
-            low_memory=False
-        ):
-            total_rows += len(chunk)
-            
-            # Handle potential data type issues with flag column
-            if 'flag' in chunk.columns:
-                # Convert to string, lowercase, and strip whitespace
-                chunk['flag_clean'] = chunk['flag'].astype(str).str.lower().str.strip()
-                
-                # Filter for flag='abnormal'
-                filtered = chunk[chunk['flag_clean'] == 'abnormal']
-                filtered = filtered.drop(columns=['flag_clean'])
-                
-                if not filtered.empty:
-                    lab_chunks.append(filtered)
-                    processed_rows += len(filtered)
-            else:
-                print("Warning: 'flag' column not found in labevents.csv")
-                break
-        
-        if lab_chunks:
-            lab_df = pd.concat(lab_chunks, ignore_index=True)
-            output_path = RAW_DATA_DIR / "labevents_extract.csv"
-            lab_df.to_csv(output_path, index=False)
-            print(f"   Original rows: {total_rows:,}")
-            print(f"   Extracted {len(lab_df):,} rows with flag='abnormal'")
-            print(f"   Saved to: {output_path}")
-        else:
-            print(f"   No records with flag='abnormal' found in {total_rows:,} rows")
-            # Create empty extract file for consistency
-            pd.DataFrame(columns=pd.read_csv(lab_path, nrows=0).columns).to_csv(
-                RAW_DATA_DIR / "labevents_extract.csv", index=False
+        # 删除旧文件，避免重复 append
+        if vital_out.exists():
+            vital_out.unlink()
+
+        # 用 scan_csv 懒加载；streaming=True 让执行尽量流式
+        lf = (
+            pl.scan_csv(vital_path, ignore_errors=True)
+            .with_columns(
+                pl.col("warning").cast(pl.Utf8).str.strip_chars().alias("warning_clean")
             )
+            .filter(pl.col("warning_clean").is_in(["1", "1.0"]))
+            .drop("warning_clean")
+        )
+
+        # 关键：sink_csv 会边执行边写出（更接近你 pandas chunks 的效果）
+        try:
+            lf.sink_csv(vital_out)  # Polars 会自动并行解析/执行
+            # 检查是否写出为空（文件可能存在但只有 header 或甚至没写）
+            if vital_out.exists() and vital_out.stat().st_size > 0:
+                logger.success(f"Vital extract done: saved={vital_out}")
+            else:
+                logger.warning("Vital extract seems empty; writing empty extract file")
+                _write_empty_like(vital_path, vital_out)
+        except pl.exceptions.ColumnNotFoundError:
+            logger.error("Column 'warning' not found in chartevents.csv; aborting vital extraction")
+
+    # ============================================================
+    # 2) labevents: flag == 'abnormal'
+    # ============================================================
+    logger.info("2) Processing labs: hosp/labevents.csv (flag=='abnormal')")
+    lab_path = config.eventExtract.LABEVENTS_IN_PATH
+    lab_out = config.eventExtract.LABEVENTS_OUT_PATH
+
+    if not lab_path.exists():
+        logger.error(f"File not found: {lab_path}")
     else:
-        print(f"   File not found: {lab_path}")
-    
-    print("\n" + "="*50)
-    print("Preprocessing complete!")
-    print("Extracted files are saved in:", RAW_DATA_DIR)
-    print("Naming convention: original_filename + '_extract.csv'")
-    print("="*50)
+        if lab_out.exists():
+            lab_out.unlink()
+
+        lf = (
+            pl.scan_csv(lab_path, ignore_errors=True)
+            .with_columns(
+                pl.col("flag").cast(pl.Utf8).str.to_lowercase().str.strip_chars().alias("flag_clean")
+            )
+            .filter(pl.col("flag_clean") == "abnormal")
+            .drop("flag_clean")
+        )
+
+        try:
+            lf.sink_csv(lab_out)
+            if lab_out.exists() and lab_out.stat().st_size > 0:
+                logger.success(f"Lab extract done: saved={lab_out}")
+            else:
+                logger.warning("Lab extract seems empty; writing empty extract file")
+                _write_empty_like(lab_path, lab_out)
+        except pl.exceptions.ColumnNotFoundError:
+            logger.error("Column 'flag' not found in labevents.csv; aborting lab extraction")
+
+    logger.success("Preprocessing complete (polars)")
+    logger.info(f"Extracted files saved under: {config.paths.RAW_DATA_DIR}")
 
 if __name__ == "__main__":
     extract_abnormal_data()

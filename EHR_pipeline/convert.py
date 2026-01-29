@@ -3,11 +3,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from config import BuildConfig
+from util.logUtil import setup_logger
+logger = setup_logger()
+config = BuildConfig()
 # --- 配置部分 ---
 TS_FMT = "%Y-%m-%d %H:%M:%S"
-ROOT = Path(__file__).resolve().parent
-INPUT_DIR = ROOT / "bench_data" / "patients"
-OUTPUT_DIR = ROOT / "bench_data" / "patients_sequence"
+INPUT_DIR = Path(config.eventStreamExtract.PATIENT_PATH)
+OUTPUT_DIR = Path(config.eventStreamExtract.PATIENT_SEQUENCE_PATH)
 
 # 黑名单字段（这些会被清洗掉，不进入 Content）
 BLACKLIST_KEYS = {
@@ -51,7 +54,7 @@ def convert_single_patient(json_path: Path) -> Optional[Path]:
         with json_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"[ERROR] 读取失败 {json_path}: {e}")
+        logger.error(f"读取失败 {json_path}: {e}")
         return None
 
     patient_info = data.get("patient_info") or {}
@@ -153,7 +156,7 @@ def convert_single_patient(json_path: Path) -> Optional[Path]:
 
 def batch_convert():
     if not INPUT_DIR.exists():
-        print(f"[错误] 输入目录不存在: {INPUT_DIR}")
+        logger.error(f"输入目录不存在: {INPUT_DIR}")
         return
 
     files = sorted(INPUT_DIR.glob("P*.json"))
@@ -162,16 +165,16 @@ def batch_convert():
     # 这里建议全量重新跑一遍，去掉过滤条件，或者手动删除旧文件
     target_files = [p for p in files if "_sequenced" not in p.name]
 
-    print(f"找到 {len(target_files)} 个源文件，准备转换...")
+    logger.info(f"找到 {len(target_files)} 个源文件，准备转换...")
     
     count = 0
     for p in target_files:
         out = convert_single_patient(p)
         if out:
-            print(f"  -> 生成: {out.name}")
+            logger.info(f"  -> 生成: {out.name}")
             count += 1
             
-    print(f"\n全部完成，共转换 {count} 个病人文件。")
+    logger.success(f"\n全部完成，共转换 {count} 个病人文件。")
 
 if __name__ == "__main__":
     batch_convert()

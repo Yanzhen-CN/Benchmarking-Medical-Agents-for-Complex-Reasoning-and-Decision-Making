@@ -1,2 +1,9 @@
 *.csv
-*.json
+
+env
+*_data
+__pycache__
+*.pyc
+*.pyo
+.vscode
+.env
