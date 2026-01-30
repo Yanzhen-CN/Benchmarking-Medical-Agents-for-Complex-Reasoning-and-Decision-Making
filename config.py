@@ -88,7 +88,7 @@ class BuildConfig:
             self.PATIENT_OUTPUT_PATH: Path = paths.BENCH_DATA_DIR / "patients"
             
             # 是否使用LLM辅助切分笔记
-            self.USE_LLM: bool = True
+            self.USE_LLM: bool = False
             
     def __init__(self):
         self.paths = BuildConfig.Paths()
