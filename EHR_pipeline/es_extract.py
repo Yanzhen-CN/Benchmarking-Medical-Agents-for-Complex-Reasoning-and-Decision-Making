@@ -46,6 +46,28 @@ MAX_WORKERS = min(config.run.MAX_WORKERS, os.cpu_count() or 1)
 # Utility Functions
 # ============================================================
 
+def _available_cols(path: Path) -> List[str]:
+    """
+    Read header only to get existing columns (robust across different extracts/raw files).
+    """
+    try:
+        return pl.read_csv(str(path), n_rows=0).columns
+    except Exception:
+        # fallback: try lazy schema (may fail on some malformed files)
+        return pl.scan_csv(str(path), has_header=True, ignore_errors=True).schema.keys()
+
+
+def _scan_csv_safe(path: Path, columns: List[str]) -> pl.LazyFrame:
+    """
+    scan_csv but only selects columns that actually exist in the file.
+    """
+    avail = set(_available_cols(path))
+    use_cols = [c for c in columns if c in avail]
+    if not use_cols:
+        raise ValueError(f"No requested columns exist in {path}")
+    return pl.scan_csv(str(path), has_header=True, ignore_errors=True).select(use_cols)
+
+
 def _fmt_ts(x: Any) -> Optional[str]:
     if x is None or pd.isna(x):
         return None
@@ -317,6 +339,113 @@ def load_img_data(cohort_ids: Set[int]) -> pd.DataFrame:
     logger.info(f"[Loader-pl] Img loaded: rows={len(out)} from {fpath.name}")
     return out
 
+def load_micro_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    """
+    Microbiology loader (Polars -> pandas).
+
+    - Reads hosp/microbiologyevents.csv (or microbiologyevents_extract.csv if exists via _find_data_file)
+    - Robust datetime parsing:
+        charttime: try "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", date-only "%Y-%m-%d"
+        chartdate: same
+      event_time = coalesce(charttime_dt, chartdate_dt)
+    - Filters by cohort hadm_id
+    - Returns pandas DF with unified 'event_time' column (datetime64[ns])
+    """
+    logger = get_logger()
+    logger.info("[Loader-pl] Loading Microbiology...")
+
+    cohort_list = list(cohort_ids)
+
+    # prefer *_extract.csv if present, else hosp/microbiologyevents.csv
+    fpath = _find_data_file("microbiologyevents", "hosp")
+
+    # columns we care about (will be intersected with existing)
+    cols = [
+        "hadm_id",
+        "charttime",
+        "chartdate",
+        "micro_specimen_id",
+        "spec_type_desc",
+        "test_seq",
+        "test_name",
+        "org_name",
+        "isolate_num",
+        "ab_name",
+        "interpretation",
+        "dilution_text",
+        "dilution_comparison",
+        "dilution_value",
+        "comments",
+    ]
+
+    # scan and select only existing columns
+    lf0 = pl.scan_csv(str(fpath), has_header=True, ignore_errors=True)
+    existing = set(lf0.collect_schema().names())
+    use_cols = [c for c in cols if c in existing]
+    if not use_cols:
+        logger.warning(f"[Loader-pl] Microbiology: no usable columns in {fpath.name}")
+        return pd.DataFrame()
+
+    micro_lf = lf0.select(use_cols).with_columns(
+        pl.col("hadm_id").cast(pl.Int64, strict=False)
+    )
+
+    def _parse_mimic_dt(col: pl.Expr) -> pl.Expr:
+        """
+        Robust datetime parser for MIMIC-ish strings.
+        Returns pl.Datetime or null (never throws).
+        """
+        s = (
+            col.cast(pl.Utf8, strict=False)
+             .str.strip_chars()
+             .replace("", None)
+             .replace("nan", None)
+             .replace("None", None)
+        )
+
+        p1 = s.str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        p2 = s.str.strptime(pl.Datetime, format="%Y-%m-%dT%H:%M:%S", strict=False)
+        p3 = s.str.strptime(pl.Date, format="%Y-%m-%d", strict=False).cast(pl.Datetime, strict=False)
+
+        return pl.coalesce([p1, p2, p3])
+
+    # add parsed datetime columns safely (even if charttime/chartdate missing)
+    if "charttime" in use_cols:
+        micro_lf = micro_lf.with_columns(
+            _parse_mimic_dt(pl.col("charttime")).alias("charttime_dt")
+        )
+    else:
+        micro_lf = micro_lf.with_columns(
+            pl.lit(None, dtype=pl.Datetime).alias("charttime_dt")
+        )
+
+    if "chartdate" in use_cols:
+        micro_lf = micro_lf.with_columns(
+            _parse_mimic_dt(pl.col("chartdate")).alias("chartdate_dt")
+        )
+    else:
+        micro_lf = micro_lf.with_columns(
+            pl.lit(None, dtype=pl.Datetime).alias("chartdate_dt")
+        )
+
+    micro_lf = (
+        micro_lf.with_columns([
+            pl.coalesce([pl.col("charttime_dt"), pl.col("chartdate_dt")]).alias("event_time"),
+        ])
+        .drop(["charttime_dt", "chartdate_dt"])
+        .filter(pl.col("hadm_id").is_in(cohort_list))
+    )
+
+    out = _to_pandas(micro_lf)
+
+    # pandas side: ensure datetime dtype
+    if "event_time" in out.columns:
+        out["event_time"] = pd.to_datetime(out["event_time"], errors="coerce")
+
+    logger.info(f"[Loader-pl] Microbiology loaded: rows={len(out)} from {fpath.name}")
+    return out
+
+
 # ============================================================
 # Event Builders
 # ============================================================
@@ -435,6 +564,133 @@ def build_img_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
             }
         )
     return events
+def build_micro_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+    """
+    Build microbiology events from pandas slice (one hadm_id).
+    Uses event_time (charttime fallback chartdate) as timestamp.
+    Groups by (micro_specimen_id, test_seq) if present else event_time.
+    """
+    if df is None or df.empty:
+        return []
+
+    if "event_time" not in df.columns:
+        return []
+
+    df = df.dropna(subset=["event_time"]).copy()
+    if df.empty:
+        return []
+
+    # choose grouping columns for "one specimen/test"
+    group_cols: List[str] = []
+    if "micro_specimen_id" in df.columns:
+        group_cols.append("micro_specimen_id")
+    if "test_seq" in df.columns:
+        group_cols.append("test_seq")
+    if not group_cols:
+        group_cols = ["event_time"]
+
+    df = df.sort_values(by=["event_time"], na_position="last")
+
+    events: List[Dict[str, Any]] = []
+
+    for _, g in df.groupby(group_cols, dropna=False):
+        g_sorted = g.sort_values(by=["event_time"], na_position="last")
+        first = g_sorted.iloc[0].to_dict()
+
+        ts_str = _fmt_ts(first.get("event_time"))
+        if ts_str is None:
+            continue
+
+        specimen_id = _nan_to_none(first.get("micro_specimen_id"))
+        spec_type = _nan_to_none(first.get("spec_type_desc"))
+        test_name = _nan_to_none(first.get("test_name"))
+        test_seq = _nan_to_none(first.get("test_seq"))
+
+        # organism existence: org_name non-null AND not a known negative token
+        has_org = False
+        if "org_name" in g_sorted.columns:
+            org_series = g_sorted["org_name"].dropna()
+            if not org_series.empty:
+                # treat "NEGATIVE"/"NO GROWTH" etc. as negative signals (optional but safer)
+                neg_tokens = {"NEGATIVE", "NO GROWTH", "NONE", "N/A"}
+                cleaned = org_series.astype(str).str.strip()
+                has_org = (~cleaned.str.upper().isin(neg_tokens)).any()
+
+        organisms: List[Dict[str, Any]] = []
+
+        if has_org:
+            org_group_cols = ["org_name"]
+            if "isolate_num" in g_sorted.columns:
+                org_group_cols.append("isolate_num")
+
+            for org_key, og in g_sorted.groupby(org_group_cols, dropna=False):
+                # normalize key to tuple
+                if not isinstance(org_key, tuple):
+                    org_key = (org_key,)
+
+                org_name = org_key[0]
+                isolate_num = org_key[1] if (len(org_key) > 1) else None
+
+                # skip negative tokens again (in case mixed)
+                if org_name is None or (isinstance(org_name, str) and org_name.strip().upper() in {"NEGATIVE", "NO GROWTH", "NONE", "N/A"}):
+                    continue
+
+                antibiotics: List[Dict[str, Any]] = []
+                if "ab_name" in og.columns:
+                    for _, r in og.iterrows():
+                        ab = r.get("ab_name")
+                        if ab is None or pd.isna(ab):
+                            continue
+                        antibiotics.append(
+                            {
+                                "ab_name": _nan_to_none(ab),
+                                "interpretation": _nan_to_none(r.get("interpretation")),
+                                "dilution_text": _nan_to_none(r.get("dilution_text")),
+                                "dilution_comparison": _nan_to_none(r.get("dilution_comparison")),
+                                "dilution_value": _nan_to_none(r.get("dilution_value")),
+                            }
+                        )
+
+                organisms.append(
+                    {
+                        "org_name": _nan_to_none(org_name),
+                        "isolate_num": _nan_to_none(isolate_num),
+                        "antibiotics": antibiotics,
+                    }
+                )
+
+        # collect comments
+        comments_out: Optional[List[str]] = None
+        if "comments" in g_sorted.columns:
+            cs: List[str] = []
+            for c in g_sorted["comments"].dropna().unique().tolist():
+                if isinstance(c, str):
+                    t = c.strip()
+                    if t and t != "___":
+                        cs.append(t)
+            if cs:
+                comments_out = cs
+
+        events.append(
+            {
+                "type": "microbiology",
+                "timestamp": ts_str,
+                "specimen": {
+                    "specimen_id": specimen_id,
+                    "spec_type": spec_type,
+                    "test_name": test_name,
+                    "test_seq": test_seq,
+                },
+                "results": {
+                    "negative": (len(organisms) == 0),
+                    "organisms": organisms,
+                    "comments": comments_out,
+                },
+            }
+        )
+
+    events.sort(key=lambda x: (x["timestamp"], x["type"]))
+    return events
 
 # ============================================================
 # Worker
@@ -466,6 +722,7 @@ def process_patient(file_path: Path, data_maps: Dict[str, Dict[int, pd.DataFrame
             events.extend(build_med_events(data_maps["med"].get(hid)))
             events.extend(build_proc_events(data_maps["proc"].get(hid)))
             events.extend(build_img_events(data_maps["img"].get(hid)))
+            events.extend(build_micro_events(data_maps["micro"].get(hid))) 
 
             events = [e for e in events if e.get("timestamp")]
             events.sort(key=lambda x: (x["timestamp"], x["type"]))
@@ -518,6 +775,7 @@ def event_stream_extract():
             "med": io_pool.submit(load_med_data, cohort_ids),
             "proc": io_pool.submit(load_proc_data, cohort_ids),
             "img": io_pool.submit(load_img_data, cohort_ids),
+            "micro": io_pool.submit(load_micro_data, cohort_ids),
         }
         try:
             raw_lab = futures["lab"].result()
@@ -525,6 +783,7 @@ def event_stream_extract():
             raw_med = futures["med"].result()
             raw_proc = futures["proc"].result()
             raw_img = futures["img"].result()
+            raw_micro = futures["micro"].result()
         except Exception:
             logger.exception("!!! Critical Loader Error")
             return
@@ -537,10 +796,11 @@ def event_stream_extract():
         "med": df_to_map(raw_med),
         "proc": df_to_map(raw_proc),
         "img": df_to_map(raw_img),
+        "micro": df_to_map(raw_micro),
     }
 
     # free big dfs
-    del raw_lab, raw_vital, raw_med, raw_proc, raw_img
+    del raw_lab, raw_vital, raw_med, raw_proc, raw_img, raw_micro
     gc.collect()
 
     # 4) Processing (ThreadPool) - NO pickling of data_maps

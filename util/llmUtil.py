@@ -110,6 +110,54 @@ def _normalize_placeholders(obj: Any) -> Any:
         return {k: _normalize_placeholders(v) for k, v in obj.items()}
     return obj
 
+def _safe_int(x: Any) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return 0
+
+import tiktoken
+def _count_tokens_locally(messages: List[Dict[str, Any]], model: str) -> int:
+    """
+    Best-effort token estimation using tiktoken if available.
+    If tiktoken not installed or model not supported, returns 0.
+    """
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except Exception:
+        # fallback encoding
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return 0
+
+    # Very rough approximation (chat format differs across providers)
+    total = 0
+    for m in messages:
+        # count role/name + content
+        total += len(enc.encode(str(m.get("role", ""))))
+        if "name" in m:
+            total += len(enc.encode(str(m.get("name", ""))))
+        c = m.get("content", "")
+        if isinstance(c, (dict, list)):
+            c = json.dumps(c, ensure_ascii=False)
+        total += len(enc.encode(str(c)))
+    return total
+
+
+def _count_tokens_locally_texts(texts: Sequence[str], model: str) -> int:
+    if tiktoken is None:
+        return 0
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except Exception:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return 0
+    return sum(len(enc.encode(t)) for t in texts)
+
+
 class LLMUtil:
     """
     Wrapper for LLM interactions (chat completions, embeddings) using OpenAI-compatible API.
@@ -146,6 +194,11 @@ class LLMUtil:
             self._limiter.acquire()
             try:
                 resp = self.client.chat.completions.create(**payload)
+
+                # ---- token accounting (prefer API usage, fallback to local estimate) ----
+                fallback_pt = _count_tokens_locally(messages, model)
+                self._accumulate_chat_usage(getattr(resp, "usage", None), fallback_prompt_tokens=fallback_pt)
+
                 answer = (resp.choices[0].message.content or "").strip()
                 logger.debug(f"Chat response received (length {len(answer)}).")
                 return answer
@@ -177,7 +230,15 @@ class LLMUtil:
         """
 
         # A strong "only JSON" constraint
-        guard = "Return ONLY valid JSON. Do not include markdown, code fences, or explanations."
+        guard = '''
+Return ONLY valid JSON. For example, respond like this:
+{
+  "key1": "value1",
+  "key2": 123,
+  "key3": ["a", "b", "c"]
+}
+Do not include markdown, code fences, or explanations.
+'''
         if strict_only_json:
             sys = f"{system_prompt.strip()}\n\n{guard}"
         else:
@@ -208,7 +269,8 @@ class LLMUtil:
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning(f"chat_json attempt {attempt} failed to parse JSON: {last_err}")
-
+                if e == json.JSONDecodeError:
+                    logger.warning(f"Response text was: {text}")
                 # Repair prompt: feed back the error and ask for corrected JSON only
                 repair_user = (
                     "Your previous output could not be parsed as JSON.\n"
@@ -257,6 +319,10 @@ class LLMUtil:
                 self._limiter.acquire()
                 try:
                     resp = self.client.embeddings.create(model=model, input=buf)
+
+                    fallback_it = _count_tokens_locally_texts(buf, model)
+                    self._accumulate_embed_usage(getattr(resp, "usage", None), fallback_input_tokens=fallback_it)
+
                     return [d.embedding for d in resp.data]
                 except Exception as e:
                     last_err = f"{type(e).__name__}: {e}"
@@ -281,6 +347,70 @@ class LLMUtil:
 
         return out
     
+    def _accumulate_chat_usage(self, usage: Any, *, fallback_prompt_tokens: int = 0) -> None:
+        """
+        Accumulate token usage from API response usage if present.
+        usage may be OpenAI SDK object or dict.
+        """
+        if usage is None:
+            # fallback only counts prompt tokens; completion unknown
+            if fallback_prompt_tokens > 0:
+                self.token_usage["chat"]["prompt_tokens"] += fallback_prompt_tokens
+                self.token_usage["chat"]["total_tokens"] += fallback_prompt_tokens
+            return
+
+        # OpenAI SDK: usage.prompt_tokens / completion_tokens / total_tokens
+        if isinstance(usage, dict):
+            pt = _safe_int(usage.get("prompt_tokens"))
+            ct = _safe_int(usage.get("completion_tokens"))
+            tt = _safe_int(usage.get("total_tokens")) or (pt + ct)
+        else:
+            pt = _safe_int(getattr(usage, "prompt_tokens", None))
+            ct = _safe_int(getattr(usage, "completion_tokens", None))
+            tt = _safe_int(getattr(usage, "total_tokens", None)) or (pt + ct)
+
+        if pt == 0 and fallback_prompt_tokens > 0:
+            pt = fallback_prompt_tokens
+            tt = tt or (pt + ct)
+
+        self.token_usage["chat"]["prompt_tokens"] += pt
+        self.token_usage["chat"]["completion_tokens"] += ct
+        self.token_usage["chat"]["total_tokens"] += tt
+
+
+    def _accumulate_embed_usage(self, usage: Any, *, fallback_input_tokens: int = 0) -> None:
+        """
+        Accumulate embedding token usage.
+        Some providers return usage with different fields; handle best-effort.
+        """
+        if usage is None:
+            if fallback_input_tokens > 0:
+                self.token_usage["embeddings"]["input_tokens"] += fallback_input_tokens
+                self.token_usage["embeddings"]["total_tokens"] += fallback_input_tokens
+            return
+
+        if isinstance(usage, dict):
+            it = _safe_int(usage.get("input_tokens") or usage.get("prompt_tokens"))
+            tt = _safe_int(usage.get("total_tokens")) or it
+        else:
+            it = _safe_int(getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None))
+            tt = _safe_int(getattr(usage, "total_tokens", None)) or it
+
+        if it == 0 and fallback_input_tokens > 0:
+            it = fallback_input_tokens
+            tt = tt or it
+
+        self.token_usage["embeddings"]["input_tokens"] += it
+        self.token_usage["embeddings"]["total_tokens"] += tt
+        
+    def get_token_usage(self) -> Dict[str, Any]:
+        # shallow copy避免外部乱改
+        return {
+            "chat": dict(self.token_usage["chat"]),
+            "embeddings": dict(self.token_usage["embeddings"]),
+        }
+
+
     def __init__(self) -> None:
         self.config = LLMConfig()
         self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
@@ -288,8 +418,8 @@ class LLMUtil:
             "chat": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "embeddings": {"input_tokens": 0, "total_tokens": 0},
         }
-        max_inflight = getattr(self.config, "max_inflight", 16)
-        qps = getattr(self.config, "qps", 10)  # e.g., 5 or 10
+        max_inflight = getattr(self.config, "max_inflight", 8)
+        qps = getattr(self.config, "qps", 5)  # e.g., 5 or 10
         self._limiter = _RateLimiter(max_inflight=max_inflight, qps=qps)
         self.max_retries = self.config.max_retries
 
@@ -318,9 +448,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import json
 import os
-
+    
+    
+llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
 def _one_job(i: int) -> dict:
-    llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
+
     t0 = time.time()
     obj = llm.chat_json(
         system_prompt="You are a JSON generator. Output JSON only.",
@@ -360,6 +492,7 @@ def limiter_smoke_test():
     print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
     if results:
         print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
+    print(f"Token usage:{llm.get_token_usage()}")
 
 if __name__ == "__main__":
     limiter_smoke_test()

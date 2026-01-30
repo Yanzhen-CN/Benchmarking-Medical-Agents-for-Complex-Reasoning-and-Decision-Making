@@ -9,8 +9,9 @@ from config import ContextConfig, LLMConfig
 context_config = ContextConfig()
 llm_config = context_config.llm_config
 
-
-if context_config.USE_LLM_FOR_IMAGE_DESC or context_config.USE_LLM_FOR_REASON:
+llm: Optional[LLMUtil] = None 
+def init_llm_util():
+    global llm
     llm = LLMUtil()
 
 def infer_imaging_modality_target_llm(
@@ -140,3 +141,6 @@ def generate_reason_from_messages_llm(
         reason = reason[:1024].rstrip() + "..."
 
     return reason
+
+def get_token_usage() -> Dict[str, Any]:
+    return llm.get_token_usage()

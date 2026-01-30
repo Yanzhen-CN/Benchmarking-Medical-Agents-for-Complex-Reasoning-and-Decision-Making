@@ -8,11 +8,14 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 
 from tqdm import tqdm
 
-from EHR_pipeline.llm_tools import infer_imaging_modality_target_llm, generate_reason_from_messages_llm
+from EHR_pipeline.llm_tools import (
+    infer_imaging_modality_target_llm, generate_reason_from_messages_llm, get_token_usage, init_llm_util
+)
+from util.logUtil import setup_logger
 from config import ContextConfig
 
 config = ContextConfig()
-
+logger = setup_logger()
 # ============================================================
 # Rendering: one visit -> OpenAI-like multi-turn messages
 # ============================================================
@@ -264,9 +267,9 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             items = ev.get("items", []) or []
             messages.append(
                 {
-                    "role": "tool",
-                    "name": "environment.step",
+                    "role": "user",
                     "content": {
+                        "name": "environment",
                         **_build_vital_observation(items),
                         "timestamp": ev_ts,
                         "event_id": ev.get("event_id"),
@@ -291,9 +294,9 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             )
             messages.append(
                 {
-                    "role": "tool",
-                    "name": "environment.step",
+                    "role": "user",
                     "content": {
+                        "name": "environment",
                         **_build_lab_observation(items),
                         "timestamp": ev_ts,
                         "event_id": ev.get("event_id"),
@@ -322,9 +325,9 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             )
             messages.append(
                 {
-                    "role": "tool",
-                    "name": "environment.step",
+                    "role": "user",
                     "content": {
+                        "name": "environment",
                         **_build_micro_observation(items),
                         "timestamp": ev_ts,
                         "event_id": ev.get("event_id"),
@@ -353,9 +356,9 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             )
             messages.append(
                 {
-                    "role": "tool",
-                    "name": "environment.step",
+                    "role": "user",
                     "content": {
+                        "name": "environment",
                         "observation_type": "imaging_results",
                         "results": [
                             {
@@ -411,9 +414,9 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             )
             messages.append(
                 {
-                    "role": "tool",
-                    "name": "environment.step",
+                    "role": "user",
                     "content": {
+                        "name": "environment",
                         "observation_type": "medication",
                         "notes": "Prescription recorded; eMAR fields reflect administration outcomes if available.",
                         "timestamp": ev_ts,
@@ -444,9 +447,9 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             )
             messages.append(
                 {
-                    "role": "tool",
-                    "name": "environment.step",
+                    "role": "user",
                     "content": {
+                        "name": "environment",
                         "observation_type": "procedure_result",
                         "procedure": {"name": proc_name, "brief": "procedure_performed"},
                         "timestamp": ev_ts,
@@ -804,7 +807,7 @@ def build_context() -> None:
 
     outer_workers = getattr(config, "MAX_PATIENT_WORKERS", None) or 4
     inner_workers = getattr(config, "MAX_SESSION_WORKERS", None) or 8
-
+    init_llm_util()
     with ProcessPoolExecutor(max_workers=outer_workers) as ex:
         futures = [
             ex.submit(process_one_patient_file, str(p), str(out_path), inner_workers)
@@ -826,6 +829,7 @@ def build_context() -> None:
                 outer_pbar.update(1)
         finally:
             outer_pbar.close()
+    logger.info(f"Token usage: {get_token_usage()}")
 
 
 if __name__ == "__main__":
