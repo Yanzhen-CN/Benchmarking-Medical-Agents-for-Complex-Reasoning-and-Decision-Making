@@ -101,6 +101,7 @@ def split_note_to_adm_discharge_rule(text: str) -> Dict[str, Any]:
         "Social History",
         "Family History",
         "Physical Exam",
+        "Pertinent Result"
         "Brief Hospital Course",
         "Discharge Disposition",
         "Discharge Diagnosis",
@@ -167,6 +168,7 @@ def split_note_to_adm_discharge_rule(text: str) -> Dict[str, Any]:
     discharge_note = {
         "procedures": sections.get("Major Surgical or Invasive Procedure"),
         "physical_exam": discharge_physical_exam,
+        "pertinent_result": sections.get("Pertinent Result"),
         "hospital_course": sections.get("Brief Hospital Course"),
         "discharge_disposition": sections.get("Discharge Disposition"),
         "discharge_diagnosis": sections.get("Discharge Diagnosis"),
