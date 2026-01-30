@@ -181,30 +181,30 @@ def extract_notes():
     ok_visits = 0
     missing_visits = 0
 
-    # with ThreadPoolExecutor(max_workers=max_workers) as ex:
-    #     futs = []
-    #     for row in patient_indexes.itertuples(index=False):
-    #         futs.append(
-    #             ex.submit(process_one_patient_thread, int(row.subject_id), str(row.patient_id), discharge_map)
-    #         )
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = []
+        for row in patient_indexes.itertuples(index=False):
+            futs.append(
+                ex.submit(process_one_patient_thread, int(row.subject_id), str(row.patient_id), discharge_map)
+            )
 
-    #     for fut in tqdm(as_completed(futs), total=len(futs), desc="Processing patients (threads)"):
-    #         try:
-    #             fname, okv, miss = fut.result(timeout=300)
-    #             ok_patients += 1
-    #             ok_visits += okv
-    #             missing_visits += miss
-    #         except Exception as e:
-    #             logger.error(f"Error processing patient: {e}")
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Processing patients (threads)"):
+            try:
+                fname, okv, miss = fut.result(timeout=300)
+                ok_patients += 1
+                ok_visits += okv
+                missing_visits += miss
+            except Exception as e:
+                logger.error(f"Error processing patient: {e}")
     
-    for row in tqdm(patient_indexes.itertuples(index=False), total=len(patient_indexes), desc="Processing patients (threads)"):
-        try:
-            fname, okv, miss = process_one_patient_thread(int(row.subject_id), str(row.patient_id), discharge_map)
-            ok_patients += 1
-            ok_visits += okv
-            missing_visits += miss
-        except Exception as e:
-            logger.error(f"Error processing patient {row.patient_id}: {e}")
+    # for row in tqdm(patient_indexes.itertuples(index=False), total=len(patient_indexes), desc="Processing patients (threads)"):
+    #     try:
+    #         fname, okv, miss = process_one_patient_thread(int(row.subject_id), str(row.patient_id), discharge_map)
+    #         ok_patients += 1
+    #         ok_visits += okv
+    #         missing_visits += miss
+    #     except Exception as e:
+    #         logger.error(f"Error processing patient {row.patient_id}: {e}")
     logger.success("DONE")
     logger.info(f"Patients processed: {ok_patients}")
     logger.info(f"Visits updated (have note): {ok_visits}")
