@@ -59,6 +59,7 @@ def _force_schema(out: Dict[str, Any]) -> Dict[str, Any]:
     discharge_info = {
         "procedures": _clean(dis.get("procedures")),
         "physical_exam": _clean(dis.get("physical_exam")),
+        "pertinent_result": _clean(dis.get("Pertinent Result")),
         "hospital_course": _clean(dis.get("hospital_course")),
         "discharge_disposition": _clean(dis.get("discharge_disposition")),
         "discharge_diagnosis": _clean(dis.get("discharge_diagnosis")),
@@ -239,7 +240,6 @@ def split_note_to_adm_discharge(text: str) -> Dict[str, Any]:
     Split the discharge note into admission_info and discharge_info.
     Uses LLM-based method if enabled; otherwise falls back to rule-based method.
     """
-    use_llm = None
     if use_llm and _llm is not None:
         try:
             return split_note_to_adm_discharge_llm(text)
