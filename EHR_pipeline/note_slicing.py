@@ -200,6 +200,7 @@ Schema (must match exactly):
   "discharge_info": {
     "procedures": string|null,
     "physical_exam": string|null,
+    "pertinent_result": string|null,
     "hospital_course": string|null,
     "discharge_disposition": string|null,
     "discharge_diagnosis": string|null,
