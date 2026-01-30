@@ -239,6 +239,7 @@ def split_note_to_adm_discharge(text: str) -> Dict[str, Any]:
     Split the discharge note into admission_info and discharge_info.
     Uses LLM-based method if enabled; otherwise falls back to rule-based method.
     """
+    use_llm = None
     if use_llm and _llm is not None:
         try:
             return split_note_to_adm_discharge_llm(text)
