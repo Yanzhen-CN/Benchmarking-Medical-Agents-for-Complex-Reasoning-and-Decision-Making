@@ -2,14 +2,6 @@
 
 This folder contains the end-to-end pipeline for building the EHR benchmark dataset and LLM-ready context.
 
-## Dependencies
-
-Use the repo-level requirements file:
-
-```bash
-pip install -r ../requirements.txt
-```
-
 Key libraries used in this pipeline include:
 - pandas
 - polars
