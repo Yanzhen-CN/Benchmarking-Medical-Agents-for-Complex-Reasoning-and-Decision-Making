@@ -1,16 +1,22 @@
 # STEP1: Extract patients and visits from MIMIC-IV
 # - Build patient JSON files for benchmark
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 import polars as pl
+
+# Allow running from repo root or EHR_pipeline directory.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from util.logUtil import setup_logger
 from config import BuildConfig
 
 logger = setup_logger()
 config = BuildConfig()
-
 # =========================
 # Input files (MIMIC-IV)
 # =========================

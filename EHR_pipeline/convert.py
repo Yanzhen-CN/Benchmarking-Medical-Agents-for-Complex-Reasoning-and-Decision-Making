@@ -1,7 +1,14 @@
 import json
+import sys
 from pathlib import Path
+from pathlib import Path as _Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+# Allow running from repo root or EHR_pipeline directory.
+_ROOT = _Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from config import BuildConfig
 from util.logUtil import setup_logger

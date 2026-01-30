@@ -3,10 +3,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import re
 import json
+import sys
 from pathlib import Path
+from pathlib import Path as _Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
+
+# Allow running from repo root or EHR_pipeline directory.
+_ROOT = _Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from EHR_pipeline.llm_tools import infer_imaging_modality_target_llm, generate_reason_from_messages_llm
 from config import ContextConfig
