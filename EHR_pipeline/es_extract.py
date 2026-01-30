@@ -754,7 +754,7 @@ def process_patient(file_path: Path, data_maps: Dict[str, Dict[int, pd.DataFrame
 
             final_stream: List[Dict[str, Any]] = []
             for idx, evt in enumerate(events, 1):
-                eid = f"{pid}-{visit['visit_id']}-E{idx}"
+                eid = f"{visit['visit_id']}-E{idx}"
                 evt_with_id = {"event_id": eid}
                 evt_with_id.update(evt)
                 final_stream.append(evt_with_id)
@@ -832,14 +832,21 @@ def event_stream_extract():
     logger.info(f">>> Step 3: Processing patients with {MAX_WORKERS} threads...")
 
     success_count = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = [pool.submit(process_patient, pf, data_maps) for pf in patient_files]
-        for fut in as_completed(futs):
-            try:
-                ok = fut.result()
-                success_count += 1 if ok else 0
-            except Exception:
-                logger.exception("Unhandled exception in worker future")
+    # with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    #     futs = [pool.submit(process_patient, pf, data_maps) for pf in patient_files]
+    #     for fut in as_completed(futs):
+    #         try:
+    #             ok = fut.result()
+    #             success_count += 1 if ok else 0
+    #         except Exception:
+    #             logger.exception("Unhandled exception in worker future")
+    
+    for pf in patient_files:
+        try:
+            process_patient(pf, data_maps)
+            success_count += 1
+        except Exception:
+            logger.exception(f"Unhandled exception processing {pf.name}")
 
     logger.info(f">>> Done. Success: {success_count}/{len(patient_files)}")
 
