@@ -568,7 +568,7 @@ def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
                 "type": "PROCEDURE",
                 "timestamp": ts_str,
                 "name": _nan_to_none(row.get("long_title")),
-                "code": _nan_to_none(row.get("icd_code")),
+                # "code": _nan_to_none(row.get("icd_code")),
             }
         )
     return events
