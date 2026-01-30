@@ -58,9 +58,41 @@ All runtime parameters are configured in `../config.py`:
   - `ContextConfig.USE_LLM_FOR_REASON`
   - `LLMConfig.provider`, `LLMConfig.api_key`, `LLMConfig.base_url`
 
+### LLM setup for note extraction
+
+`note_extract.py` uses LLM only if `BuildConfig.noteExtract.USE_LLM = True` (in `../config.py`).  
+When enabled, it relies on `LLMConfig` + environment variables:
+
+Required env vars:
+```bash
+export OPENAI_API_KEY="your_key"
+# Optional if using a custom endpoint / compatible provider:
+export OPENAI_API_BASE_URL="https://your-base-url"
+```
+
+Relevant config in `../config.py`:
+```python
+class LLMConfig:
+    provider = "qwen"  # qwen | openai | compatible
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_API_BASE_URL")
+
+class BuildConfig.NoteExtract:
+    USE_LLM = True  # enable LLM-based note section split
+```
+
+Notes:
+- If `USE_LLM=False`, note splitting falls back to rule-based parsing.
+- `build_context.py` has its own LLM switches (`ContextConfig.USE_LLM_FOR_IMAGE_DESC`, `ContextConfig.USE_LLM_FOR_REASON`).
+- Qwen Turbo official docs (Model Studio): `https://help.aliyun.com/zh/model-studio/qwen-api-reference/`
+
 ## Build steps (end-to-end)
 
-Run these in order from this directory:
+Quick start (recommended):
+- From repo root, run `python build_sequence.py`.
+- To enable LLM features, configure `.env` (see LLM setup below).
+
+Manual steps (run in order from this directory):
 
 ```bash
 python events_preprocess.py
