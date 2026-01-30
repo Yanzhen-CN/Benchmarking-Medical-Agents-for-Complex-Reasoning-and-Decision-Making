@@ -460,44 +460,62 @@ def load_micro_data(cohort_ids: Set[int]) -> pd.DataFrame:
 def build_lab_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
+
+    df = df.dropna(subset=["charttime"]).copy()
     events: List[Dict[str, Any]] = []
-    for row in df.to_dict("records"):
-        if pd.isna(row.get("charttime")):
-            continue
-        events.append(
-            {
-                "type": "LAB",
-                "timestamp": _fmt_ts(row["charttime"]),
-                "name": _nan_to_none(row.get("label")),
-                "value": _nan_to_none(row.get("valuenum")),
-                "value_text": _nan_to_none(row.get("value")),
-                "unit": _nan_to_none(row.get("valueuom")),
-                "flag": _nan_to_none(row.get("flag")),
-                "category": _nan_to_none(row.get("category")),
-            }
-        )
+
+    for ts, group in df.groupby("charttime"):
+        items = []
+        for r in group.to_dict("records"):
+            items.append({
+                "name": _nan_to_none(r.get("label")),
+                "category": _nan_to_none(r.get("category")),
+                "fluid": _nan_to_none(r.get("fluid")),
+                "value_num": _nan_to_none(r.get("valuenum")),
+                "value_text": _nan_to_none(r.get("value")),
+                "unit": _nan_to_none(r.get("valueuom")),
+                "flag": _nan_to_none(r.get("flag"))
+            })
+        
+        events.append({
+            "type": "lab",
+            "timestamp": _fmt_ts(ts),
+            "items": items
+        })
     return events
 
 
 def build_vital_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
+    
+    df = df.dropna(subset=["charttime"]).copy()
     events: List[Dict[str, Any]] = []
-    for row in df.to_dict("records"):
-        if pd.isna(row.get("charttime")):
-            continue
-        warn_val = row.get("warning")
-        is_warning = (str(warn_val) == "1") or (warn_val == 1)
-        events.append(
-            {
-                "type": "VITAL",
-                "timestamp": _fmt_ts(row["charttime"]),
-                "name": _nan_to_none(row.get("label")),
-                "value": _nan_to_none(row.get("valuenum")),
-                "unit": _nan_to_none(row.get("unitname")),
-                "warning": is_warning,
-            }
-        )
+
+    for ts, group in df.groupby("charttime"):
+        items = []
+        any_warning = False
+        
+        for r in group.to_dict("records"):
+            warn_val = r.get("warning")
+            is_warning = (str(warn_val) == "1") or (warn_val == 1)
+            if is_warning:
+                any_warning = True
+                
+            items.append({
+                "name": _nan_to_none(r.get("label")),
+                "value_num": _nan_to_none(r.get("valuenum")),
+                "value_text": _nan_to_none(r.get("value")),
+                "unit": _nan_to_none(r.get("unitname")),
+                "flag": "warning" if is_warning else None
+            })
+        
+        events.append({
+            "type": "vital",
+            "timestamp": _fmt_ts(ts),
+            "flag": "warning" if any_warning else None,
+            "items": items
+        })
     return events
 
 
