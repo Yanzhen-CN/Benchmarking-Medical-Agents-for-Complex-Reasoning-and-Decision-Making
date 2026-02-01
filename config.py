@@ -108,12 +108,15 @@ class LLMConfig:
         # Default models (override per call as needed)
         self.chat_model: str = "qwen-turbo"
         self.embed_model: str = "text-embedding-v3"  # Qwen embedding model name may differ; override if needed
+        self.model: str = os.getenv("LLM_MODEL", self.chat_model)
 
         # Retry and robustness
         self.timeout_s: Optional[float] = None  # OpenAI SDK handles timeouts differently; keep for future extension
         self.max_retries: int = 10
         self.retry_backoff_base_s: float = 0.6
         self.retry_backoff_jitter_s: float = 0.2
+        self.max_inflight: int = int(os.getenv("LLM_MAX_INFLIGHT", "8"))
+        self.qps: float = float(os.getenv("LLM_QPS", "5"))
 
         # Default generation params
         self.temperature: float = 0.0
@@ -135,5 +138,16 @@ class ContextConfig:
         self.REASON_MODEL: str = "qwen-turbo"
         
         self.llm_config: LLMConfig = LLMConfig()
+
+
+class FactQGenConfig:
+    def __init__(self):
+        build = BuildConfig()
+        self.EVENTS_SELECTED_DIR: Path = Path("./tasks/factual_questions/events_selected")
+        self.QUESTIONS_OUT_DIR: Path = Path("./tasks/factual_questions/questions_generated")
+        self.MODEL: str = os.getenv("QGEN_MODEL", LLMConfig().chat_model)
+        self.BATCH_SIZE_LAB: int = int(os.getenv("QGEN_BATCH_LAB", "10"))
+        self.BATCH_SIZE_MED: int = int(os.getenv("QGEN_BATCH_MED", "10"))
+        self.RANDOM_SEED: int = int(os.getenv("QGEN_SEED", "7"))
         
         

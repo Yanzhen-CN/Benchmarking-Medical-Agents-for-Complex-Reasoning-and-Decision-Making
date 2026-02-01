@@ -116,7 +116,10 @@ def _safe_int(x: Any) -> int:
     except Exception:
         return 0
 
-import tiktoken
+try:
+    import tiktoken  # type: ignore
+except Exception:
+    tiktoken = None
 def _count_tokens_locally(messages: List[Dict[str, Any]], model: str) -> int:
     """
     Best-effort token estimation using tiktoken if available.
