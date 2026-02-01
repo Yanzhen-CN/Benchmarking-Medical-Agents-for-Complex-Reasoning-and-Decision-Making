@@ -59,6 +59,7 @@ def _force_schema(out: Dict[str, Any]) -> Dict[str, Any]:
     discharge_info = {
         "procedures": _clean(dis.get("procedures")),
         "physical_exam": _clean(dis.get("physical_exam")),
+        "pertinent_result": _clean(dis.get("Pertinent Result")),
         "hospital_course": _clean(dis.get("hospital_course")),
         "discharge_disposition": _clean(dis.get("discharge_disposition")),
         "discharge_diagnosis": _clean(dis.get("discharge_diagnosis")),
@@ -101,6 +102,7 @@ def split_note_to_adm_discharge_rule(text: str) -> Dict[str, Any]:
         "Social History",
         "Family History",
         "Physical Exam",
+        "Pertinent Result"
         "Brief Hospital Course",
         "Discharge Disposition",
         "Discharge Diagnosis",
@@ -167,6 +169,7 @@ def split_note_to_adm_discharge_rule(text: str) -> Dict[str, Any]:
     discharge_note = {
         "procedures": sections.get("Major Surgical or Invasive Procedure"),
         "physical_exam": discharge_physical_exam,
+        "pertinent_result": sections.get("Pertinent Result"),
         "hospital_course": sections.get("Brief Hospital Course"),
         "discharge_disposition": sections.get("Discharge Disposition"),
         "discharge_diagnosis": sections.get("Discharge Diagnosis"),
@@ -198,6 +201,7 @@ Schema (must match exactly):
   "discharge_info": {
     "procedures": string|null,
     "physical_exam": string|null,
+    "pertinent_result": string|null,
     "hospital_course": string|null,
     "discharge_disposition": string|null,
     "discharge_diagnosis": string|null,

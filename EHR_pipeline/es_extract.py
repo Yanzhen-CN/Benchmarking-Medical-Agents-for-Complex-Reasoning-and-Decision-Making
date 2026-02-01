@@ -460,44 +460,62 @@ def load_micro_data(cohort_ids: Set[int]) -> pd.DataFrame:
 def build_lab_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
+
+    df = df.dropna(subset=["charttime"]).copy()
     events: List[Dict[str, Any]] = []
-    for row in df.to_dict("records"):
-        if pd.isna(row.get("charttime")):
-            continue
-        events.append(
-            {
-                "type": "LAB",
-                "timestamp": _fmt_ts(row["charttime"]),
-                "name": _nan_to_none(row.get("label")),
-                "value": _nan_to_none(row.get("valuenum")),
-                "value_text": _nan_to_none(row.get("value")),
-                "unit": _nan_to_none(row.get("valueuom")),
-                "flag": _nan_to_none(row.get("flag")),
-                "category": _nan_to_none(row.get("category")),
-            }
-        )
+
+    for ts, group in df.groupby("charttime"):
+        items = []
+        for r in group.to_dict("records"):
+            items.append({
+                "name": _nan_to_none(r.get("label")),
+                "category": _nan_to_none(r.get("category")),
+                "fluid": _nan_to_none(r.get("fluid")),
+                "value_num": _nan_to_none(r.get("valuenum")),
+                "value_text": _nan_to_none(r.get("value")),
+                "unit": _nan_to_none(r.get("valueuom")),
+                "flag": _nan_to_none(r.get("flag"))
+            })
+        
+        events.append({
+            "type": "lab",
+            "timestamp": _fmt_ts(ts),
+            "items": items
+        })
     return events
 
 
 def build_vital_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
+    
+    df = df.dropna(subset=["charttime"]).copy()
     events: List[Dict[str, Any]] = []
-    for row in df.to_dict("records"):
-        if pd.isna(row.get("charttime")):
-            continue
-        warn_val = row.get("warning")
-        is_warning = (str(warn_val) == "1") or (warn_val == 1)
-        events.append(
-            {
-                "type": "VITAL",
-                "timestamp": _fmt_ts(row["charttime"]),
-                "name": _nan_to_none(row.get("label")),
-                "value": _nan_to_none(row.get("valuenum")),
-                "unit": _nan_to_none(row.get("unitname")),
-                "warning": is_warning,
-            }
-        )
+
+    for ts, group in df.groupby("charttime"):
+        items = []
+        any_warning = False
+        
+        for r in group.to_dict("records"):
+            warn_val = r.get("warning")
+            is_warning = (str(warn_val) == "1") or (warn_val == 1)
+            if is_warning:
+                any_warning = True
+                
+            items.append({
+                "name": _nan_to_none(r.get("label")),
+                "value_num": _nan_to_none(r.get("valuenum")),
+                "value_text": _nan_to_none(r.get("value")),
+                "unit": _nan_to_none(r.get("unitname")),
+                "flag": "warning" if is_warning else None
+            })
+        
+        events.append({
+            "type": "vital",
+            "timestamp": _fmt_ts(ts),
+            "flag": "warning" if any_warning else None,
+            "items": items
+        })
     return events
 
 
@@ -550,7 +568,7 @@ def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
                 "type": "PROCEDURE",
                 "timestamp": ts_str,
                 "name": _nan_to_none(row.get("long_title")),
-                "code": _nan_to_none(row.get("icd_code")),
+                # "code": _nan_to_none(row.get("icd_code")),
             }
         )
     return events
@@ -736,7 +754,7 @@ def process_patient(file_path: Path, data_maps: Dict[str, Dict[int, pd.DataFrame
 
             final_stream: List[Dict[str, Any]] = []
             for idx, evt in enumerate(events, 1):
-                eid = f"{pid}-{visit['visit_id']}-E{idx}"
+                eid = f"{visit['visit_id']}-E{idx}"
                 evt_with_id = {"event_id": eid}
                 evt_with_id.update(evt)
                 final_stream.append(evt_with_id)
@@ -822,6 +840,13 @@ def event_stream_extract():
                 success_count += 1 if ok else 0
             except Exception:
                 logger.exception("Unhandled exception in worker future")
+    
+    # for pf in patient_files:
+    #     try:
+    #         process_patient(pf, data_maps)
+    #         success_count += 1
+    #     except Exception:
+    #         logger.exception(f"Unhandled exception processing {pf.name}")
 
     logger.info(f">>> Done. Success: {success_count}/{len(patient_files)}")
 

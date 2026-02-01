@@ -21,7 +21,7 @@ class BuildConfig:
             # True：只分析 cohort，不生成 JSON
             self.ANALYZE_MODE: bool = False
             # Demo 模式：只取前 N 个病人，方便调试
-            self.DEMO_MODE: bool = False
+            self.DEMO_MODE: bool = True
             self.DEMO_N: int = 5
             self.MAX_WORKERS: int = 16  # 并行处理时的最大线程数
         
@@ -88,7 +88,7 @@ class BuildConfig:
             self.PATIENT_OUTPUT_PATH: Path = paths.BENCH_DATA_DIR / "patients"
             
             # 是否使用LLM辅助切分笔记
-            self.USE_LLM: bool = True
+            self.USE_LLM: bool = False
             
     def __init__(self):
         self.paths = BuildConfig.Paths()
