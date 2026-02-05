@@ -555,23 +555,45 @@ def build_med_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
 
 
 def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+    # 1. 基础判空
     if df is None or df.empty:
         return []
+
+    time_col = "charttime" 
+    if "starttime" in df.columns:
+        time_col = "starttime"
+        
+    df = df.dropna(subset=[time_col]).copy()
+
     events: List[Dict[str, Any]] = []
-    for row in df.to_dict("records"):
-        ts = row.get("chartdate")
-        if pd.isna(ts):
-            continue
-        ts_str = pd.Timestamp(ts).strftime("%Y-%m-%d 00:00:00")
+    
+    # 3. 按时间分组核心逻辑
+    for start_ts, group in df.groupby(time_col):
+        items: List[Dict[str, Any]] = []
+        
+        for r in group.to_dict("records"):
+            # 这里构建 Procedure 特有的 item 结构
+            items.append(
+                {
+                    # 必选：名称
+                    "name": _nan_to_none(r.get("long_title") or r.get("label")),
+                    
+                    # 可选：如果有持续时间或位置信息
+                    # "location": _nan_to_none(r.get("location")),
+                    # "end_timestamp": _fmt_ts(r.get("endtime")), 
+                }
+            )
+
+        # 4. 组装 Event
         events.append(
             {
-                "type": "PROCEDURE",
-                "timestamp": ts_str,
-                "name": _nan_to_none(row.get("long_title")),
-                # "code": _nan_to_none(row.get("icd_code")),
+                "type": "PROCEDURE",      # 事件类型
+                "timestamp": _fmt_ts(start_ts),
+                "items": items,           # 聚合后的列表
             }
         )
-    return events
+            
+    return eventss
 
 
 def build_img_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
