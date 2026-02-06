@@ -140,6 +140,33 @@ class ContextConfig:
         self.llm_config: LLMConfig = LLMConfig()
 
 
+class AgentConfig:
+    def __init__(self):
+        # Agent identity (used by memory providers like mem0)
+        self.agent_id: str = os.getenv("AGENT_ID", "bench-agent")
+        self.app_id: Optional[str] = os.getenv("AGENT_APP_ID")
+        self.run_id: Optional[str] = os.getenv("AGENT_RUN_ID")
+
+        # Memory backend selection
+        # mem0 | in_memory | custom
+        self.memory_provider: str = os.getenv("MEMORY_PROVIDER", "mem0")
+
+        # Retrieval / context settings
+        self.memory_top_k: int = int(os.getenv("MEMORY_TOP_K", "5"))
+        self.max_recent_turns: int = int(os.getenv("AGENT_MAX_RECENT_TURNS", "6"))
+
+        # What to store
+        self.store_dialog: bool = os.getenv("AGENT_STORE_DIALOG", "1") == "1"
+        self.store_observations: bool = os.getenv("AGENT_STORE_OBS", "1") == "1"
+        self.include_memory_in_prompt: bool = os.getenv("AGENT_INCLUDE_MEMORY", "1") == "1"
+
+        # Observation extractor settings (optional)
+        self.observation_model: Optional[str] = os.getenv("AGENT_OBS_MODEL")
+
+        # System prompt override (optional)
+        self.system_prompt: Optional[str] = os.getenv("AGENT_SYSTEM_PROMPT")
+
+
 class FactQGenConfig:
     def __init__(self):
         build = BuildConfig()
