@@ -1,4 +1,6 @@
 *.csv
+*.jsonl
+*.json
 
 env
 *_data

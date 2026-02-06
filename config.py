@@ -151,3 +151,28 @@ class FactQGenConfig:
         self.RANDOM_SEED: int = int(os.getenv("QGEN_SEED", "7"))
         
         
+class TimelineGenConfig:
+    def __init__(self):
+        # 继承基础配置 (如果有的话)
+        # build = BuildConfig() 
+    
+        self.PATIENTS_SEQ_DIR: Path = Path("./EHR_pipeline/bench_data/patients_sequence")
+
+        # --- 输出路径 ---
+        # 建议把两个子任务分开存放，方便评测脚本读取
+        self.TASK_ROOT: Path = Path("./tasks/task2")
+        self.MICRO_CLOZE_DIR: Path = self.TASK_ROOT / "visit_cloze"
+        self.TRAJECTORY_DIR: Path = self.TASK_ROOT / "trajectory_sorting"
+
+        # --- 参数配置 ---
+        # 随机种子，保证每次生成的结果一致
+        self.RANDOM_SEED: int = int(os.getenv("TIMELINE_SEED", "42"))
+        
+        # 排序任务：
+        # 窗口 (默认 5 个 Visit)
+        self.TRAJECTORY_WINDOW_SIZE: int = int(os.getenv("TIMELINE_WINDOW", "5"))
+        # 步长 (默认2)
+        self.TRAJECTORY_STRIDE: int = int(os.getenv("TIMELINE_STRIDE", "2"))
+        
+        # 填空任务：至少需要几个 targets 才能构成一个有效题目
+        self.MIN_TARGETS_FOR_CLOZE: int = 4
