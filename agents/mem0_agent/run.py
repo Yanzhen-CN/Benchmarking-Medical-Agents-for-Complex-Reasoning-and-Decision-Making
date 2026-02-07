@@ -10,13 +10,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agents import (
+from agents.mem0_agent import (
     MemoryAugmentedChatAgent,
     OpenAICompatibleLLMProvider,
     Mem0MemoryProvider,
     LLMObservationExtractor,
 )
-from agents.core import AgentConfig
+from agents.mem0_agent.core import AgentConfig
 
 
 def load_local_env() -> None:

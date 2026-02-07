@@ -38,6 +38,9 @@ python run_test.py --task tests --items P0001 --debug
 # 运行多个患者（逗号分隔）
 python run_test.py --task tests --items P0001,P0002
 
+# 运行某个 task 下的所有 patients
+python run_test.py --task tests --items all
+
 # 保留记忆（不做删除）
 python run_test.py --task tests --items P0001 --no-delete
 ```

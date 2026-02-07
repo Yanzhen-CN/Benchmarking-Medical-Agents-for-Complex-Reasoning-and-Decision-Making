@@ -15,14 +15,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agents import (
+from agents.mem0_agent import (
     MemoryAugmentedChatAgent,
     OpenAICompatibleLLMProvider,
     Mem0MemoryProvider,
     LLMObservationExtractor,
     InMemoryProvider,
 )
-from agents.core import AgentConfig
+from agents.mem0_agent.core import AgentConfig
 
 
 def load_local_env() -> None:
@@ -94,7 +94,7 @@ def main() -> None:
     parser.add_argument(
         "--items",
         required=True,
-        help="comma-separated list of jsonl basenames (e.g., P0001,P0002)",
+        help="comma-separated list of json basenames (e.g., P0001,P0002) or 'all'",
     )
     parser.add_argument(
         "--debug",
@@ -110,9 +110,14 @@ def main() -> None:
 
     seq_dir = ROOT / "tasks" / args.task / "sequence"
 
-    item_names = [x.strip() for x in args.items.split(",") if x.strip()]
-    if not item_names:
-        raise SystemExit("No items provided")
+    if args.items.strip().lower() == "all":
+        item_names = [p.stem for p in sorted(seq_dir.glob("*.json"))]
+        if not item_names:
+            raise SystemExit(f"No items found in {seq_dir}")
+    else:
+        item_names = [x.strip() for x in args.items.split(",") if x.strip()]
+        if not item_names:
+            raise SystemExit("No items provided")
 
     agent, mem = build_agent()
 
@@ -189,6 +194,7 @@ def main() -> None:
         with out_path.open("w", encoding="utf-8") as f:
             for ans in answers:
                 f.write(json.dumps(ans, ensure_ascii=False) + "\n")
+        print(f"Results saved to: {out_path}")
 
         # Flush memory for this file after finishing
         if args.no_delete:
