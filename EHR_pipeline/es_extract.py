@@ -286,43 +286,90 @@ def load_med_data(cohort_ids: Set[int]) -> pd.DataFrame:
         logger.info(f"[Loader-pl] Med loaded: rows={len(pres)} (no eMAR)")
         return pres
 
-
 def load_proc_data(cohort_ids: Set[int]) -> pd.DataFrame:
+    """
+    Unified Loader:
+    1. Hosp (ICD): 只有 chartdate -> 设为 charttime (00:00:00), endtime = None
+    2. ICU (Events): 有 starttime -> 设为 charttime, endtime = 真实结束时间
+    """
     logger = get_logger()
-    logger.info("[Loader-pl] Loading Procedures...")
+    logger.info("[Loader-pl] Loading Procedures (ICD + ICU)...")
 
     cohort_list = list(cohort_ids)
 
-    fpath = _find_data_file("procedures_icd", "hosp")
-    cols = ["hadm_id", "icd_code", "icd_version", "chartdate"]
-    proc_lf = (
-        _scan_csv(fpath, cols)
+    # ================= 1. 加载 HOSP ICD (模糊时间) =================
+    fpath_icd = _find_data_file("procedures_icd", "hosp")
+    cols_icd = ["hadm_id", "icd_code", "icd_version", "chartdate"]
+    
+    lf_icd = (
+        _scan_csv(fpath_icd, cols_icd)
         .with_columns([
             pl.col("hadm_id").cast(pl.Int64, strict=False),
+            # chartdate 转为 datetime (默认 00:00:00)
+            pl.col("chartdate").cast(pl.Utf8, strict=False).str.to_date(strict=False).cast(pl.Datetime),
             pl.col("icd_code").cast(pl.Utf8, strict=False),
             pl.col("icd_version").cast(pl.Int64, strict=False),
-            pl.col("chartdate").cast(pl.Utf8, strict=False).str.to_date(strict=False),
         ])
         .filter(pl.col("hadm_id").is_in(cohort_list))
     )
 
-    d_path = _find_data_file("d_icd_procedures", "hosp")
-    d_cols = ["icd_code", "icd_version", "long_title"]
-    d_lf = (
-        _scan_csv(d_path, d_cols)
-        .with_columns([
-            pl.col("icd_code").cast(pl.Utf8, strict=False),
-            pl.col("icd_version").cast(pl.Int64, strict=False),
-            pl.col("long_title").cast(pl.Utf8, strict=False),
+    # Join ICD 字典获取名称
+    d_path_icd = _find_data_file("d_icd_procedures", "hosp")
+    lf_d_icd = _scan_csv(d_path_icd, ["icd_code", "icd_version", "long_title"])
+    
+    # 整理 ICD 结构
+    lf_icd_final = (
+        lf_icd.join(lf_d_icd, on=["icd_code", "icd_version"], how="left")
+        .select([
+            pl.col("hadm_id"),
+            pl.col("chartdate").alias("charttime"), # 统一时间列
+            pl.lit(None, dtype=pl.Datetime).alias("endtime"), # ICD 没有结束时间 -> NaN
+            pl.col("long_title").alias("name"),     # 统一名称列
+            pl.lit(1).alias("is_fuzzy")             # 标记：1代表是模糊时间
         ])
     )
 
-    out_lf = proc_lf.join(d_lf, on=["icd_code", "icd_version"], how="left")
+    # ================= 2. 加载 ICU Events (精确时间) =================
+    fpath_icu = _find_data_file("procedureevents", "icu")
+    cols_icu = ["hadm_id", "itemid", "starttime", "endtime", "statusdescription"]
+    
+    lf_icu = (
+        _scan_csv(fpath_icu, cols_icu)
+        .filter(
+            pl.col("hadm_id").is_in(cohort_list) & 
+            (pl.col("statusdescription") != "Rewritten")
+        )
+        .with_columns([
+            pl.col("hadm_id").cast(pl.Int64, strict=False),
+            pl.col("starttime").cast(pl.Utf8, strict=False).str.to_datetime(strict=False),
+            pl.col("endtime").cast(pl.Utf8, strict=False).str.to_datetime(strict=False),
+            pl.col("itemid").cast(pl.Int64, strict=False),
+        ])
+    )
+
+    # Join ICU 字典获取名称
+    d_path_icu = _find_data_file("d_items", "icu")
+    lf_d_icu = _scan_csv(d_path_icu, ["itemid", "label"]).with_columns(pl.col("itemid").cast(pl.Int64))
+
+    # 整理 ICU 结构
+    lf_icu_final = (
+        lf_icu.join(lf_d_icu, on="itemid", how="left")
+        .select([
+            pl.col("hadm_id"),
+            pl.col("starttime").alias("charttime"), # 统一时间列
+            pl.col("endtime"),                      # 保留结束时间
+            pl.col("label").alias("name"),          # 统一名称列
+            pl.lit(0).alias("is_fuzzy")             # 标记：0代表精确时间
+        ])
+    )
+
+    # ================= 3. 合并返回 =================
+    # 使用 diagonal concat，自动对齐列名
+    out_lf = pl.concat([lf_icd_final, lf_icu_final], how="diagonal")
     out = _to_pandas(out_lf)
 
-    logger.info(f"[Loader-pl] Proc loaded: rows={len(out)} from {fpath.name}")
+    logger.info(f"[Loader-pl] Proc loaded (ICD+ICU): rows={len(out)}")
     return out
-
 
 def load_img_data(cohort_ids: Set[int]) -> pd.DataFrame:
     logger = get_logger()
@@ -555,46 +602,46 @@ def build_med_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
 
 
 def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
-    # 1. 基础判空
     if df is None or df.empty:
         return []
 
-    time_col = "charttime" 
-    if "starttime" in df.columns:
-        time_col = "starttime"
-        
-    df = df.dropna(subset=[time_col]).copy()
-
+    # 移除没有时间的数据
+    df = df.dropna(subset=["charttime"]).copy()
     events: List[Dict[str, Any]] = []
-    
-    # 3. 按时间分组核心逻辑
-    for start_ts, group in df.groupby(time_col):
+
+    # 按 charttime 和 is_fuzzy 分组
+    # 这样可以区分“某天发生的ICD手术”和“某天00:00:00发生的ICU操作”
+    for (ts, is_fuzzy), group in df.groupby(["charttime", "is_fuzzy"]):
+        
         items: List[Dict[str, Any]] = []
         
         for r in group.to_dict("records"):
-            # 这里构建 Procedure 特有的 item 结构
-            items.append(
-                {
-                    # 必选：名称
-                    "name": _nan_to_none(r.get("long_title") or r.get("label")),
-                    
-                    # 可选：如果有持续时间或位置信息
-                    # "location": _nan_to_none(r.get("location")),
-                    # "end_timestamp": _fmt_ts(r.get("endtime")), 
-                }
-            )
-
-        # 4. 组装 Event
-        events.append(
-            {
-                "type": "PROCEDURE",      # 事件类型
-                "timestamp": _fmt_ts(start_ts),
-                "items": items,           # 聚合后的列表
+            # 极简 Item 结构
+            item_dict = {
+                "name": _nan_to_none(r.get("name")),
+                "has_fuzzy_timestamp": is_fuzzy,
             }
-        )
             
-    return eventss
+            
+            if pd.notna(r.get("endtime")):
+                item_dict["end_timestamp"] = _fmt_ts(r.get("endtime"))
+            items.append(item_dict)
 
+
+        if is_fuzzy == 1:
+            # ICD: 只显示日期 YYYY-MM-DD
+            ts_str = ts.strftime("%Y-%m-%d")
+        else:
+            # ICU: 显示精确时间 YYYY-MM-DD HH:MM:SS
+            ts_str = _fmt_ts(ts)
+
+        events.append({
+            "type": "PROCEDURE",
+            "timestamp": ts_str,
+            "items": items
+        })
+            
+    return events
 
 def build_img_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
