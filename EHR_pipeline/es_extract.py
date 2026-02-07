@@ -605,18 +605,14 @@ def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
 
-    # 移除没有时间的数据
     df = df.dropna(subset=["charttime"]).copy()
     events: List[Dict[str, Any]] = []
 
-    # 按 charttime 和 is_fuzzy 分组
-    # 这样可以区分“某天发生的ICD手术”和“某天00:00:00发生的ICU操作”
     for (ts, is_fuzzy), group in df.groupby(["charttime", "is_fuzzy"]):
         
         items: List[Dict[str, Any]] = []
         
         for r in group.to_dict("records"):
-            # 极简 Item 结构
             item_dict = {
                 "name": _nan_to_none(r.get("name")),
                 "has_fuzzy_timestamp": is_fuzzy,
@@ -629,10 +625,10 @@ def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
 
 
         if is_fuzzy == 1:
-            # ICD: 只显示日期 YYYY-MM-DD
+            # 只显示日期 YYYY-MM-DD
             ts_str = ts.strftime("%Y-%m-%d")
         else:
-            # ICU: 显示精确时间 YYYY-MM-DD HH:MM:SS
+            # 显示精确时间 YYYY-MM-DD HH:MM:SS
             ts_str = _fmt_ts(ts)
 
         events.append({
