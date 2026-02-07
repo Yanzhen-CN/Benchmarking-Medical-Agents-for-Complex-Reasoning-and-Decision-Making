@@ -559,41 +559,42 @@ def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
 
-    time_col = "charttime" 
-    if "starttime" in df.columns:
-        time_col = "starttime"
-        
-    df = df.dropna(subset=[time_col]).copy()
+    if "chartdate" not in df.columns:
+        return []
+
+    df = df.dropna(subset=["chartdate"]).copy()
+    if "seq_num" in df.columns:
+        df["seq_num"] = pd.to_numeric(df["seq_num"], errors="coerce")
 
     events: List[Dict[str, Any]] = []
     
-    # 3. 按时间分组核心逻辑
-    for start_ts, group in df.groupby(time_col):
-        items: List[Dict[str, Any]] = []
-        
-        for r in group.to_dict("records"):
-            # 这里构建 Procedure 特有的 item 结构
-            items.append(
+    # 3. 按 chartdate 分组，并用 seq_num 排序生成伪时间戳
+    for chart_date, group in df.groupby("chartdate"):
+        g = group.sort_values(by=["seq_num"] if "seq_num" in group.columns else ["chartdate"])
+        n = len(g)
+        if n <= 0:
+            continue
+        step_hours = 24 / n
+        base_date = pd.Timestamp(chart_date).strftime("%Y-%m-%d")
+
+        for i, r in enumerate(g.to_dict("records")):
+            hour = int(i * step_hours)
+            ts_str = f"{base_date} {hour:02d}:00:00"
+            items = [
                 {
-                    # 必选：名称
                     "name": _nan_to_none(r.get("long_title") or r.get("label")),
-                    
-                    # 可选：如果有持续时间或位置信息
-                    # "location": _nan_to_none(r.get("location")),
-                    # "end_timestamp": _fmt_ts(r.get("endtime")), 
+                }
+            ]
+            events.append(
+                {
+                    "type": "PROCEDURE",
+                    "timestamp": ts_str,
+                    "items": items,
                 }
             )
-
-        # 4. 组装 Event
-        events.append(
-            {
-                "type": "PROCEDURE",      # 事件类型
-                "timestamp": _fmt_ts(start_ts),
-                "items": items,           # 聚合后的列表
-            }
-        )
             
-    return eventss
+    return events
+            
 
 
 def build_img_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
