@@ -605,39 +605,43 @@ def build_proc_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
 
-    df = df.dropna(subset=["charttime"]).copy()
-    events: List[Dict[str, Any]] = []
+    if "chartdate" not in df.columns:
+        return []
 
-    for (ts, is_fuzzy), group in df.groupby(["charttime", "is_fuzzy"]):
-        
+    df = df.dropna(subset=["chartdate"]).copy()
+    if "seq_num" in df.columns:
+        df["seq_num"] = pd.to_numeric(df["seq_num"], errors="coerce")
+
+    events: List[Dict[str, Any]] = []
+    
+    # 3. 按时间分组核心逻辑
+    for start_ts, group in df.groupby(time_col):
         items: List[Dict[str, Any]] = []
         
         for r in group.to_dict("records"):
-            item_dict = {
-                "name": _nan_to_none(r.get("name")),
-                "has_fuzzy_timestamp": is_fuzzy,
+            # 这里构建 Procedure 特有的 item 结构
+            items.append(
+                {
+                    # 必选：名称
+                    "name": _nan_to_none(r.get("long_title") or r.get("label")),
+                    
+                    # 可选：如果有持续时间或位置信息
+                    # "location": _nan_to_none(r.get("location")),
+                    # "end_timestamp": _fmt_ts(r.get("endtime")), 
+                }
+            )
+
+        # 4. 组装 Event
+        events.append(
+            {
+                "type": "PROCEDURE",      # 事件类型
+                "timestamp": _fmt_ts(start_ts),
+                "items": items,           # 聚合后的列表
             }
+        )
             
-            
-            if pd.notna(r.get("endtime")):
-                item_dict["end_timestamp"] = _fmt_ts(r.get("endtime"))
-            items.append(item_dict)
+    return eventss
 
-
-        if is_fuzzy == 1:
-            # 只显示日期 YYYY-MM-DD
-            ts_str = ts.strftime("%Y-%m-%d")
-        else:
-            # 显示精确时间 YYYY-MM-DD HH:MM:SS
-            ts_str = _fmt_ts(ts)
-
-        events.append({
-            "type": "PROCEDURE",
-            "timestamp": ts_str,
-            "items": items
-        })
-            
-    return events
 
 def build_img_events(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     if df is None or df.empty:
