@@ -27,14 +27,29 @@ except ImportError:
             self.PATIENTS_SEQ_DIR = Path("./EHR_pipeline/bench_data/patients_sequence")
             self.MICRO_CLOZE_DIR = Path("./tasks/task2/visit_cloze")
 
+def is_precise_timestamp(ts_str):
+    """
+    判断时间戳精度。
+    MIMIC ETL 约定：
+    - "YYYY-MM-DD" (len=10) -> 模糊时间 (Fuzzy/Date-level)
+    - "YYYY-MM-DD HH:MM:SS" (len=19) -> 精确时间 (Precise/Minute-level)
+    """
+    if not ts_str: 
+        return False
+    return len(str(ts_str)) > 10
+
 def generate_cloze_tasks_for_patient(patient_events, patient_id, config=None):
     """
     生成完形填空任务 (返回任务列表)
+    逻辑升级：
+    1. Anchors: 观测事件 + 只有日期的模糊手术 (作为背景)
+    2. Targets: 只有具备精确时间戳的药物和手术 (作为考题)
     """
     if config is None: config = TimelineGenConfig()
     
     tasks = []
     
+    # 按 Visit 分组
     visits = {}
     for event in patient_events:
         v_ref = event.get('visit_ref')
@@ -43,6 +58,9 @@ def generate_cloze_tasks_for_patient(patient_events, patient_id, config=None):
         visits[v_ref].append(event)
         
     for v_ref, events in visits.items():
+        # 预排序：保证 Anchors 在 Input 中是按时间顺序呈现的
+        # Python 字符串比较： "2020-01-01" < "2020-01-01 10:00:00"
+        # 意味着同日期的模糊背景会排在当天精确事件之前，符合阅读逻辑
         events.sort(key=lambda x: x.get('timestamp') or "")
         
         anchors = []
@@ -53,6 +71,7 @@ def generate_cloze_tasks_for_patient(patient_events, patient_id, config=None):
             content = event.get('content', '')
             timestamp = event.get('timestamp')
             
+            # 基础观测类事件 -> 永远是 Anchors
             if etype in ['ADMISSION', 'DISCHARGE', 'LAB', 'MICROBIOLOGY', 'VITAL', 'IMAGING']:
                 anchors.append({
                     "event_id": event['event_id'],
@@ -61,37 +80,66 @@ def generate_cloze_tasks_for_patient(patient_events, patient_id, config=None):
                     "timestamp": timestamp,
                     "content": content
                 })
-            elif etype in ['MEDICATION', 'PROCEDURE', 'SURGERY']:
+            
+            # 干预类事件 (MEDICATION, PROCEDURE) -> 根据精度分流
+            elif etype in ['MEDICATION', 'PROCEDURE']:
                 if not timestamp: continue
-                targets.append({
-                    "event_id": event['event_id'],
-                    "type": "target",
-                    "event_type": etype,
-                    "content": content,
-                    "original_timestamp": timestamp 
-                })
+
+                # === 核心修改逻辑 ===
+                if is_precise_timestamp(timestamp):
+                    # 情况 A: 精确时间 -> 做成 Target (考题)
+                    targets.append({
+                        "event_id": event['event_id'],
+                        "type": "target",
+                        "event_type": etype,
+                        "content": content,
+                        "original_timestamp": timestamp # 暂时保留用于生成 Ground Truth
+                    })
+                else:
+                    # 情况 B: 模糊时间 (只有日期) -> 降级为 Anchor (背景)
+                    # 例如：Hosp Procedures (Billing ICD)
+                    anchors.append({
+                        "event_id": event['event_id'],
+                        "type": "anchor", # 标记为背景
+                        "event_type": etype,
+                        "timestamp": timestamp,
+                        "content": content
+                    })
         
+        # 检查 Target 数量是否足够生成一道题
         if len(targets) < config.MIN_TARGETS_FOR_CLOZE: 
             continue
             
+        # 生成 Ground Truth (基于精确时间的顺序)
         ground_truth_order = [t['event_id'] for t in targets] 
+        
+        # 打乱 Targets
         shuffled_targets = copy.deepcopy(targets)
         random.shuffle(shuffled_targets)
         
+        # 移除 Targets 中的时间戳 (防止泄题)
         for t in shuffled_targets:
-            del t['original_timestamp']
+            if 'original_timestamp' in t:
+                del t['original_timestamp']
+            # 注意：event 对象里本身可能有 timestamp 字段，如果是深拷贝过来的也要清理
+            if 'timestamp' in t:
+                del t['timestamp']
             
         task = {
             "task_type": "micro_cloze",
             "patient_id": patient_id,
             "visit_ref": v_ref,
-            "question_text": "Analyze the clinical timeline provided in the 'anchors'. Determine the most logical chronological position for each item in the 'shuffled_targets'.",
+            "question_text": "Analyze the clinical timeline provided in the 'anchors'. Determine the most logical chronological position for each item in the 'shuffled_targets'. Note that some procedures in anchors may only have date-level precision, serving as context.",
             "input_context": {
                 "anchors": anchors,
                 "shuffled_targets": shuffled_targets
             },
             "ground_truth": {
                 "correct_order": ground_truth_order
+            },
+            "meta": {
+                "num_anchors": len(anchors),
+                "num_targets": len(targets)
             }
         }
         tasks.append(task)
@@ -106,6 +154,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"[Config] Seed: {cfg.RANDOM_SEED}")
+    print(f"[Config] Min Targets: {cfg.MIN_TARGETS_FOR_CLOZE}")
     random.seed(cfg.RANDOM_SEED)
 
     if not os.path.exists(args.input_dir):
@@ -115,7 +164,7 @@ if __name__ == "__main__":
     files = glob.glob(os.path.join(args.input_dir, "P*_sequenced.json"))
     
     os.makedirs(args.output_dir, exist_ok=True)
-    out_file = os.path.join(args.output_dir, "micro_cloze_tasks.jsonl") # 改为 .jsonl
+    out_file = os.path.join(args.output_dir, "micro_cloze_tasks.jsonl")
 
     print(f"Processing {len(files)} files -> {out_file}")
     
@@ -129,7 +178,7 @@ if __name__ == "__main__":
                 
                 tasks = generate_cloze_tasks_for_patient(data, pid, cfg)
                 for task in tasks:
-                    f_out.write(json.dumps(task, ensure_ascii=False) + "\n") # Line by line
+                    f_out.write(json.dumps(task, ensure_ascii=False) + "\n")
                     count += 1
             except Exception as e:
                 print(f"Error processing {fpath}: {e}")
