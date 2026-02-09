@@ -26,7 +26,7 @@ except ImportError:
             self.TRAJECTORY_WINDOW_SIZE = 5
             self.TRAJECTORY_STRIDE = 1
             self.PATIENTS_SEQ_DIR = Path("./EHR_pipeline/bench_data/patients_sequence")
-            self.TRAJECTORY_DIR = Path("./tasks/task2/trajectory_sorting")
+            self.TRAJECTORY_DIR = Path("./tasks/temporal_inference/trajectory_sorting")
 
 # ... extract_visit_summary 保持不变 ...
 def extract_visit_summary(visit_events):
