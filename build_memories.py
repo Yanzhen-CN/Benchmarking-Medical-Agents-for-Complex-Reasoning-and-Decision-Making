@@ -2,7 +2,7 @@ from config import BuildConfig
 from util.logUtil import setup_logger
 logger = setup_logger()
 from EHR_pipeline import (
-    events_preprocess, note_extract, patients_extract, es_extract, convert, build_context
+    events_preprocess, note_extract, patients_extract, es_extract, convert#, build_context
 )
     
 # from context_builder import build_context

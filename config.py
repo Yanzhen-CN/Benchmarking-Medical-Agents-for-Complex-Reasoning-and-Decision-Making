@@ -89,6 +89,12 @@ class BuildConfig:
             
             # 是否使用LLM辅助切分笔记
             self.USE_LLM: bool = False
+    
+    class LabPanelExtract:
+        def __init__(self, paths):
+            self.INPUT_DIR: Path = paths.BENCH_DATA_DIR / "patients"
+            self.OUTPUT_DIR: Path = paths.BENCH_DATA_DIR / "lab_panels"
+            self.BATCH_SIZE: int = 120  # 每次给 LLM 的测试数量
             
     def __init__(self):
         self.paths = BuildConfig.Paths()
@@ -97,6 +103,7 @@ class BuildConfig:
         self.noteExtract = BuildConfig.NoteExtract(self.paths)
         self.patientExtract = BuildConfig.PatientExtract(self.paths)
         self.eventStreamExtract = BuildConfig.EventStreamExtract(self.paths, self.patientExtract, self.eventExtract)
+        self.labPanelExtract = BuildConfig.LabPanelExtract(self.paths)
         
 
 class LLMConfig:
@@ -187,7 +194,7 @@ class TimelineGenConfig:
 
         # --- 输出路径 ---
         # 建议把两个子任务分开存放，方便评测脚本读取
-        self.TASK_ROOT: Path = Path("./tasks/task2")
+        self.TASK_ROOT: Path = Path("./tasks/temporal_inference")
         self.MICRO_CLOZE_DIR: Path = self.TASK_ROOT / "visit_cloze"
         self.TRAJECTORY_DIR: Path = self.TASK_ROOT / "trajectory_sorting"
 

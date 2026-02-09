@@ -21,8 +21,8 @@ try:
     import visit_cloze_question
     import trajectory_sorting_question
 except ImportError:
-    from tasks.task2 import visit_cloze_question
-    from tasks.task2 import trajectory_sorting_question
+    from tasks.temporal_inference import visit_cloze_question
+    from tasks.temporal_inference import trajectory_sorting_question
 
 def main():
     # 1. 加载配置
