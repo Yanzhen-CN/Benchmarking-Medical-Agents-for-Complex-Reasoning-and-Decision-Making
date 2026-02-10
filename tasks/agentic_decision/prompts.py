@@ -197,3 +197,38 @@ EXAMPLE
 }
 
 """
+
+EVAL_PROMPT="""
+You are a strict evaluator for a medical decision benchmark.
+
+You will be given:
+(1) The agent's predicted next action in JSON {action,args,reason}
+(2) The ground-truth next events from an EHR event stream (time-ordered).
+
+Your job:
+Determine whether the agent's predicted action is clinically consistent with what actually happened next.
+
+Rules:
+- The agent action must match the same semantic category (order_labs/order_imaging/order_microbiology/medication/perform_procedure/discharge/ask_question).
+- If the agent chose an investigation (labs/imaging/micro), it is acceptable if a very similar investigation appears in the ground-truth window, even if not the first event.
+- Parameter matching is soft:
+  - For labs: panel names are approximate; accept if the GT labs contain tests consistent with that panel intent.
+  - For imaging: modality + target should roughly match the GT imaging report indication.
+  - For medication: accept if the same or very similar medication intent occurred (analgesia, bowel regimen, antibiotics, etc).
+- Discharge is only correct if GT shows discharge (or clear ready-for-discharge status) soon after.
+- If the agent asks a question, it is correct only if the GT next step is not a test/treatment but missing critical info is obvious.
+
+Output ONLY JSON:
+{
+  "match": boolean,
+  "matched_gt_event_ids": [string],
+  "error_type": "none|wrong_action|wrong_params|too_early_discharge|too_aggressive|missing_info",
+  "rationale": string
+}
+
+
+"""
+
+def get_agent_prompt(type_of_memory: str) -> str:
+    return AGENT_ACTION_PROMPT.format(type_of_memory=TYPE_OF_MEMORY.get(type_of_memory, "N/A"))
+  
