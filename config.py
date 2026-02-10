@@ -194,7 +194,7 @@ class TimelineGenConfig:
 
         # --- 输出路径 ---
         # 建议把两个子任务分开存放，方便评测脚本读取
-        self.TASK_ROOT: Path = Path("./tasks/temporal_inference")
+        self.TASK_ROOT: Path = Path("./question_data")
         self.MICRO_CLOZE_DIR: Path = self.TASK_ROOT / "visit_cloze"
         self.TRAJECTORY_DIR: Path = self.TASK_ROOT / "trajectory_sorting"
 
