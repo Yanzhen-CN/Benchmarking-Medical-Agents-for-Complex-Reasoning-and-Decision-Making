@@ -5,6 +5,11 @@ from pathlib import Path
 
 from typing import Optional, Any, Dict
 
+class LoggerConfig:
+    def __init__(self):
+        self.level: str = "INFO"
+        self.log_file: Optional[str] = None  # e.g. "logs/app.log"
+
 class BuildConfig:
     class Paths:
         def __init__(self):
@@ -217,8 +222,8 @@ class AgentQaGenConfig:
         self.OUTPUT_PATH: Path = Path("./tasks/agentic_decision/questions_generated/")
         self.INDICATOR_PANEL_MAP: Path = Path("./bench_data/lab_panels/panel_to_indicators.json")
         self.K_ACTION: int = 6
-        self.K_PARAM: int = 6
-        self.K_MED: int = 6
+        self.K_PARAM: int = 10
+        self.K_MED: int = 10
         self.ENABLE_DISCHARGE_Q: bool = True
         self.DISCHARGE_XH: float = 6.0
         self.DISCHARGE_ONLY_WITHIN_H: float = 48.0
@@ -226,3 +231,7 @@ class AgentQaGenConfig:
         
         self.DEMO_MODE: bool = True
         self.DEMO_N: int = 5
+        
+        self.AGENT_TASK_STARTING_VISIT: int = 9
+        
+        self.MAX_WORKERS: int = 16

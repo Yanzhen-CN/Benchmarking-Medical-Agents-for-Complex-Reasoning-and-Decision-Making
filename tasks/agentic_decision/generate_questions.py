@@ -11,8 +11,7 @@ Outputs (JSONL):
 
 Question types:
 - T3-N: Next Action (always)
-- T3-A: Parameter question if GT is order_xxx (labs/imaging/micro/procedure)
-- T3-M: Medication question if GT is medication
+- T3-A: Parameter question if GT (labs/imaging/micro/procedure/medication)
 - T3-D: Discharge Yes/No near discharge time
 
 Distractors:
@@ -25,7 +24,7 @@ Labs parameter GT:
 - indicator_key uses composite key: name||fluid||unit_norm (recommended).
 
 Time-window GT merge:
-- For T3-A (labs/imaging/micro), collect all corresponding events in (t, t+24h],
+- For T3-A (labs/imaging/micro/medication), collect all corresponding events in (t, t+24h],
   produce gt_list=[{"value":..., "delta_hours":..., "weight":...}, ...]
   with exp decay weight where 0h->1.0, 24h->0.01.
 """
@@ -47,17 +46,10 @@ from util.logUtil import setup_logger
 logger = setup_logger()
 
 # --------- LLM ----------
-from util.llmUtil import LLMUtil
-llm = LLMUtil()
+from util.llmUtil import LLMUtil, ChatTokenUsage
 
-def call_llm_json(prompt: str, system: str) -> Dict[str, Any]:
+def call_llm_json(llm: LLMUtil, prompt: str, system: str) -> Dict[str, Any]:
     return llm.chat_json(user_text=prompt, system_prompt=system)
-
-# Optional (if you have it)
-try:
-    from EHR_pipeline.llm_tools import infer_imaging_modality_target_llm
-except Exception:
-    infer_imaging_modality_target_llm = None
 
 # --------- constants ----------
 ACTIONS = [
@@ -110,11 +102,13 @@ def iter_json_files(root: Path):
 
 # --------- context rendering ----------
 def compact_event(ev: Dict[str, Any], max_items: int = 40) -> Dict[str, Any]:
-    t = ev.get("type")
+    t_raw = ev.get("type") or ""
+    t = t_raw.lower()
     out = {"type": t, "timestamp": ev.get("timestamp")}
+
     items = ev.get("items", []) or []
+
     if t == "lab":
-        # keep just analytes summary
         out["items"] = [
             {
                 "name": it.get("name"),
@@ -124,18 +118,27 @@ def compact_event(ev: Dict[str, Any], max_items: int = 40) -> Dict[str, Any]:
             }
             for it in items[:max_items]
         ]
-    elif t == "IMAGING":
+    elif t == "imaging":
+        # some datasets put imaging content in name/report instead of items
+        out["name"] = ev.get("name")
+        out["report"] = (ev.get("report") or "")[:1200]
         out["items"] = items[:min(max_items, len(items))]
     elif t == "microbiology":
         out["items"] = items[:min(max_items, len(items))]
-    elif t == "MEDICATION":
+        if "specimen" in ev:
+            out["specimen"] = ev.get("specimen")
+    elif t == "medication":
         out["items"] = [
             {"drug": it.get("drug"), "route": it.get("route"), "dose": it.get("dose"), "status": it.get("status")}
             for it in items[:max_items]
         ]
+    elif t == "procedure":
+        out["name"] = ev.get("name")
     else:
         out["items"] = items[:min(max_items, len(items))]
+
     return out
+
 
 def build_history(visit: Dict[str, Any], upto_time: datetime) -> List[Dict[str, Any]]:
     hist = []
@@ -151,20 +154,13 @@ def gt_action_from_event(ev: Dict[str, Any]) -> Optional[str]:
     # normalize uppercase types in your sample: MEDICATION/IMAGING etc.
     if et in EVENT2ACTION:
         return EVENT2ACTION[et]
-    if et == "medication":
-        return "medication"
-    if et == "imaging":
-        return "order_imaging"
-    if et == "microbiology":
-        return "order_microbiology"
-    if et == "lab":
-        return "order_labs"
-    return None
+    raise ValueError(f"Unknown event type: {et} in event at {ev.get('timestamp')}")
 
 def infer_lab_panel_for_event(
+    llm: LLMUtil,
     ev: Dict[str, Any],
     indicator_panel_map: Optional[Dict[str, str]],
-) -> Tuple[Optional[str], Dict[str, Any]]:
+) -> Tuple[Optional[List[str]], Dict[str, Any]]:
     """
     Return:
       (panel_name, debug)
@@ -172,75 +168,46 @@ def infer_lab_panel_for_event(
     """
     items = ev.get("items", []) or []
     if not items:
+        logger.warning(f"Lab event at {ev.get('timestamp')} has no items. Cannot infer panel.")
         return None, {"reason": "no_items"}
 
-    if not indicator_panel_map:
-        # fallback: let LLM infer a panel name for this whole event
-        prompt = f"""
+    prompt = f"""
 You are given a lab event containing multiple lab indicators.
-Infer the most likely clinical test panel/order name for this event (open-set, no fixed enum).
-Return JSON: {{"panel":"...","reason":"..."}}.
+Infer the most likely clinical test panels/orders name for this event (open-set, no fixed enum).
+You need to simulate a doctor's actual diagnostic process, obtaining the provided indicators using as few labs as possible.
+You need to provide a list of abbreviations for the inspection items.
+Return JSON: {{"panel":["...", ...],"reason":"..."}}.
 
 Lab indicators:
 {json.dumps([{"name":it.get("name"),"fluid":it.get("fluid"),"unit":it.get("unit") or it.get("units")} for it in items[:60]], ensure_ascii=False)}
 """.strip()
-        out = call_llm_json(prompt, system="You are a clinical lab expert.")
-        panel = norm(out.get("panel") or "")
-        return (panel or None), {"llm": out}
+    out = call_llm_json(llm, prompt, system="You are a clinical lab expert.")
+    panel = out.get("panel") or []
+    return panel, {"llm": out}
 
-    vote = Counter()
-    used = 0
-    miss = 0
-    for it in items:
-        name = norm(it.get("name") or "")
-        fluid = norm(it.get("fluid") or "")
-        unit = _norm_unit(it.get("unit") or it.get("units") or "")
-        if not name:
-            continue
-        key = make_indicator_key(name, fluid, unit)
-        p = indicator_panel_map.get(key)
-        if p:
-            vote[p] += 1
-            used += 1
-        else:
-            miss += 1
-
-    if not vote:
-        return None, {"reason": "no_votes", "used": used, "miss": miss}
-
-    panel, n = vote.most_common(1)[0]
-    return panel, {"vote": dict(vote), "chosen": panel, "used": used, "miss": miss}
-
-def infer_imaging_param_for_event(ev: Dict[str, Any], history_messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def infer_imaging_param_for_event(llm: LLMUtil, ev: Dict[str, Any], history_messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     Return structured imaging label:
       {"modality": "...", "target": "..."}  # e.g. {"modality":"ct","target":"head"}
     Use your existing infer_imaging_modality_target_llm if available; else LLM on event items.
     """
-    if infer_imaging_modality_target_llm is not None and history_messages is not None:
-        try:
-            # Your tool likely expects messages; adapt if needed.
-            return infer_imaging_modality_target_llm(history_messages)
-        except Exception:
-            pass
 
-    # fallback: infer from imaging items
     prompt = f"""
 Infer imaging modality and body part target from this imaging event.
 Return JSON only:
 {{"modality":"ct|mri|xray|ultrasound|echo|doppler|pet|other","target":"free text body part"}}.
 
 Imaging event:
-{json.dumps(compact_event(ev), ensure_ascii=False)}
+{json.dumps(ev, ensure_ascii=False)}
 """.strip()
-    out = call_llm_json(prompt, system="You are a radiology ordering expert.")
+    out = call_llm_json(llm, prompt, system="You are a radiology ordering expert.")
     return {
         "modality": norm(out.get("modality") or "other").lower(),
         "target": norm(out.get("target") or ""),
         "raw": out,
     }
 
-def infer_micro_param_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+def infer_micro_param_for_event(llm: LLMUtil, ev: Dict[str, Any]) -> Dict[str, Any]:
     """
     Return {"specimen": "...", "test": "..."} open-set but suggest typical culture naming.
     """
@@ -249,9 +216,9 @@ Infer microbiology order parameters from this microbiology event.
 Return JSON only: {{"specimen":"...","test":"..."}}.
 
 Event:
-{json.dumps(compact_event(ev), ensure_ascii=False)}
+{json.dumps(ev, ensure_ascii=False)}
 """.strip()
-    out = call_llm_json(prompt, system="You are a clinical microbiology expert.")
+    out = call_llm_json(llm, prompt, system="You are a clinical microbiology expert.")
     return {"specimen": norm(out.get("specimen") or ""), "test": norm(out.get("test") or ""), "raw": out}
 
 def infer_med_param_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
@@ -275,8 +242,41 @@ def infer_med_param_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         )
     return {"meds": meds}
 
+
+def infer_proc_param_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For your real schema: each PROCEDURE is one event with 'name'.
+    Returns:
+      {"procedures": [{"procedure": str}, ...]}
+    """
+    name = (ev.get("name") or "").strip()
+    if not name:
+        return {"procedures": []}
+    return {"procedures": [{"procedure": name}]}
+
+
+def group_future_by_timestamp(future: List[Tuple[datetime, Dict[str, Any]]]) -> List[Tuple[datetime, List[Dict[str, Any]]]]:
+    """
+    future: sorted [(ts, ev), ...]
+    return: [(ts, [ev1, ev2, ...]), ...] grouped by exact ts
+    """
+    grouped: List[Tuple[datetime, List[Dict[str, Any]]]] = []
+    cur_ts = None
+    cur_bucket: List[Dict[str, Any]] = []
+    for ts, ev in future:
+        if cur_ts is None or ts != cur_ts:
+            if cur_bucket:
+                grouped.append((cur_ts, cur_bucket))
+            cur_ts = ts
+            cur_bucket = [ev]
+        else:
+            cur_bucket.append(ev)
+    if cur_bucket:
+        grouped.append((cur_ts, cur_bucket))
+    return grouped
 # --------- distractor generation ----------
 def llm_generate_options(
+    llm: LLMUtil,
     qtype: str,
     stem: str,
     gt: Any,
@@ -285,6 +285,11 @@ def llm_generate_options(
     forbid: List[str],
     preference_hint: str,
 ) -> List[Any]:
+    
+    if n_options <= 0:
+        logger.warning(f"Requested number of options is {n_options}. Returning empty list.")
+        return []
+    
     """
     Return list of distractor options (length = n_options - 1 typically), excluding GT.
     "options" format depends on qtype:
@@ -323,7 +328,7 @@ Return JSON:
 Generate exactly {n_options} options.
 """.strip()
 
-    out = call_llm_json(prompt, system="You design adversarial-yet-plausible multiple-choice distractors for clinicians.")
+    out = call_llm_json(llm, prompt, system="You design adversarial-yet-plausible multiple-choice distractors for clinicians.")
     opts = out.get("options", []) or []
     cleaned = []
     seen = set()
@@ -352,11 +357,11 @@ class Question:
     qtype: str
     question: str
     options: List[Any]
-    answer: Any
+    answer: Dict[str, float]
     meta: Dict[str, Any]
 
 def make_qid(patient_id: str, visit_id: str, t_index: int, qtype: str, local_i: int) -> str:
-    return f"{patient_id}-{visit_id}-T{t_index:04d}-{qtype}-{local_i}"
+    return f"{visit_id}-T{t_index:04d}-{qtype}-{local_i}"
 
 # --------- future-window gt list ----------
 def collect_future_events(
@@ -369,10 +374,17 @@ def collect_future_events(
     out = []
     for ev in events:
         ts = parse_time(ev["timestamp"])
-        if ts <= t0:
-            continue
-        if ts > t1:
-            continue
+        if ev["type"].lower() == "procedure":
+            # since procedure only has day-level timestamp, we consider it matches if it's on the same day as t0 or within horizon
+            if ts.date() < t0.date():
+                continue
+            if ts.date() > t1.date():
+                continue
+        else:
+            if ts <= t0:
+                continue
+            if ts > t1:
+                continue
         act = gt_action_from_event(ev)
         if act == match_action:
             out.append((ts, ev))
@@ -390,42 +402,10 @@ def build_T3N(
     out_options_k: int,
 ) -> Question:
     history = build_history(visit, t_cur)
-    stem = "Next step is most appropriate?"
+    stem = "Which of the next step is most appropriate?"
 
-    # preference hints per your spec
-    hint = ""
-    if gt_action == "order_imaging":
-        hint = "Prefer distractors: order_labs, ask_question (typical clinical pathway)."
-    elif gt_action == "medication":
-        hint = "Prefer distractors: order_labs (recheck), perform_procedure (more aggressive)."
-    elif gt_action == "discharge":
-        hint = "Prefer distractors: medication (adjust), order_labs (recheck)."
-
-    forbid = [gt_action]
-    # Ask LLM to pick k-1 distractors from ACTIONS, irrelevant to GT.
-    # We still enforce it's from ACTIONS by post-filtering.
-    llm_opts = llm_generate_options(
-        qtype="T3-N",
-        stem=stem,
-        gt={"action": gt_action},
-        history=history,
-        n_options=max(6, out_options_k),  # ask a few more, then filter
-        forbid=forbid,
-        preference_hint=hint,
-    )
-    # filter to allowed actions
-    distractors = []
-    for x in llm_opts:
-        if x in ACTIONS and x != gt_action:
-            distractors.append(x)
-    # backfill deterministically if insufficient
-    for a in ACTIONS:
-        if a != gt_action and a not in distractors:
-            distractors.append(a)
-        if len(distractors) >= out_options_k - 1:
-            break
-
-    options = distractors[: out_options_k - 1] + [gt_action]
+    options = random.sample([a for a in ACTIONS if a != gt_action], out_options_k - 1) + [gt_action]
+    random.shuffle(options)
     # shuffle but keep deterministic-ish: put GT random? here keep last to simplify
     q = Question(
         qid=make_qid(patient_id, visit["visit_id"], t_index, "T3-N", 0),
@@ -436,12 +416,13 @@ def build_T3N(
         qtype="T3-N",
         question=stem,
         options=options,
-        answer=gt_action,
+        answer={gt_action: 1.0},
         meta={"history": history, "gt_action": gt_action},
     )
     return q
 
 def build_T3A_labs(
+    llm: LLMUtil,
     patient_id: str,
     visit: Dict[str, Any],
     events: List[Dict[str, Any]],
@@ -460,7 +441,7 @@ def build_T3A_labs(
     debug_list = []
 
     for ts, ev in future:
-        panel, dbg = infer_lab_panel_for_event(ev, indicator_panel_map)
+        panel, dbg = infer_lab_panel_for_event(llm, ev, indicator_panel_map)
         debug_list.append({"timestamp": ev["timestamp"], "panel": panel, "debug": dbg})
         if not panel:
             continue
@@ -473,27 +454,39 @@ def build_T3A_labs(
     # main GT: earliest panel
     chosen_panel = gt_list[0]["value"]
     history = build_history(visit, t_cur)
-    stem = "Which lab panel/order is most appropriate next?"
+    stem = f"Which {len(chosen_panel)} lab panels are most appropriate next?"
 
     # LLM generate irrelevant panel names
-    forbid = list({chosen_panel})
+    forbid = chosen_panel
     hint = "Generate common but irrelevant lab orders/panels that do NOT match GT."
 
-    distractors = llm_generate_options(
-        qtype="T3-A-labs",
-        stem=stem,
-        gt={"panel": chosen_panel, "gt_list": gt_list},
-        history=history,
-        n_options=out_options_k - 1,
-        forbid=forbid,
-        preference_hint=hint,
-    )
-    # backfill with generic negatives if needed
-    while len(distractors) < out_options_k - 1:
-        distractors.append(f"Unrelated Lab Order {len(distractors)+1}")
+    if isinstance(chosen_panel, list) and len(chosen_panel) < out_options_k:
+        distractors = llm_generate_options(
+            llm,
+            qtype="T3-A-labs",
+            stem=stem,
+            gt={"panel": chosen_panel, "gt_list": gt_list},
+            history=history,
+            n_options=out_options_k - len(chosen_panel),
+            forbid=forbid,
+            preference_hint=hint,
+        )
+        # backfill with generic negatives if needed
+        while len(distractors) < out_options_k - 1:
+            distractors.append(f"Unrelated Lab Order {len(distractors)+1}")
 
-    options = distractors[: out_options_k - 1] + [chosen_panel]
-
+        options = distractors[: out_options_k - 1] + chosen_panel
+    elif len(chosen_panel) >= out_options_k:
+        options = chosen_panel[:out_options_k]  # too many GT panels, just take some
+        chosen_panel = {p: 1.0 for p in options}
+    else:
+        logger.warning(f"GT panel is not a list for event at {events[t_index]['timestamp']}. Got: {chosen_panel}. Skipping question.")
+        return None
+    random.shuffle(options)  
+    answer = {}
+    for p in chosen_panel:
+        answer[p] = 1.0 / len(chosen_panel)
+        
     return Question(
         qid=make_qid(patient_id, visit["visit_id"], t_index, "T3-A", 0),
         visit_id=visit["visit_id"],
@@ -503,7 +496,7 @@ def build_T3A_labs(
         qtype="T3-A",
         question=stem,
         options=options,
-        answer=chosen_panel,  # evaluation should use gt_list + topk/decay; answer is "primary"
+        answer=answer,
         meta={
             "subtype": "labs",
             "history": history,
@@ -514,6 +507,7 @@ def build_T3A_labs(
     )
 
 def build_T3A_imaging(
+    llm: LLMUtil,
     patient_id: str,
     visit: Dict[str, Any],
     events: List[Dict[str, Any]],
@@ -530,7 +524,7 @@ def build_T3A_imaging(
     gt_list = []
     debug = []
     for ts, ev in future:
-        lab = infer_imaging_param_for_event(ev, history_messages=None)
+        lab = infer_imaging_param_for_event(llm, ev, history_messages=None)
         # normalize to a single string option
         modality = norm(lab.get("modality") or "other").lower()
         target = norm(lab.get("target") or "")
@@ -542,25 +536,31 @@ def build_T3A_imaging(
     if not gt_list:
         return None
 
-    chosen = gt_list[0]["value"]
+    chosen, weight = gt_list[0]["value"], gt_list[0]["weight"]
+    answer = {chosen: 1.0}
     stem = "Which imaging order is most appropriate next?"
     forbid = [chosen]
+    for item in gt_list:
+        forbid.append(item["value"])
+        answer[item["value"]] = item["weight"] / weight  # if multiple GT, can give partial credit
     hint = "Generate imaging orders that are irrelevant to GT. Prefer same body part different modality, or same modality different body part."
 
     distractors = llm_generate_options(
+        llm=llm,
         qtype="T3-A-imaging",
         stem=stem,
         gt={"imaging": chosen, "gt_list": gt_list},
         history=history,
-        n_options=out_options_k - 1,
+        n_options=out_options_k - len(gt_list),
         forbid=forbid,
         preference_hint=hint,
     )
-    while len(distractors) < out_options_k - 1:
+    while len(distractors) < out_options_k - len(gt_list):
         distractors.append(f"XR Unrelated Part {len(distractors)+1}")
 
-    options = distractors[: out_options_k - 1] + [chosen]
-
+    options = distractors[: out_options_k - len(gt_list)] + list(answer.keys())
+    random.shuffle(options)
+    
     return Question(
         qid=make_qid(patient_id, visit["visit_id"], t_index, "T3-A", 1),
         visit_id=visit["visit_id"],
@@ -570,11 +570,12 @@ def build_T3A_imaging(
         qtype="T3-A",
         question=stem,
         options=options,
-        answer=chosen,
+        answer=answer,
         meta={"subtype": "imaging", "history": history, "gt_list": gt_list, "gt_primary": chosen, "debug": debug},
     )
 
 def build_T3A_micro(
+    llm: LLMUtil,
     patient_id: str,
     visit: Dict[str, Any],
     events: List[Dict[str, Any]],
@@ -591,9 +592,10 @@ def build_T3A_micro(
     gt_list = []
     debug = []
     for ts, ev in future:
-        p = infer_micro_param_for_event(ev)
-        specimen = norm(p.get("specimen") or "")
-        test = norm(p.get("test") or "culture")
+        # p = infer_micro_param_for_event(ev)
+        p = ev["specimen"]
+        specimen = norm(p.get("spec_type") or "")
+        test = norm(p.get("test_name") or "culture")
         value = f"{specimen} {test}".strip()
         dh = (ts - t_cur).total_seconds() / 3600.0
         gt_list.append({"value": value, "delta_hours": dh, "weight": decay_weight(dh)})
@@ -602,24 +604,30 @@ def build_T3A_micro(
     if not gt_list:
         return None
 
-    chosen = gt_list[0]["value"]
+    chosen, weight = gt_list[0]["value"], gt_list[0]["weight"]
+    answer = {chosen: 1.0}
     stem = "Which microbiology test is most appropriate next?"
     forbid = [chosen]
-    hint = "Generate common but irrelevant cultures by swapping specimen (blood vs urine vs sputum) or unrelated tests."
+    hint = "Generate microbiology orders that are irrelevant to GT. Prefer different specimen or different test type."
+    for item in gt_list:
+        forbid.append(item["value"])
+        answer[item["value"]] = item["weight"] / weight  # if multiple GT, can give partial credit
 
     distractors = llm_generate_options(
+        llm=llm,
         qtype="T3-A-micro",
         stem=stem,
         gt={"micro": chosen, "gt_list": gt_list},
         history=history,
-        n_options=out_options_k - 1,
+        n_options=out_options_k - len(gt_list),
         forbid=forbid,
         preference_hint=hint,
     )
-    while len(distractors) < out_options_k - 1:
+    while len(distractors) < out_options_k - len(gt_list):
         distractors.append(f"Urine culture (irrelevant) {len(distractors)+1}")
 
-    options = distractors[: out_options_k - 1] + [chosen]
+    options = distractors[: out_options_k - len(gt_list)] + list(answer.keys())
+    random.shuffle(options)
 
     return Question(
         qid=make_qid(patient_id, visit["visit_id"], t_index, "T3-A", 2),
@@ -630,11 +638,12 @@ def build_T3A_micro(
         qtype="T3-A",
         question=stem,
         options=options,
-        answer=chosen,
-        meta={"subtype": "micro", "history": history, "gt_list": gt_list, "gt_primary": chosen, "debug": debug},
+        answer=answer,
+        meta={"subtype": "micro", "history": history, "gt_list": gt_list, "gt_primary": answer, "debug": debug},
     )
 
-def build_T3M_medication(
+def build_T3A_medication(
+    llm: LLMUtil,
     patient_id: str,
     visit: Dict[str, Any],
     events: List[Dict[str, Any]],
@@ -654,36 +663,64 @@ def build_T3M_medication(
     meds = mp.get("meds", []) or []
     if not meds:
         return None
-
-    primary_drug = meds[0]["drug"]
+    
+    primary_drugs = []
+    for d in meds:
+        drug = norm(d.get("drug") or "")
+        if drug:
+            primary_drugs.append(drug)
+    result = {tuple(primary_drugs): 1.0}  # if multiple meds, can give partial credit to any subset; for simplicity we just give full credit to all as a set
     # GT list can include multiple meds in 24h window (topk evaluation)
     gt_list = []
     debug = []
+    primary_weight = decay_weight((ts0 - t_cur).total_seconds() / 3600.0)
     for ts, ev in future:
         mp2 = infer_med_param_for_event(ev)
+        secondary_drugs = []
+        dh = (ts - t_cur).total_seconds() / 3600.0
+        decayed_weight = decay_weight(dh)
         for m in mp2.get("meds", []) or []:
-            dh = (ts - t_cur).total_seconds() / 3600.0
-            gt_list.append({"value": m["drug"], "delta_hours": dh, "weight": decay_weight(dh)})
+            gt_list.append({"value": m["drug"], "delta_hours": dh, "weight": decayed_weight})
+            secondary_drugs.append(m["drug"])
+        result[tuple(secondary_drugs)] = decayed_weight / primary_weight  # partial credit for secondary GT meds
         debug.append({"timestamp": ev["timestamp"], "meds": mp2.get("meds", [])})
-
-    stem = "Which medication is most appropriate next?"
-    forbid = [primary_drug]
+        
+    if len(primary_drugs) == 0 or len(primary_drugs) > out_options_k:
+        logger.warning(f"GT medication is empty or too large for event at {events[t_index]['timestamp']}. Got: {primary_drugs}. Skipping question.")
+        return None
+    
+    stem = f"Which {len(primary_drugs)} medications are most appropriate next?"
+    future_drug = []
+    for item in gt_list:
+        drug = item["value"]
+        if drug not in primary_drugs:
+            future_drug.append(drug)
+    forbid = primary_drugs + future_drug  # forbid primary GT + other GT meds in 24h window
     hint = "Generate medications that are plausible but irrelevant to the current GT and history. Avoid near-duplicate drug names."
 
     distractors = llm_generate_options(
-        qtype="T3-M",
+        llm=llm,
+        qtype="T3-A",
         stem=stem,
-        gt={"drug": primary_drug, "gt_list": gt_list},
+        gt={"drug": primary_drugs, "gt_list": gt_list},
         history=history,
-        n_options=out_options_k - 1,
+        n_options=out_options_k - len(forbid),
         forbid=forbid,
         preference_hint=hint,
     )
-    while len(distractors) < out_options_k - 1:
+    while len(distractors) < out_options_k - len(forbid):
         distractors.append(f"Unrelated Drug {len(distractors)+1}")
 
-    options = distractors[: out_options_k - 1] + [primary_drug]
-
+    options = distractors[: out_options_k - len(forbid)] + forbid
+    if len(options) > out_options_k:
+        options = options[:out_options_k]  # in case GT meds exceed k, just take some
+    random.shuffle(options)
+    answer = {}
+    for t, w in result.items():
+        for drug in t:
+            if drug in forbid:
+                answer[drug] = w/len(t)  # partial credit for GT meds
+    
     return Question(
         qid=make_qid(patient_id, visit["visit_id"], t_index, "T3-M", 0),
         visit_id=visit["visit_id"],
@@ -693,8 +730,8 @@ def build_T3M_medication(
         qtype="T3-M",
         question=stem,
         options=options,
-        answer=primary_drug,
-        meta={"history": history, "gt_list": gt_list, "gt_primary": primary_drug, "debug": debug},
+        answer=answer,
+        meta={"history": history, "gt_list": gt_list, "gt_primary": primary_drugs, "debug": answer},
     )
 
 def build_T3D_discharge(
@@ -726,8 +763,138 @@ def build_T3D_discharge(
         qtype="T3-D",
         question=stem,
         options=options,
-        answer=gt,
+        answer={gt: 1.0},
         meta={"history": history, "discharge_time": discharge_time.strftime("%Y-%m-%d %H:%M:%S"), "X_hours": X_hours},
+    )
+
+def build_T3A_procedure(
+    llm: LLMUtil,
+    patient_id: str,
+    visit: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    t_index: int,
+    t_cur: datetime,
+    out_options_k: int,
+) -> Optional["Question"]:
+
+    future = collect_future_events(events, t_cur, 24.0, "perform_procedure")
+    if not future:
+        return None
+
+    history = build_history(visit, t_cur)
+
+    # group by exact timestamp: many procedures share same ts
+    future_groups = group_future_by_timestamp(future)
+    if not future_groups:
+        return None
+
+    # primary group: earliest timestamp bucket
+    ts0, evs0 = future_groups[0]
+
+    primary_procs: List[str] = []
+    for ev in evs0:
+        name = norm(ev.get("name") or "")
+        if name:
+            primary_procs.append(name)
+
+    # dedup keep order
+    seen = set()
+    primary_procs = [x for x in primary_procs if not (x in seen or seen.add(x))]
+
+    if len(primary_procs) == 0 or len(primary_procs) > out_options_k:
+        logger.warning(
+            f"GT procedure is empty or too large at {events[t_index]['timestamp']}. "
+            f"Got {len(primary_procs)}: {primary_procs[:5]}"
+        )
+        return None
+
+    # scoring sets
+    result = {tuple(primary_procs): 1.0}
+
+    gt_list: List[Dict[str, Any]] = []
+    debug: List[Dict[str, Any]] = []
+
+    primary_weight = decay_weight((ts0 - t_cur).total_seconds() / 3600.0)
+
+    for ts, evs in future_groups:
+        dh = (ts - t_cur).total_seconds() / 3600.0
+        w = decay_weight(dh)
+
+        bucket = []
+        for ev in evs:
+            name = norm(ev.get("name") or "")
+            if not name:
+                continue
+            gt_list.append({"value": name, "delta_hours": dh, "weight": w})
+            bucket.append(name)
+
+        # dedup
+        seen2 = set()
+        bucket = [x for x in bucket if not (x in seen2 or seen2.add(x))]
+
+        if bucket:
+            result[tuple(bucket)] = w / primary_weight
+
+        debug.append({"timestamp": evs[0].get("timestamp"), "procedures": bucket})
+
+    stem = f"Which {len(primary_procs)} procedures are most appropriate next?"
+
+    # forbid = primary + other GT procedures in 24h window
+    future_proc = []
+    for item in gt_list:
+        p = norm(item["value"])
+        if p and p not in primary_procs:
+            future_proc.append(p)
+
+    forbid = primary_procs + future_proc
+
+    n_distractors = out_options_k - len(forbid)
+    if n_distractors < 0:
+        n_distractors = 0
+
+    hint = "Generate procedures that are plausible but irrelevant to the current GT and history. Avoid near-duplicate procedure names."
+
+    distractors = llm_generate_options(
+        llm=llm,
+        qtype="T3-A-procedure",
+        stem=stem,
+        gt={"procedure": primary_procs, "gt_list": gt_list},
+        history=history,
+        n_options=n_distractors,
+        forbid=forbid,
+        preference_hint=hint,
+    )
+    while len(distractors) < n_distractors:
+        distractors.append(f"Unrelated Procedure {len(distractors)+1}")
+
+    options = distractors[:n_distractors] + forbid
+    if len(options) > out_options_k:
+        options = options[:out_options_k]
+    random.shuffle(options)
+
+    answer: Dict[str, float] = {}
+    for t_set, w in result.items():
+        for proc in t_set:
+            if proc in forbid:
+                answer[proc] = max(answer.get(proc, 0.0), w / max(len(t_set), 1))
+
+    return Question(
+        qid=make_qid(patient_id, visit["visit_id"], t_index, "T3-P", 0),
+        visit_id=visit["visit_id"],
+        hadm_id=visit.get("hadm_id"),
+        t_index=t_index,
+        timestamp=events[t_index]["timestamp"],
+        qtype="T3-P",
+        question=stem,
+        options=options,
+        answer=answer,
+        meta={
+            "subtype": "procedure",
+            "history": history,
+            "gt_list": gt_list,
+            "gt_primary": primary_procs,
+            "debug": debug,
+        },
     )
 
 # --------- main pipeline ----------
@@ -761,6 +928,7 @@ def sample_decision_points(events: List[Dict[str, Any]], n_points: int, seed: in
     return sorted(rng.sample(candidates, k=n_points))
 
 def generate_questions_for_visit(
+    llm: LLMUtil,
     patient_id: str,
     visit: Dict[str, Any],
     indicator_panel_map: Optional[Dict[str, str]],
@@ -808,17 +976,23 @@ def generate_questions_for_visit(
 
         # ---- 1 extra question max by default (param or med). You can allow 2 if you want. ----
         if gt_act == "order_labs":
-            q = build_T3A_labs(patient_id, visit, events, i, t_cur, indicator_panel_map, k_param)
+            q = build_T3A_labs(llm, patient_id, visit, events, i, t_cur, indicator_panel_map, k_param)
             if q: out.append(q)
         elif gt_act == "order_imaging":
-            q = build_T3A_imaging(patient_id, visit, events, i, t_cur, k_param)
+            q = build_T3A_imaging(llm, patient_id, visit, events, i, t_cur, k_param)
             if q: out.append(q)
         elif gt_act == "order_microbiology":
-            q = build_T3A_micro(patient_id, visit, events, i, t_cur, k_param)
+            q = build_T3A_micro(llm, patient_id, visit, events, i, t_cur, k_param)
             if q: out.append(q)
         elif gt_act == "medication":
-            q = build_T3M_medication(patient_id, visit, events, i, t_cur, k_med)
+            q = build_T3A_medication(llm, patient_id, visit, events, i, t_cur, k_med)
             if q: out.append(q)
+        elif gt_act == "perform_procedure":
+            q = build_T3A_procedure(llm, patient_id, visit, events, i, t_cur, k_param)
+            if q: out.append(q)
+        else:
+            logger.warning(f"GT action {gt_act} at index {i+1} does not match any known action types. Skipping param question.")
+            continue
 
         # ---- T3-D near discharge ----
         if enable_discharge_q and discharge_time is not None:
@@ -851,53 +1025,103 @@ def write_questions_jsonl(patient_out_path: Path, questions: List[Dict[str, Any]
             fw.write(json.dumps(q, ensure_ascii=False) + "\n")
     return len(questions)
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+
+def process_one_patient(fp_str: str, cfg_dict: Dict[str, Any])\
+    -> Tuple[str, int, Dict[str, Dict[str, int]]]:
+    """
+    Worker: process one patient file and write its jsonl.
+    Return: (patient_id, n_questions_written)
+    """
+    # IMPORTANT: init LLM inside worker
+    llm = LLMUtil()
+
+    fp = Path(fp_str)
+    obj = json.loads(fp.read_text(encoding="utf-8"))
+    patient_id = obj.get("patient_info", {}).get("patient_id") or fp.stem
+
+    out_path = Path(cfg_dict["OUTPUT_PATH"])
+    out_path.mkdir(parents=True, exist_ok=True)
+    patient_out = out_path / f"{patient_id}.jsonl"
+
+    # load indicator_panel_map (read-only) inside worker
+    ind_map_path = cfg_dict.get("INDICATOR_PANEL_MAP")
+    indicator_panel_map = load_indicator_panel_map(ind_map_path) if ind_map_path else None
+
+    total_written = 0
+    visits = (obj.get("visits", []) or [])
+    start_visit = int(cfg_dict.get("AGENT_TASK_STARTING_VISIT", 0))
+    visits = visits[start_visit:]
+
+    for visit in visits:
+        qs = generate_questions_for_visit(
+            llm=llm,
+            patient_id=patient_id,
+            visit=visit,
+            indicator_panel_map=indicator_panel_map,
+            k_action=int(cfg_dict["K_ACTION"]),
+            k_param=int(cfg_dict["K_PARAM"]),
+            k_med=int(cfg_dict["K_MED"]),
+            enable_discharge_q=bool(cfg_dict["ENABLE_DISCHARGE_Q"]),
+            discharge_Xh=float(cfg_dict["DISCHARGE_XH"]),
+            discharge_only_within_h=float(cfg_dict["DISCHARGE_ONLY_WITHIN_H"]),
+            seed=int(cfg_dict["RANDOM_SEED"]),
+        )
+        total_written += write_questions_jsonl(patient_out, qs)
+    logger.info(f"Patient {patient_id}: wrote {total_written} questions to {patient_out}")
+    logger.info(f"Token usage: {json.dumps(llm.get_token_usage(), ensure_ascii=False, indent=2)}")
+
+    return patient_id, total_written, llm.get_token_usage()
+
 
 def main():
     from config import AgentQaGenConfig
-    
     cfg = AgentQaGenConfig()
 
-    in_dir = cfg.INPUT_DIR
-    out_path = cfg.OUTPUT_PATH
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    in_dir = Path(cfg.INPUT_DIR)
+    out_dir = Path(cfg.OUTPUT_PATH)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    global_token_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+    files = list(iter_json_files(in_dir))
+    if cfg.DEMO_MODE:
+        files = files[: cfg.DEMO_N]
 
-    indicator_panel_map = load_indicator_panel_map(cfg.INDICATOR_PANEL_MAP)
+    # pack cfg to dict (so it can be pickled)
+    cfg_dict = {
+        "INPUT_DIR": str(cfg.INPUT_DIR),
+        "OUTPUT_PATH": str(cfg.OUTPUT_PATH),
+        "INDICATOR_PANEL_MAP": getattr(cfg, "INDICATOR_PANEL_MAP", None),
+        "K_ACTION": cfg.K_ACTION,
+        "K_PARAM": cfg.K_PARAM,
+        "K_MED": cfg.K_MED,
+        "ENABLE_DISCHARGE_Q": cfg.ENABLE_DISCHARGE_Q,
+        "DISCHARGE_XH": cfg.DISCHARGE_XH,
+        "DISCHARGE_ONLY_WITHIN_H": cfg.DISCHARGE_ONLY_WITHIN_H,
+        "RANDOM_SEED": cfg.RANDOM_SEED,
+        "AGENT_TASK_STARTING_VISIT": getattr(cfg, "AGENT_TASK_STARTING_VISIT", 0),
+    }
+
+    max_workers = getattr(cfg, "MAX_WORKERS", None) or min(8, os.cpu_count() or 4)
+
     total_q = 0
     total_patients = 0
 
-    for fp in tqdm(list(iter_json_files(in_dir)), desc="Generating per-patient jsonl"):
-        obj = json.loads(fp.read_text(encoding="utf-8"))
-        patient_id = obj.get("patient_info", {}).get("patient_id") or fp.stem
-
-        patient_out = out_path / f"{patient_id}.jsonl"
-        wrote_any = False
-
-        for visit in obj.get("visits", []) or []:
-            qs = generate_questions_for_visit(
-                patient_id=patient_id,
-                visit=visit,
-                indicator_panel_map=indicator_panel_map,
-                k_action=cfg.K_ACTION,
-                k_param=cfg.K_PARAM,
-                k_med=cfg.K_MED,
-                enable_discharge_q=cfg.ENABLE_DISCHARGE_Q,
-                discharge_Xh=cfg.DISCHARGE_XH,
-                discharge_only_within_h=cfg.DISCHARGE_ONLY_WITHIN_H,
-                seed=cfg.RANDOM_SEED,
-            )
-            n = write_questions_jsonl(patient_out, qs)
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(process_one_patient, str(fp), cfg_dict) for fp in files]
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Patients"):
+            pid, n, usage = fut.result()
             if n > 0:
-                wrote_any = True
+                total_patients += 1
                 total_q += n
+                for k in global_token_usage.keys():
+                    global_token_usage[k] += (usage.get("chat",{})).get(k, 0)
 
-        if wrote_any:
-            total_patients += 1
-            
-        if cfg.DEMO_MODE:
-            if total_patients >= cfg.DEMO_N:  
-                break
-
-    logger.success(f"Wrote {total_q} questions for {total_patients} patients into folder: {out_path}")
-
+    logger.success(f"Wrote {total_q} questions for {total_patients} patients into folder: {cfg.OUTPUT_PATH}")
+    logger.info(f"Global token usage: {json.dumps(global_token_usage, ensure_ascii=False, indent=2)}")
 if __name__ == "__main__":
     main()

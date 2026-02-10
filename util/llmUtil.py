@@ -14,15 +14,27 @@ import json
 import time
 import random
 from typing import Any, Dict, List, Optional, Sequence, Union, Callable, Tuple
-
+import copy
 from openai import OpenAI
 from util.logUtil import setup_logger
 from config import LLMConfig
 config = LLMConfig()
 logger = setup_logger()
+from dataclasses import dataclass
 
 import threading
 from collections import deque
+
+@dataclass
+class ChatTokenUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+@dataclass
+class EmbeddingTokenUsage:
+    input_tokens: int = 0
+    total_tokens: int = 0
 
 class _RateLimiter:
     """
@@ -358,8 +370,8 @@ Do not include markdown, code fences, or explanations.
         if usage is None:
             # fallback only counts prompt tokens; completion unknown
             if fallback_prompt_tokens > 0:
-                self.token_usage["chat"]["prompt_tokens"] += fallback_prompt_tokens
-                self.token_usage["chat"]["total_tokens"] += fallback_prompt_tokens
+                self.token_usage["chat"].prompt_tokens += fallback_prompt_tokens
+                self.token_usage["chat"].total_tokens += fallback_prompt_tokens
             return
 
         # OpenAI SDK: usage.prompt_tokens / completion_tokens / total_tokens
@@ -376,9 +388,11 @@ Do not include markdown, code fences, or explanations.
             pt = fallback_prompt_tokens
             tt = tt or (pt + ct)
 
-        self.token_usage["chat"]["prompt_tokens"] += pt
-        self.token_usage["chat"]["completion_tokens"] += ct
-        self.token_usage["chat"]["total_tokens"] += tt
+        self.token_usage["chat"].prompt_tokens += pt
+        self.token_usage["chat"].completion_tokens += ct
+        self.token_usage["chat"].total_tokens += tt
+        
+        logger.debug(f"Accumulated chat usage: prompt={pt}, completion={ct}, total={tt} (fallback_prompt={fallback_prompt_tokens})")
 
 
     def _accumulate_embed_usage(self, usage: Any, *, fallback_input_tokens: int = 0) -> None:
@@ -388,8 +402,8 @@ Do not include markdown, code fences, or explanations.
         """
         if usage is None:
             if fallback_input_tokens > 0:
-                self.token_usage["embeddings"]["input_tokens"] += fallback_input_tokens
-                self.token_usage["embeddings"]["total_tokens"] += fallback_input_tokens
+                self.token_usage["embeddings"].input_tokens += fallback_input_tokens
+                self.token_usage["embeddings"].total_tokens += fallback_input_tokens
             return
 
         if isinstance(usage, dict):
@@ -403,23 +417,34 @@ Do not include markdown, code fences, or explanations.
             it = fallback_input_tokens
             tt = tt or it
 
-        self.token_usage["embeddings"]["input_tokens"] += it
-        self.token_usage["embeddings"]["total_tokens"] += tt
+        self.token_usage["embeddings"].input_tokens += it
+        self.token_usage["embeddings"].total_tokens += tt
         
     def get_token_usage(self) -> Dict[str, Any]:
-        # shallow copy避免外部乱改
         return {
-            "chat": dict(self.token_usage["chat"]),
-            "embeddings": dict(self.token_usage["embeddings"]),
+            "chat": {
+                "prompt_tokens": self.token_usage["chat"].prompt_tokens,
+                "completion_tokens": self.token_usage["chat"].completion_tokens,
+                "total_tokens": self.token_usage["chat"].total_tokens,
+            },
+            "embeddings": {
+                "input_tokens": self.token_usage["embeddings"].input_tokens,
+                "total_tokens": self.token_usage["embeddings"].total_tokens,
+            }
         }
-
+    
+    def reset_token_usage(self) -> None:
+        self.token_usage = {
+            "chat": ChatTokenUsage(),
+            "embeddings": EmbeddingTokenUsage(),
+        }
 
     def __init__(self) -> None:
         self.config = LLMConfig()
         self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
         self.token_usage = {
-            "chat": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "embeddings": {"input_tokens": 0, "total_tokens": 0},
+            "chat": ChatTokenUsage(),
+            "embeddings": EmbeddingTokenUsage(),
         }
         max_inflight = getattr(self.config, "max_inflight", 8)
         qps = getattr(self.config, "qps", 5)  # e.g., 5 or 10
@@ -429,73 +454,75 @@ Do not include markdown, code fences, or explanations.
 
 
 
-# # -----------------------------
-# # Minimal self-test (optional)
-# # -----------------------------
-# if __name__ == "__main__":
-#     # Quick smoke test:
-#     #   export DASHSCOPE_API_KEY=...
-#     #   python util/llmUtil.py
-#     llm = LLMUtil()
-#     obj = llm.chat_json(
-#         system_prompt="You are a JSON generator.",
-#         user_text='Return {"ok": true, "x": "___", "y": "____"}',
-#     )
-#     print("chat_json:", obj)
-
-#     vecs = llm.embed_texts(["hello", "world"])
-#     print("embeddings:", len(vecs), len(vecs[0]) if vecs else 0)
-
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-import json
-import os
-    
-    
-llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
-def _one_job(i: int) -> dict:
-
-    t0 = time.time()
-    obj = llm.chat_json(
-        system_prompt="You are a JSON generator. Output JSON only.",
-        user_text=f'{{"job": {i}, "ok": true, "ts": "{time.time()}"}}',
-        model=getattr(config, "model", "qwen-turbo"),
-        temperature=0.0,
-    )
-    dt = time.time() - t0
-    return {"i": i, "dt": dt, "obj": obj}
-
-def limiter_smoke_test():
-    # 你可以用环境变量临时调参（如果你在 LLMConfig 里接了 env）
-    # os.environ["LLM_MAX_INFLIGHT"] = "4"
-    # os.environ["LLM_QPS"] = "2"
-
-    total_jobs = 1000          # 总请求数
-    thread_workers = 20      # 启很多线程，看看 limiter 是否能“压住”
-
-    t_all = time.time()
-    results = []
-    fails = 0
-
-    with ThreadPoolExecutor(max_workers=thread_workers) as ex:
-        futs = [ex.submit(_one_job, i) for i in range(total_jobs)]
-        for fu in as_completed(futs):
-            try:
-                r = fu.result()
-                results.append(r)
-                print(f"job {r['i']:02d} done in {r['dt']:.2f}s -> keys={list(r['obj'].keys())}")
-            except Exception as e:
-                fails += 1
-                print("FAILED:", repr(e))
-
-    total_dt = time.time() - t_all
-    results.sort(key=lambda x: x["dt"])
-    print("\n========== SUMMARY ==========")
-    print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
-    if results:
-        print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
-    print(f"Token usage:{llm.get_token_usage()}")
-
+# -----------------------------
+# Minimal self-test (optional)
+# -----------------------------
 if __name__ == "__main__":
-    limiter_smoke_test()
+    # Quick smoke test:
+    #   export DASHSCOPE_API_KEY=...
+    #   python util/llmUtil.py
+    llm = LLMUtil()
+    logger.info("Running LLMUtil self-test...")
+    test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="qwen-turbo", temperature=0.0)
+    obj = llm.chat_json(
+        system_prompt="You are a JSON generator.",
+        user_text='Return {"ok": true, "x": "___", "y": "____"}',
+    )
+    print("chat_json:", obj)
+
+    vecs = llm.embed_texts(["hello", "world"])
+    print("embeddings:", len(vecs), len(vecs[0]) if vecs else 0)
+
+
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+# import time
+# import json
+# import os
+    
+    
+# llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
+# def _one_job(i: int) -> dict:
+
+#     t0 = time.time()
+#     obj = llm.chat_json(
+#         system_prompt="You are a JSON generator. Output JSON only.",
+#         user_text=f'{{"job": {i}, "ok": true, "ts": "{time.time()}"}}',
+#         model=getattr(config, "model", "qwen-turbo"),
+#         temperature=0.0,
+#     )
+#     dt = time.time() - t0
+#     return {"i": i, "dt": dt, "obj": obj}
+
+# def limiter_smoke_test():
+#     # 你可以用环境变量临时调参（如果你在 LLMConfig 里接了 env）
+#     # os.environ["LLM_MAX_INFLIGHT"] = "4"
+#     # os.environ["LLM_QPS"] = "2"
+
+#     total_jobs = 1000          # 总请求数
+#     thread_workers = 20      # 启很多线程，看看 limiter 是否能“压住”
+
+#     t_all = time.time()
+#     results = []
+#     fails = 0
+
+#     with ThreadPoolExecutor(max_workers=thread_workers) as ex:
+#         futs = [ex.submit(_one_job, i) for i in range(total_jobs)]
+#         for fu in as_completed(futs):
+#             try:
+#                 r = fu.result()
+#                 results.append(r)
+#                 print(f"job {r['i']:02d} done in {r['dt']:.2f}s -> keys={list(r['obj'].keys())}")
+#             except Exception as e:
+#                 fails += 1
+#                 print("FAILED:", repr(e))
+
+#     total_dt = time.time() - t_all
+#     results.sort(key=lambda x: x["dt"])
+#     print("\n========== SUMMARY ==========")
+#     print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
+#     if results:
+#         print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
+#     print(f"Token usage:{llm.get_token_usage()}")
+
+# if __name__ == "__main__":
+#     limiter_smoke_test()
