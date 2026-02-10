@@ -10,3 +10,6 @@ __pycache__
 .vscode
 .env
 run
+
+*/events_selected
+*/questions_generated

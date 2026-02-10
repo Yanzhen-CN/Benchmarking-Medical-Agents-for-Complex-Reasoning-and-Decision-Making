@@ -2,7 +2,8 @@ from config import BuildConfig
 from util.logUtil import setup_logger
 logger = setup_logger()
 from EHR_pipeline import (
-    events_preprocess, note_extract, patients_extract, es_extract, convert#, build_context
+    events_preprocess, note_extract, patients_extract, 
+    es_extract, convert, get_lab_panels#, build_context
 )
     
 # from context_builder import build_context
@@ -26,6 +27,9 @@ def main():
     convert.batch_convert()
     # logger.info("Step 5: Building context for each patient")
     # build_context.build_context()
+    logger.info("Step 5: Extracting lab panels")
+    get_lab_panels.get_lab_panels()
+    logger.info("Dataset building process completed successfully")
 
 if __name__ == "__main__":
     main()

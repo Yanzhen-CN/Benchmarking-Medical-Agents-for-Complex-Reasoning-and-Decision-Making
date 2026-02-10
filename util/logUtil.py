@@ -4,10 +4,12 @@ import sys
 import os
 
 _LOGGER_CONFIGURED = False
+from config import LoggerConfig
+cfg = LoggerConfig()
 
 def setup_logger(
-    level: str = "INFO",
-    log_file: str | None = None,
+    level: str = cfg.level,
+    log_file: str | None = cfg.log_file,
 ):
     """
     Setup loguru logger.

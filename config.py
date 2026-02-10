@@ -5,6 +5,11 @@ from pathlib import Path
 
 from typing import Optional, Any, Dict
 
+class LoggerConfig:
+    def __init__(self):
+        self.level: str = "INFO"
+        self.log_file: Optional[str] = None  # e.g. "logs/app.log"
+
 class BuildConfig:
     class Paths:
         def __init__(self):
@@ -210,3 +215,23 @@ class TimelineGenConfig:
         
         # 填空任务：至少需要几个 targets 才能构成一个有效题目
         self.MIN_TARGETS_FOR_CLOZE: int = 4
+
+class AgentQaGenConfig:
+    def __init__(self):
+        self.INPUT_DIR: Path = Path("./bench_data/patients")
+        self.OUTPUT_PATH: Path = Path("./tasks/agentic_decision/questions_generated/")
+        self.INDICATOR_PANEL_MAP: Path = Path("./bench_data/lab_panels/panel_to_indicators.json")
+        self.K_ACTION: int = 6
+        self.K_PARAM: int = 10
+        self.K_MED: int = 10
+        self.ENABLE_DISCHARGE_Q: bool = True
+        self.DISCHARGE_XH: float = 6.0
+        self.DISCHARGE_ONLY_WITHIN_H: float = 48.0
+        self.RANDOM_SEED: int = 42
+        
+        self.DEMO_MODE: bool = True
+        self.DEMO_N: int = 5
+        
+        self.AGENT_TASK_STARTING_VISIT: int = 9
+        
+        self.MAX_WORKERS: int = 16
