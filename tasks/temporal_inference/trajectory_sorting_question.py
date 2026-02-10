@@ -236,7 +236,7 @@ if __name__ == "__main__":
             lines = generate_jsonl_content(data, pid, cfg)
             
             if lines:
-                out_name = f"{pid}_trajectory.jsonl"
+                out_name = f"{pid}.jsonl"
                 out_path = os.path.join(args.output_dir, out_name)
                 with open(out_path, 'w', encoding='utf-8') as f_out:
                     for line in lines:
