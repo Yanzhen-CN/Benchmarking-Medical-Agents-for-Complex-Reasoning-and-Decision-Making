@@ -21,13 +21,14 @@ from datetime import datetime
 try:
     from config import TimelineGenConfig
 except ImportError:
+    print("TimelineGenConfig not found, creat now")
     class TimelineGenConfig:
         def __init__(self):
             self.RANDOM_SEED = 42
             self.TRAJECTORY_WINDOW_SIZE = 5
             self.TRAJECTORY_STRIDE = 1
-            self.PATIENTS_SEQ_DIR = Path("./EHR_pipeline/bench_data/patients_sequence")
-            self.TRAJECTORY_DIR = Path("./question_data/trajectory_sorting")
+            self.PATIENTS_SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
+            self.TRAJECTORY_DIR = PROJECT_ROOT / "question_data" / "trajectory_sorting"
 
 def parse_ts(ts_str):
     if not ts_str: return None
@@ -220,6 +221,7 @@ if __name__ == "__main__":
     random.seed(cfg.RANDOM_SEED)
 
     if not os.path.exists(args.input_dir):
+        print(args.input_dir)
         print("Input dir not found")
         exit(1)
 
