@@ -247,13 +247,16 @@ class AgentQaGenConfig:
 class AgentTaskConfig:
     def __init__(self):
         self.QUESTIONS_DIR: Path = Path("./tasks/agentic_decision/questions_generated")
-        self.VISIT_CONTEXT_DIR: Path = Path("./bench_data/patients")
+        self.PATIENTS_DIR: Path = Path("./bench_data/patients")
         self.EVENT_SEQ_DIR: Path = Path("./bench_data/patients_sequence")
         
         self.MAXWORKERS: int = 16
         self.MAX_VISIBALE_VISITS: int = 10
         self.MAX_KNOWN_FACTS: int = 10
         self.MEMORY_TYPE: str = "report" # report | event_stream
+        self.MAX_EVENTS_PER_VISIT = 9999
+        
+        self.CONTEXT_DIR: Path = Path("./tasks/agentic_decision/context")
         
         self.DEMO_MODE: bool = True
         self.DEMO_N: int = 5

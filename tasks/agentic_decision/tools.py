@@ -62,6 +62,12 @@ def iter_json_files(root: Path):
         if p.name.startswith("."):
             continue
         yield p
+
+def iter_jsonl_files(root: Path):
+    for p in root.rglob("*.jsonl"):
+        if p.name.startswith("."):
+            continue
+        yield p
         
 # --------- LLM ----------
 
@@ -321,7 +327,7 @@ def generate_reason_from_messages_llm(
     current_action: str,
     current_args: Dict[str, Any],
     model: str = llm_cfg.chat_model,
-    max_history_msgs: int = 24,   # 控制上下文长度：只取最近 N 条
+    max_history_msgs: int = 8,   # 控制上下文长度：只取最近 N 条
 ) -> str:
     """
     Generate assistant 'reason' based ONLY on the prefix messages (no extra summary).
