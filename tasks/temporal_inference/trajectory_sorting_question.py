@@ -221,6 +221,7 @@ if __name__ == "__main__":
     random.seed(cfg.RANDOM_SEED)
 
     if not os.path.exists(args.input_dir):
+        print(args.input_dir)
         print("Input dir not found")
         exit(1)
 
