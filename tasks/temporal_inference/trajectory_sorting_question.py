@@ -27,7 +27,11 @@ except ImportError:
             self.RANDOM_SEED = 42
             self.TRAJECTORY_WINDOW_SIZE = 5
             self.TRAJECTORY_STRIDE = 1
+<<<<<<< HEAD
             self.PATIENTS_SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
+=======
+            self.PATIENTS_SEQ_DIR = PROJECT_ROOT / "EHR_pipeline" / "bench_data" / "patients_sequence"
+>>>>>>> d3eae85cdfc9f31ff4e3c7c9fc8dabb65610a363
             self.TRAJECTORY_DIR = PROJECT_ROOT / "question_data" / "trajectory_sorting"
 
 def parse_ts(ts_str):
