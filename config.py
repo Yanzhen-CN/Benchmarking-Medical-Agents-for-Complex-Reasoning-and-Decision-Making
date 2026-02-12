@@ -199,11 +199,7 @@ class TimelineGenConfig:
         # build = BuildConfig() 
     
         base = Path(__file__).resolve().parent  # 假设config.py在项目根目录
-<<<<<<< HEAD
         self.PATIENTS_SEQ_DIR = base / "bench_data" / "patients_sequence"
-=======
-        self.PATIENTS_SEQ_DIR = base / "EHR_pipeline" / "bench_data" / "patients_sequence"
->>>>>>> d3eae85cdfc9f31ff4e3c7c9fc8dabb65610a363
 
         # --- 输出路径 ---
         # 建议把两个子任务分开存放，方便评测脚本读取
