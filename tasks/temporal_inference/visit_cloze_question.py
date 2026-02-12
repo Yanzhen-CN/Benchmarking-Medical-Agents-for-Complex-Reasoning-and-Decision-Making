@@ -19,12 +19,13 @@ from tqdm import tqdm
 try:
     from config import TimelineGenConfig
 except ImportError:
+    print("TimelineGenConfig not found, creat now")
     class TimelineGenConfig:
         def __init__(self):
             self.RANDOM_SEED = 42
             self.MIN_TARGETS_FOR_CLOZE = 4
-            self.PATIENTS_SEQ_DIR = Path("./EHR_pipeline/bench_data/patients_sequence")
-            self.MICRO_CLOZE_DIR = Path("./question_data/visit_cloze")
+            self.PATIENTS_SEQ_DIR = PROJECT_ROOT / "EHR_pipeline" / "bench_data" / "patients_sequence"
+            self.TRAJECTORY_DIR = PROJECT_ROOT / "question_data" / "visit_cloze"
 
 def is_precise_timestamp(ts_str):
     if not ts_str: return False
