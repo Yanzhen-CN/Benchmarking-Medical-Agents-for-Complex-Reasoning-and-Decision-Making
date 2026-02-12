@@ -186,6 +186,7 @@ class LLMUtil:
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         extra: Optional[Dict[str, Any]] = None,
+        enable_thinking: bool = False,
     ) -> str:
         """
         Simple chat completion. Returns the assistant message content (string).
@@ -195,6 +196,7 @@ class LLMUtil:
             "model": model,
             "messages": messages,
             "temperature": temperature, 
+            "extra_body":{"enable_thinking": enable_thinking}
         }
         if top_p is not None:
             payload["top_p"] = top_p
@@ -230,13 +232,14 @@ class LLMUtil:
         *,
         system_prompt: str,
         user_text: str,
-        model: str = "qwen-turbo",
+        model: str = config.chat_model,
         temperature: float = 0.0,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         strict_only_json: bool = True,
         normalize_placeholders: bool = True,
         extra: Optional[Dict[str, Any]] = None,
+        enable_thinking: bool = False,
     ) -> Dict[str, Any]:
         """
         Ask the model to return JSON only. Retries if JSON parsing fails.
@@ -273,6 +276,7 @@ Do not include markdown, code fences, or explanations.
                     top_p=top_p,
                     max_tokens=max_tokens,
                     extra=extra,
+                    enable_thinking=enable_thinking,
                 )
                 cand = _extract_json_candidate(text) or text.strip()
 
@@ -463,7 +467,7 @@ if __name__ == "__main__":
     #   python util/llmUtil.py
     llm = LLMUtil()
     logger.info("Running LLMUtil self-test...")
-    test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="qwen-turbo", temperature=0.0)
+    test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="qwen3:4b", temperature=0.0)
     obj = llm.chat_json(
         system_prompt="You are a JSON generator.",
         user_text='Return {"ok": true, "x": "___", "y": "____"}',

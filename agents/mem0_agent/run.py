@@ -50,7 +50,6 @@ def main() -> None:
     load_local_env()
 
     agent = build_agent()
-
     messages = [
         {"role": "user", "content": "患者三天前开始发热并咳嗽。"}
     ]

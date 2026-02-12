@@ -112,14 +112,16 @@ class BuildConfig:
         
 
 class LLMConfig:
-    def __init__(self):
-        self.provider: str = "qwen"  # qwen | openai | compatible
+    def __init__(self, provider: str = 'qwen', chat_model: str = "qwen-turbo", 
+                 embed_model: str = 'text-embedding-v3',
+                 api_key: Optional[str] = None, base_url: Optional[str] = None):
+        self.provider: str = provider  # qwen | openai | compatible
         self.api_key: Optional[str] = os.getenv("OPENAI_API_KEY")  # or OPENAI_API_KEY for openai provider
         self.base_url: Optional[str] = os.getenv("OPENAI_API_BASE_URL")  # for openai provider, if using custom base URL
 
         # Default models (override per call as needed)
-        self.chat_model: str = "qwen-turbo"
-        self.embed_model: str = "text-embedding-v3"  # Qwen embedding model name may differ; override if needed
+        self.chat_model: str = chat_model
+        self.embed_model: str = embed_model  # Qwen embedding model name may differ; override if needed
         self.model: str = os.getenv("LLM_MODEL", self.chat_model)
 
         # Retry and robustness
@@ -131,7 +133,8 @@ class LLMConfig:
         self.qps: float = float(os.getenv("LLM_QPS", "5"))
 
         # Default generation params
-        self.temperature: float = 0.0
+        if provider == "qwen":
+            self.temperature: float = 0.0
         self.top_p: Optional[float] = None
         self.max_tokens: Optional[int] = None
         
@@ -229,9 +232,31 @@ class AgentQaGenConfig:
         self.DISCHARGE_ONLY_WITHIN_H: float = 48.0
         self.RANDOM_SEED: int = 42
         
-        self.DEMO_MODE: bool = True
+        self.DEMO_MODE: bool = False
         self.DEMO_N: int = 5
         
         self.AGENT_TASK_STARTING_VISIT: int = 9
         
         self.MAX_WORKERS: int = 16
+        
+        self.DISCHARGE_YES_RATIO = 0.7          # 目标 yes 比例
+        self.DISCHARGE_MIN_GAP_H = 0.5          # 离出院至少多少小时，避免贴太近（可选）
+        self.DISCHARGE_NO_MARGIN_H = 6.0        # No 采样在 (X, X+margin] 区间内（靠近但为 No）
+        self.DISCHARGE_SAMPLE_K = 1             # 每个 visit 生成几个 T3-D
+        
+class AgentTaskConfig:
+    def __init__(self):
+        self.QUESTIONS_DIR: Path = Path("./tasks/agentic_decision/questions_generated")
+        self.PATIENTS_DIR: Path = Path("./bench_data/patients")
+        self.EVENT_SEQ_DIR: Path = Path("./bench_data/patients_sequence")
+        
+        self.MAXWORKERS: int = 16
+        self.MAX_VISIBALE_VISITS: int = 10
+        self.MAX_KNOWN_FACTS: int = 10
+        self.MEMORY_TYPE: str = "report" # report | event_stream
+        self.MAX_EVENTS_PER_VISIT = 9999
+        
+        self.CONTEXT_DIR: Path = Path("./tasks/agentic_decision/context")
+        
+        self.DEMO_MODE: bool = True
+        self.DEMO_N: int = 5

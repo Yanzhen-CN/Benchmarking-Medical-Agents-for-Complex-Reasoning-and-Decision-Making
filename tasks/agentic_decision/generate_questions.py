@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import re
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,306 +46,7 @@ from tqdm import tqdm
 from util.logUtil import setup_logger
 logger = setup_logger()
 
-# --------- LLM ----------
-from util.llmUtil import LLMUtil, ChatTokenUsage
-
-def call_llm_json(llm: LLMUtil, prompt: str, system: str) -> Dict[str, Any]:
-    return llm.chat_json(user_text=prompt, system_prompt=system)
-
-# --------- constants ----------
-ACTIONS = [
-    "ask_question",
-    "order_labs",
-    "order_microbiology",
-    "order_imaging",
-    "perform_procedure",
-    "medication",
-    "discharge",
-]
-
-EVENT2ACTION = {
-    "lab": "order_labs",
-    "imaging": "order_imaging",
-    "microbiology": "order_microbiology",
-    "medication": "medication",
-    "procedure": "perform_procedure"
-}
-
-# exp decay: 0h -> 1.0, 24h -> 0.01
-_DECAY_K = math.log(100.0) / 24.0
-
-def decay_weight(delta_hours: float) -> float:
-    return float(math.exp(-_DECAY_K * max(0.0, delta_hours)))
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
-def _norm_unit(u: str) -> str:
-    u = norm(u)
-    u = u.replace(" / ", "/").replace(" ", "")
-    return u
-
-def make_indicator_key(name: str, fluid: str, unit: str) -> str:
-    name_n = norm(name)
-    fluid_n = norm(fluid).title()
-    unit_n = _norm_unit(unit)
-    return f"{name_n}||{fluid_n}||{unit_n or 'NA'}"
-
-def parse_time(ts: str) -> datetime:
-    # e.g. "2160-03-23 10:00:00"
-    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-
-def iter_json_files(root: Path):
-    for p in root.rglob("*.json"):
-        if p.name.startswith("."):
-            continue
-        yield p
-
-# --------- context rendering ----------
-def compact_event(ev: Dict[str, Any], max_items: int = 40) -> Dict[str, Any]:
-    t_raw = ev.get("type") or ""
-    t = t_raw.lower()
-    out = {"type": t, "timestamp": ev.get("timestamp")}
-
-    items = ev.get("items", []) or []
-
-    if t == "lab":
-        out["items"] = [
-            {
-                "name": it.get("name"),
-                "fluid": it.get("fluid"),
-                "unit": it.get("unit") or it.get("units"),
-                "flag": it.get("flag"),
-            }
-            for it in items[:max_items]
-        ]
-    elif t == "imaging":
-        # some datasets put imaging content in name/report instead of items
-        out["name"] = ev.get("name")
-        out["report"] = (ev.get("report") or "")[:1200]
-        out["items"] = items[:min(max_items, len(items))]
-    elif t == "microbiology":
-        out["items"] = items[:min(max_items, len(items))]
-        if "specimen" in ev:
-            out["specimen"] = ev.get("specimen")
-    elif t == "medication":
-        out["items"] = [
-            {"drug": it.get("drug"), "route": it.get("route"), "dose": it.get("dose"), "status": it.get("status")}
-            for it in items[:max_items]
-        ]
-    elif t == "procedure":
-        out["name"] = ev.get("name")
-    else:
-        out["items"] = items[:min(max_items, len(items))]
-
-    return out
-
-
-def build_history(visit: Dict[str, Any], upto_time: datetime) -> List[Dict[str, Any]]:
-    hist = []
-    for ev in visit.get("event_stream", []) or []:
-        ts = parse_time(ev["timestamp"])
-        if ts <= upto_time:
-            hist.append(compact_event(ev))
-    return hist
-
-# --------- GT extraction ----------
-def gt_action_from_event(ev: Dict[str, Any]) -> Optional[str]:
-    et = (ev.get("type") or "").lower()
-    # normalize uppercase types in your sample: MEDICATION/IMAGING etc.
-    if et in EVENT2ACTION:
-        return EVENT2ACTION[et]
-    raise ValueError(f"Unknown event type: {et} in event at {ev.get('timestamp')}")
-
-def infer_lab_panel_for_event(
-    llm: LLMUtil,
-    ev: Dict[str, Any],
-    indicator_panel_map: Optional[Dict[str, str]],
-) -> Tuple[Optional[List[str]], Dict[str, Any]]:
-    """
-    Return:
-      (panel_name, debug)
-    panel_name inferred by voting over indicators in this lab event.
-    """
-    items = ev.get("items", []) or []
-    if not items:
-        logger.warning(f"Lab event at {ev.get('timestamp')} has no items. Cannot infer panel.")
-        return None, {"reason": "no_items"}
-
-    prompt = f"""
-You are given a lab event containing multiple lab indicators.
-Infer the most likely clinical test panels/orders name for this event (open-set, no fixed enum).
-You need to simulate a doctor's actual diagnostic process, obtaining the provided indicators using as few labs as possible.
-You need to provide a list of abbreviations for the inspection items.
-Return JSON: {{"panel":["...", ...],"reason":"..."}}.
-
-Lab indicators:
-{json.dumps([{"name":it.get("name"),"fluid":it.get("fluid"),"unit":it.get("unit") or it.get("units")} for it in items[:60]], ensure_ascii=False)}
-""".strip()
-    out = call_llm_json(llm, prompt, system="You are a clinical lab expert.")
-    panel = out.get("panel") or []
-    return panel, {"llm": out}
-
-def infer_imaging_param_for_event(llm: LLMUtil, ev: Dict[str, Any], history_messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """
-    Return structured imaging label:
-      {"modality": "...", "target": "..."}  # e.g. {"modality":"ct","target":"head"}
-    Use your existing infer_imaging_modality_target_llm if available; else LLM on event items.
-    """
-
-    prompt = f"""
-Infer imaging modality and body part target from this imaging event.
-Return JSON only:
-{{"modality":"ct|mri|xray|ultrasound|echo|doppler|pet|other","target":"free text body part"}}.
-
-Imaging event:
-{json.dumps(ev, ensure_ascii=False)}
-""".strip()
-    out = call_llm_json(llm, prompt, system="You are a radiology ordering expert.")
-    return {
-        "modality": norm(out.get("modality") or "other").lower(),
-        "target": norm(out.get("target") or ""),
-        "raw": out,
-    }
-
-def infer_micro_param_for_event(llm: LLMUtil, ev: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return {"specimen": "...", "test": "..."} open-set but suggest typical culture naming.
-    """
-    prompt = f"""
-Infer microbiology order parameters from this microbiology event.
-Return JSON only: {{"specimen":"...","test":"..."}}.
-
-Event:
-{json.dumps(ev, ensure_ascii=False)}
-""".strip()
-    out = call_llm_json(llm, prompt, system="You are a clinical microbiology expert.")
-    return {"specimen": norm(out.get("specimen") or ""), "test": norm(out.get("test") or ""), "raw": out}
-
-def infer_med_param_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return {"drug": "...", "dose": "..."}.
-    If multiple meds in next event, GT can be list; for MCQ we usually pick 1 (most salient).
-    We'll keep a list and let question builder pick.
-    """
-    meds = []
-    for it in ev.get("items", []) or []:
-        drug = norm(it.get("drug") or "")
-        if not drug:
-            continue
-        meds.append(
-            {
-                "drug": drug,
-                "dose": norm(it.get("dose") or ""),
-                "route": norm(it.get("route") or ""),
-                "status": norm(it.get("status") or ""),
-            }
-        )
-    return {"meds": meds}
-
-
-def infer_proc_param_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    For your real schema: each PROCEDURE is one event with 'name'.
-    Returns:
-      {"procedures": [{"procedure": str}, ...]}
-    """
-    name = (ev.get("name") or "").strip()
-    if not name:
-        return {"procedures": []}
-    return {"procedures": [{"procedure": name}]}
-
-
-def group_future_by_timestamp(future: List[Tuple[datetime, Dict[str, Any]]]) -> List[Tuple[datetime, List[Dict[str, Any]]]]:
-    """
-    future: sorted [(ts, ev), ...]
-    return: [(ts, [ev1, ev2, ...]), ...] grouped by exact ts
-    """
-    grouped: List[Tuple[datetime, List[Dict[str, Any]]]] = []
-    cur_ts = None
-    cur_bucket: List[Dict[str, Any]] = []
-    for ts, ev in future:
-        if cur_ts is None or ts != cur_ts:
-            if cur_bucket:
-                grouped.append((cur_ts, cur_bucket))
-            cur_ts = ts
-            cur_bucket = [ev]
-        else:
-            cur_bucket.append(ev)
-    if cur_bucket:
-        grouped.append((cur_ts, cur_bucket))
-    return grouped
-# --------- distractor generation ----------
-def llm_generate_options(
-    llm: LLMUtil,
-    qtype: str,
-    stem: str,
-    gt: Any,
-    history: List[Dict[str, Any]],
-    n_options: int,
-    forbid: List[str],
-    preference_hint: str,
-) -> List[Any]:
-    
-    if n_options <= 0:
-        logger.warning(f"Requested number of options is {n_options}. Returning empty list.")
-        return []
-    
-    """
-    Return list of distractor options (length = n_options - 1 typically), excluding GT.
-    "options" format depends on qtype:
-      - T3-N: strings in ACTIONS
-      - T3-A: strings (panels or imaging orders etc.)
-      - T3-M: strings (drug names)
-      - T3-D: "Yes"/"No"
-    """
-    prompt = f"""
-You will generate multiple-choice distractor options for a clinical question.
-Constraints:
-- Distractors must be completely irrelevant to the ground-truth (GT) for the current decision.
-- Do not output GT or near-synonyms of GT.
-- Output JSON only.
-
-Question type: {qtype}
-Question stem: {stem}
-
-Ground-truth (GT):
-{json.dumps(gt, ensure_ascii=False)}
-
-Preference hints (soft):
-{preference_hint}
-
-Forbidden options (hard):
-{json.dumps(forbid, ensure_ascii=False)}
-
-Patient history (events up to current time):
-{json.dumps(history, ensure_ascii=False)}
-
-Return JSON:
-{{
-  "options": ["opt1","opt2",...],
-  "rationales": ["why opt1 is irrelevant", ...]
-}}
-Generate exactly {n_options} options.
-""".strip()
-
-    out = call_llm_json(llm, prompt, system="You design adversarial-yet-plausible multiple-choice distractors for clinicians.")
-    opts = out.get("options", []) or []
-    cleaned = []
-    seen = set()
-    for x in opts:
-        s = norm(str(x))
-        if not s:
-            continue
-        if s in seen:
-            continue
-        if s in forbid:
-            continue
-        seen.add(s)
-        cleaned.append(s)
-        if len(cleaned) >= n_options:
-            break
-    return cleaned
+from tasks.agentic_decision.tools import *
 
 # --------- question objects ----------
 @dataclass
@@ -733,6 +435,61 @@ def build_T3A_medication(
         answer=answer,
         meta={"history": history, "gt_list": gt_list, "gt_primary": primary_drugs, "debug": answer},
     )
+    
+def pick_tcur_for_discharge(
+    rng: random.Random,
+    events: List[Dict[str, Any]],
+    discharge_time: datetime,
+    X_hours: float,
+    yes_ratio: float,
+    min_gap_h: float = 0.0,
+    no_margin_h: float = 6.0,
+    within_h: float = 72.0,
+) -> Optional[Tuple[int, datetime]]:
+    """
+    从事件时间戳中挑一个作为 T3-D 的 t_cur（返回事件 index + t_cur）。
+    - 优先挑“靠近出院”的 event（上下文自然）
+    - yes_ratio 控制 Yes/No 的采样比例
+    Yes 区间： (discharge_time - X_hours, discharge_time - min_gap_h]
+    No  区间： (discharge_time - (X_hours + no_margin_h), discharge_time - X_hours)
+    并且只在最后 within_h 小时内采样（减少重复、提高相关性）
+    """
+    if not events:
+        return None
+
+    # events 已经按 timestamp 排序（你在 generate_questions_for_visit 里排过）
+    # 构建候选：取 <= discharge_time 的事件点，且在出院前 within_h 小时内
+    candidates: List[Tuple[int, datetime]] = []
+    t_min = discharge_time - timedelta(hours=within_h)
+    for i, ev in enumerate(events):
+        t = parse_time(ev["timestamp"])
+        if t > discharge_time:
+            break
+        if t < t_min:
+            continue
+        candidates.append((i, t))
+
+    if not candidates:
+        return None
+
+    # 划分 Yes / No 候选
+    yes_lo = discharge_time - timedelta(hours=X_hours)
+    yes_hi = discharge_time - timedelta(hours=min_gap_h)
+    no_lo = discharge_time - timedelta(hours=X_hours + no_margin_h)
+    no_hi = discharge_time - timedelta(hours=X_hours)
+
+    yes_cands = [(i, t) for (i, t) in candidates if (t > yes_lo and t <= yes_hi)]
+    no_cands  = [(i, t) for (i, t) in candidates if (t > no_lo  and t <= no_hi)]
+
+    want_yes = rng.random() < yes_ratio
+    pool = yes_cands if want_yes else no_cands
+    if not pool:
+        # fallback：如果目标池为空，退化到另一个池；再不行就随便挑最后一段
+        pool = no_cands if want_yes else yes_cands
+    if not pool:
+        pool = candidates[-min(len(candidates), 50):]  # 最后 50 个事件里挑
+
+    return rng.choice(pool)
 
 def build_T3D_discharge(
     patient_id: str,
@@ -743,6 +500,7 @@ def build_T3D_discharge(
     discharge_time: Optional[datetime],
     X_hours: float,
     out_options_k: int = 2,
+    seed: int = 42,
 ) -> Optional[Question]:
     if discharge_time is None:
         return None
@@ -751,7 +509,7 @@ def build_T3D_discharge(
     gt = "Yes" if yes else "No"
 
     history = build_history(visit, t_cur)
-    stem = f"Should the patient be discharged now? (GT rule: discharge within {X_hours:.0f}h => Yes)"
+    stem = f"Should the patient be discharged within {X_hours:.0f}h?"
 
     options = ["Yes", "No"]
     return Question(
@@ -899,7 +657,7 @@ def build_T3A_procedure(
 
 # --------- main pipeline ----------
 
-import random
+
 
 def sample_decision_points(events: List[Dict[str, Any]], n_points: int, seed: int, visit_key: str) -> List[int]:
     """
@@ -938,6 +696,10 @@ def generate_questions_for_visit(
     enable_discharge_q: bool,
     discharge_Xh: float,
     discharge_only_within_h: float,
+    discharge_yes_ratio: float,
+    discharge_min_gap_h: float,
+    discharge_no_margin_h: float,
+    discharge_sample_k: int,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     events = list(visit.get("event_stream", []) or [])
@@ -994,16 +756,39 @@ def generate_questions_for_visit(
             logger.warning(f"GT action {gt_act} at index {i+1} does not match any known action types. Skipping param question.")
             continue
 
-        # ---- T3-D near discharge ----
-        if enable_discharge_q and discharge_time is not None:
-            # only ask within some window before discharge to reduce redundancy
-            hrs_to_discharge = (discharge_time - t_cur).total_seconds() / 3600.0
-            if 0.0 <= hrs_to_discharge <= discharge_only_within_h:
-                qd = build_T3D_discharge(
-                    patient_id, visit, events, i, t_cur, discharge_time, discharge_Xh, out_options_k=2
-                )
-                if qd:
-                    out.append(qd)
+    # ---- T3-D: independently sample near-discharge timepoints to control YES ratio ----
+    if enable_discharge_q and discharge_time is not None and discharge_sample_k > 0:
+        # visit-level deterministic RNG
+        rng_d = random.Random(f"{seed}::T3D::{visit_key}")
+
+        for _ in range(discharge_sample_k):
+            picked = pick_tcur_for_discharge(
+                rng=rng_d,
+                events=events,
+                discharge_time=discharge_time,
+                X_hours=discharge_Xh,
+                yes_ratio=discharge_yes_ratio,
+                min_gap_h=discharge_min_gap_h,
+                no_margin_h=discharge_no_margin_h,
+                within_h=discharge_only_within_h,
+            )
+            if not picked:
+                continue
+            i_pick, t_pick = picked
+
+            qd = build_T3D_discharge(
+                patient_id=patient_id,
+                visit=visit,
+                events=events,
+                t_index=i_pick,
+                t_cur=t_pick,
+                discharge_time=discharge_time,
+                X_hours=discharge_Xh,
+                out_options_k=2,
+            )
+            if qd:
+                out.append(qd)
+
 
     # serialize
     return [q.__dict__ for q in out]
@@ -1055,20 +840,28 @@ def process_one_patient(fp_str: str, cfg_dict: Dict[str, Any])\
     visits = visits[start_visit:]
 
     for visit in visits:
-        qs = generate_questions_for_visit(
-            llm=llm,
-            patient_id=patient_id,
-            visit=visit,
-            indicator_panel_map=indicator_panel_map,
-            k_action=int(cfg_dict["K_ACTION"]),
-            k_param=int(cfg_dict["K_PARAM"]),
-            k_med=int(cfg_dict["K_MED"]),
-            enable_discharge_q=bool(cfg_dict["ENABLE_DISCHARGE_Q"]),
-            discharge_Xh=float(cfg_dict["DISCHARGE_XH"]),
-            discharge_only_within_h=float(cfg_dict["DISCHARGE_ONLY_WITHIN_H"]),
-            seed=int(cfg_dict["RANDOM_SEED"]),
-        )
-        total_written += write_questions_jsonl(patient_out, qs)
+        try:
+            qs = generate_questions_for_visit(
+                llm=llm,
+                patient_id=patient_id,
+                visit=visit,
+                indicator_panel_map=indicator_panel_map,
+                k_action=int(cfg_dict["K_ACTION"]),
+                k_param=int(cfg_dict["K_PARAM"]),
+                k_med=int(cfg_dict["K_MED"]),
+                enable_discharge_q=bool(cfg_dict["ENABLE_DISCHARGE_Q"]),
+                discharge_Xh=float(cfg_dict["DISCHARGE_XH"]),
+                discharge_only_within_h=float(cfg_dict["DISCHARGE_ONLY_WITHIN_H"]),
+                seed=int(cfg_dict["RANDOM_SEED"]),
+                discharge_yes_ratio=float(cfg_dict.get("DISCHARGE_YES_RATIO", 0.7)),
+                discharge_min_gap_h=float(cfg_dict.get("DISCHARGE_MIN_GAP_H", 0.0)),
+                discharge_no_margin_h=float(cfg_dict.get("DISCHARGE_NO_MARGIN_H", 6.0)),
+                discharge_sample_k=int(cfg_dict.get("DISCHARGE_SAMPLE_K", 1)),
+            )
+            total_written += write_questions_jsonl(patient_out, qs)
+        except Exception as e:
+            logger.error(f"Error processing patient {patient_id} visit {visit.get('visit_id')}: {e}")
+            continue
     logger.info(f"Patient {patient_id}: wrote {total_written} questions to {patient_out}")
     logger.info(f"Token usage: {json.dumps(llm.get_token_usage(), ensure_ascii=False, indent=2)}")
 
@@ -1120,6 +913,14 @@ def main():
                 total_q += n
                 for k in global_token_usage.keys():
                     global_token_usage[k] += (usage.get("chat",{})).get(k, 0)
+    
+    # for fp in tqdm(files, desc="Patients"):
+    #     pid, n, usage = process_one_patient(str(fp), cfg_dict)
+    #     if n > 0:
+    #         total_patients += 1
+    #         total_q += n
+    #         for k in global_token_usage.keys():
+    #             global_token_usage[k] += (usage.get("chat",{})).get(k, 0)
 
     logger.success(f"Wrote {total_q} questions for {total_patients} patients into folder: {cfg.OUTPUT_PATH}")
     logger.info(f"Global token usage: {json.dumps(global_token_usage, ensure_ascii=False, indent=2)}")

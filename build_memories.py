@@ -27,8 +27,8 @@ def main():
     convert.batch_convert()
     # logger.info("Step 5: Building context for each patient")
     # build_context.build_context()
-    logger.info("Step 5: Extracting lab panels")
-    get_lab_panels.get_lab_panels()
+    # logger.info("Step 5: Extracting lab panels")
+    # get_lab_panels.get_lab_panels()
     logger.info("Dataset building process completed successfully")
 
 if __name__ == "__main__":

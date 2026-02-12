@@ -1,26 +1,21 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-import re
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Set
+import argparse
 import json
-import sys
+import re
 from pathlib import Path
-from pathlib import Path as _Path
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-
 from tqdm import tqdm
-
-from tasks.agentic_decision.llm_tools import (
-    infer_imaging_modality_target_llm, generate_reason_from_messages_llm, get_token_usage, init_llm_util
-)
+from tasks.agentic_decision.tools import *
 from util.logUtil import setup_logger
-from config import ContextConfig
+from config import ContextConfig, AgentTaskConfig
 
 config = ContextConfig()
 logger = setup_logger()
-# ============================================================
-# Rendering: one visit -> OpenAI-like multi-turn messages
-# ============================================================
 
 _ALLOWED_ACTIONS = [
     "ask_question",
@@ -32,330 +27,233 @@ _ALLOWED_ACTIONS = [
     "discharge",
 ]
 
+# ============================================================
+# Helpers (keep your original helpers)
+# ============================================================
 
-def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Convert ONE visit/session (session_json["visits"][0]) into OpenAI-like chat messages.
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
-    Pattern:
-      - system: rules
-      - user: admission summary (grounded in admission_note)
-      - [zero or more] tool: vital_signs (standalone environment events)
-      - assistant: {"reason":..., "action":..., "args":...}  (ONLY 7 semantic actions)
-      - tool (environment.step): observation (grounded in event_stream or notes)
-      - ... repeated
-      - assistant discharge + (optional) tool discharge_summary (ground truth)
 
-    IMPORTANT:
-      - All assistant 'reason' fields MUST be generated via LLM (generate_reason_from_messages_llm).
-      - If the LLM returns empty/None or errors, we set reason="not_available" to keep the pipeline robust.
-    """
+def _clean_blank(x: Optional[str]) -> Optional[str]:
+    if x is None:
+        return None
+    t = str(x).strip()
+    if not t or re.fullmatch(r"_+", t):
+        return None
+    return t
 
-    # --------------------------
-    # Helpers
-    # --------------------------
-    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-        if not s:
-            return None
+
+def _safe_str(x: Any) -> str:
+    return "" if x is None else str(x)
+
+
+def _norm_type(t: Any) -> str:
+    return str(t or "").strip().lower()
+
+
+def _summarize_admission(adm_note: Dict[str, Any], patient_info: Dict[str, Any]) -> str:
+    gender = patient_info.get("gender", "unknown")
+    age_first_visit = patient_info.get("age_first_visit", "unknown")
+    language = patient_info.get("language", "unknown")
+    marital_status = patient_info.get("marital_status", "unknown")
+    race = patient_info.get("race", "unknown")
+
+    parts = [
+        f"Gender: {gender}.",
+        f"Age at first visit: {age_first_visit}.",
+        f"Language: {language}.",
+        f"Marital status: {marital_status}.",
+        f"Race: {race}.",
+    ]
+
+    allergies = _clean_blank(adm_note.get("allergies"))
+    cc = _clean_blank(adm_note.get("chief_complaint"))
+    hpi = _clean_blank(adm_note.get("history_of_present_illness"))
+    fam = _clean_blank(adm_note.get("family_history"))
+    attending = _clean_blank(adm_note.get("attending"))
+
+    if cc:
+        parts.append(f"Chief complaint: {cc}.")
+    if hpi:
+        parts.append(f"HPI: {hpi}")
+    if allergies:
+        parts.append(f"Allergies: {allergies}.")
+    if fam:
+        parts.append(f"Family history: {fam}.")
+    if attending:
+        parts.append(f"Attending: {attending}.")
+
+    return " ".join(parts).strip() or "New admission."
+
+
+def _build_lab_observation(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    results = []
+    for it in items or []:
+        results.append(
+            {
+                "name": it.get("name"),
+                "category": it.get("category"),
+                "fluid": it.get("fluid"),
+                "value_num": it.get("value_num"),
+                "value_text": it.get("value_text"),
+                "unit": it.get("unit"),
+                "flag": it.get("flag"),
+            }
+        )
+    return {"observation_type": "lab_results", "results": results}
+
+
+def _build_micro_observation_from_schema(ev: Dict[str, Any]) -> Dict[str, Any]:
+    specimen = ev.get("specimen") or {}
+    results = ev.get("results") or {}
+
+    return {
+        "observation_type": "microbiology_results",
+        "specimen": {
+            "specimen_id": specimen.get("specimen_id"),
+            "spec_type": specimen.get("spec_type"),
+        },
+        "test": specimen.get("test_name"),
+        "results": {
+            "negative": results.get("negative"),
+            "organisms": results.get("organisms") or [],
+            "comments": results.get("comments"),
+        },
+    }
+
+
+def _build_med_observation(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    admin_results = []
+    for it in items or []:
+        admin_results.append({"drug": it.get("drug"), "status": it.get("status")})
+    return {
+        "observation_type": "medication",
+        "notes": "Medication orders/admin records if available.",
+        "administration_results": admin_results,
+    }
+
+
+def _llm_reason(llm: LLMUtil, messages_so_far: List[Dict[str, Any]], current_action: str, current_args: Dict[str, Any]) -> str:
+    for _ in range(2):
         try:
-            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            r = generate_reason_from_messages_llm(
+                llm,
+                messages_so_far=messages_so_far,
+                current_action=current_action,
+                current_args=current_args,
+                model=config.REASON_MODEL,
+            )
+            if r and isinstance(r, str) and r.strip():
+                return r.strip()
         except Exception:
-            return None
+            continue
+    return "not_available"
 
-    def _safe_str(x: Any) -> str:
-        return "" if x is None else str(x)
 
-    def _clean_blank(x: Optional[str]) -> Optional[str]:
-        if x is None:
-            return None
-        t = str(x).strip()
-        if not t or re.fullmatch(r"_+", t):
-            return None
-        return t
+# ============================================================
+# Core: one visit (FULL) -> messages
+# ============================================================
 
-    def _summarize_admission(adm_note: Dict[str, Any], patient_info: Dict[str, Any]) -> str:
-        gender = patient_info.get("gender", "unknown")
-        age_first_visit = patient_info.get("age_first_visit", "unknown")
-        language = patient_info.get("language", "unknown")
-        marital_status = patient_info.get("marital_status", "unknown")
-        race = patient_info.get("race", "unknown")
+def render_visit_prefix_to_messages(
+    llm: LLMUtil,
+    patient_info: Dict[str, Any],
+    visit: Dict[str, Any],
+    stop_before_event_id: Optional[str] = None,
+    stop_before_timestamp: Optional[str] = None,
+    max_events: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Convert ONE visit from start up to BEFORE a cutoff event into OpenAI-like multi-turn messages.
 
-        parts = [
-            f"Gender: {gender}.",
-            f"Age at first visit: {age_first_visit}.",
-            f"Language: {language}.",
-            f"Marital status: {marital_status}.",
-            f"Race: {race}.",
-        ]
-
-        # Grounded summary ONLY
-        allergies = _clean_blank(adm_note.get("allergies"))
-        cc = _clean_blank(adm_note.get("chief_complaint"))
-        hpi = _clean_blank(adm_note.get("history_of_present_illness"))
-        fam = _clean_blank(adm_note.get("family_history"))
-        attending = _clean_blank(adm_note.get("attending"))
-
-        if cc:
-            parts.append(f"Chief complaint: {cc}.")
-        if hpi:
-            parts.append(f"HPI: {hpi}")
-        if allergies:
-            parts.append(f"Allergies: {allergies}.")
-        if fam:
-            parts.append(f"Family history: {fam}.")
-        if attending:
-            parts.append(f"Attending: {attending}.")
-
-        return " ".join(parts).strip()
-
-    def _infer_imaging_modality_target(content: str) -> Tuple[str, str]:
-        if getattr(config, "USE_LLM_FOR_IMAGE_DESC", False):
-            modality, target, confidence = infer_imaging_modality_target_llm(
-                content, config.IMAGE_DESC_MODEL
-            )
-            if confidence >= config.IMAGE_DESC_THRESHOLD:
-                return modality, target
-
-        # Lightweight heuristics; never invent findings
-        u = content.upper()
-        if "CHEST" in u and ("PA" in u or "LATERAL" in u or "CXR" in u):
-            return "XRay", "Chest"
-        if "ULTRASOUND" in u or re.search(r"\bUS\b", u):
-            return "Ultrasound", "Abdomen"
-        if "CT" in u:
-            return "CT", "UnknownTarget"
-        if "MRI" in u:
-            return "MRI", "UnknownTarget"
-        if "ECHO" in u:
-            return "Echocardiogram", "Heart"
-        return "Imaging", "UnknownTarget"
-
-    def _chunk_panels_from_lab_items(items: List[Dict[str, Any]]) -> List[str]:
-        # Standard terms assumption: name is panel
-        panels: List[str] = []
-        for it in items:
-            nm = _clean_blank(it.get("name"))
-            if nm and nm not in panels:
-                panels.append(nm)
-        return panels or ["Labs"]
-
-    def _build_lab_observation(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results = []
-        for it in items:
-            results.append(
-                {
-                    "name": it.get("name"),
-                    "category": it.get("category"),
-                    "fluid": it.get("fluid"),
-                    "value_num": it.get("value_num"),
-                    "value_text": it.get("value_text"),
-                    "unit": it.get("unit"),
-                    "flag": it.get("flag"),
-                }
-            )
-        return {"observation_type": "lab_results", "results": results}
-
-    def _build_vital_observation(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        vitals = []
-        for it in items:
-            vitals.append(
-                {
-                    "name": it.get("name"),
-                    "value_num": it.get("value_num"),
-                    "value_text": it.get("value_text"),
-                    "unit": it.get("unit"),
-                    "flag": it.get("flag"),
-                }
-            )
-        return {"observation_type": "vital_signs", "vitals": vitals}
-
-    def _build_micro_observation(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results = []
-        for it in items:
-            results.append(
-                {
-                    "test": it.get("test"),
-                    "specimen": it.get("specimen"),
-                    "organism": it.get("organism"),
-                    "result": it.get("result"),
-                    "abx_susceptibility": it.get("abx_susceptibility"),
-                    "flag": it.get("flag"),
-                }
-            )
-        return {"observation_type": "microbiology_results", "results": results}
-
-    def _llm_reason(messages_so_far: List[Dict[str, Any]], current_action: str, current_args: Dict[str, Any]) -> str:
-        # All reasons must come from LLM; we retry to reduce transient failures.
-        for _ in range(2):
-            try:
-                r = generate_reason_from_messages_llm(
-                    messages_so_far=messages_so_far,
-                    current_action=current_action,
-                    current_args=current_args,
-                    model=config.REASON_MODEL,
-                )
-                if r and isinstance(r, str) and r.strip():
-                    return r.strip()
-            except Exception:
-                continue
-        return "not_available"
-
-    # --------------------------
-    # Locate the visit
-    # --------------------------
-    patient_info = session_json.get("patient_info", {}) or {}
-    visits = session_json.get("visits", []) or []
-    if not visits:
-        return [], {}
-
-    if len(visits) != 1:
-        # this function is "one visit -> one session"; caller should slice.
-        visits = [visits[0]]
-
-    visit = visits[0]
+    For task-1 (visit-level context), call with:
+      stop_before_event_id=None, stop_before_timestamp=None, max_events=None
+    """
     admission_info = visit.get("admission_info", {}) or {}
-    discharge_info = visit.get("discharge_info", {}) or {}
-
     adm_note = admission_info.get("admission_note") or {}
     if not isinstance(adm_note, dict):
         adm_note = {}
-    dis_note = discharge_info.get("discharge_note") or {}
-    if not isinstance(dis_note, dict):
-        dis_note = {}
 
-    # --------------------------
-    # Start messages
-    # --------------------------
     messages: List[Dict[str, Any]] = []
-
     messages.append(
         {
             "role": "system",
-            "content": (
-                "You are a doctor agent. You must ONLY choose from these semantic actions: "
-                + ", ".join(_ALLOWED_ACTIONS)
-                + ". The environment returns only information that exists in this admission record; otherwise it returns not_available. "
-                  "Do not invent new findings."
-            ),
+            "content": f'''
+You are a doctor agent. You can perform these semantic actions when you are interacting with the environment: {", ".join(_ALLOWED_ACTIONS)}. The environment returns only information that exists in this admission record; otherwise it returns not_available. Do not invent new findings.
+Meanwhile, you may also asked to answer agentic-desision questions without interacting with the environment; in that case, you should answer based on the admission record and NOT perform any environment actions.
+Use the following format for your messages:
+- If you are interacting with the environment, your message MUST be a JSON object with keys: {{reason, action, args}}. 
+    Reason may explain workflow/clinical rationale but must not add new patient facts beyond the record.
+- If you are directly answering a question without environment interaction, your message MUST be a JSON object with keys: {{reason, answer}}.
+    The answer should be a list containing only provided option from the question, and reason should be a brief explanation based on the context and admission history.
+'''
         }
     )
-    messages.append(
-        {
-            "role": "system",
-            "content": (
-                "Each assistant message MUST be a JSON object with keys: {reason, action, args}. "
-                "Reason may explain workflow/clinical rationale but must not add new patient facts beyond the record."
-            ),
-        }
-    )
+    messages.append({"role": "user", "content": _summarize_admission(adm_note, patient_info)})
 
-    user_adm_summary = _summarize_admission(adm_note, patient_info) or "New admission."
-    messages.append({"role": "user", "content": user_adm_summary})
-
-    # --------------------------
-    # Event-driven turns
-    # --------------------------
     event_stream = visit.get("event_stream", []) or []
     event_stream_sorted = sorted(
-        event_stream, key=lambda e: _parse_dt(e.get("timestamp")) or datetime.min
+        event_stream,
+        key=lambda e: _parse_dt(e.get("timestamp")) or datetime.min
     )
 
+    cutoff_dt = _parse_dt(stop_before_timestamp) if stop_before_timestamp else None
+
+    kept: List[Dict[str, Any]] = []
     for ev in event_stream_sorted:
-        ev_type = ev.get("type")
+        ev_id = ev.get("event_id")
+        ev_dt = _parse_dt(ev.get("timestamp"))
+
+        if stop_before_event_id and ev_id == stop_before_event_id:
+            break
+        if cutoff_dt and ev_dt and ev_dt >= cutoff_dt:
+            break
+
+        kept.append(ev)
+        if max_events is not None and len(kept) >= max_events:
+            break
+    logger.info(f"Rendering visit_id={visit.get('visit_id')} with {len(kept)} events (cutoff_event_id={stop_before_event_id}, cutoff_timestamp={stop_before_timestamp}, max_events={max_events})")
+
+    for ev in tqdm(kept, desc=f"Rendering {len(kept)} events to messages"):
+        ev_type = _norm_type(ev.get("type"))
         ev_ts = ev.get("timestamp")
+        ev_id = ev.get("event_id")
 
-        # 0) vitals: standalone environment events
-        if ev_type == "vital":
-            items = ev.get("items", []) or []
-            messages.append(
-                {
-                    "role": "user",
-                    "content": {
-                        "name": "environment",
-                        **_build_vital_observation(items),
-                        "timestamp": ev_ts,
-                        "event_id": ev.get("event_id"),
-                    },
-                }
-            )
-            continue
-
-        # 1) labs
         if ev_type == "lab":
-            items = ev.get("items", []) or []
-            panels = _chunk_panels_from_lab_items(items)
+            panels, _ = infer_lab_panel_for_event(llm, ev, None)
             current_args = {"panels": panels, "timestamp": ev_ts}
+            reason = _llm_reason(llm, messages, "order_labs", current_args)
 
-            reason = _llm_reason(messages, "order_labs", current_args)
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": {"reason": reason, "action": "order_labs", "args": current_args},
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": {
-                        "name": "environment",
-                        **_build_lab_observation(items),
-                        "timestamp": ev_ts,
-                        "event_id": ev.get("event_id"),
-                    },
-                }
-            )
-            continue
-
-        # 2) microbiology
-        if ev_type == "microbiology":
             items = ev.get("items", []) or []
-            tests = [it.get("test") for it in items if it.get("test")]
-            current_args = {"tests": tests, "timestamp": ev_ts}
-
-            reason = _llm_reason(messages, "order_microbiology", current_args)
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": {
-                        "reason": reason,
-                        "action": "order_microbiology",
-                        "args": current_args,
-                    },
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": {
-                        "name": "environment",
-                        **_build_micro_observation(items),
-                        "timestamp": ev_ts,
-                        "event_id": ev.get("event_id"),
-                    },
-                }
-            )
+            messages.append({"role": "assistant", "content": {"reason": reason, "action": "order_labs", "args": current_args}})
+            messages.append({"role": "user", "content": {"name": "environment", **_build_lab_observation(items), "timestamp": ev_ts, "event_id": ev_id}})
             continue
 
-        # 3) imaging
+        if ev_type == "microbiology":
+            specimen = ev.get("specimen") or {}
+            test_name = specimen.get("test_name") or specimen.get("name")
+            current_args = {"tests": [test_name] if test_name else [], "timestamp": ev_ts}
+            reason = _llm_reason(llm, messages, "order_microbiology", current_args)
+
+            messages.append({"role": "assistant", "content": {"reason": reason, "action": "order_microbiology", "args": current_args}})
+            messages.append({"role": "user", "content": {"name": "environment", **_build_micro_observation_from_schema(ev), "timestamp": ev_ts, "event_id": ev_id}})
+            continue
+
         if ev_type == "imaging":
-            content = _safe_str(ev.get("content"))
-            modality, target = _infer_imaging_modality_target(content)
+            report = _safe_str(ev.get("report"))
+            result = infer_imaging_param_for_event(llm, ev)
+            modality = result.get("modality") or "imaging"
+            target = result.get("target") or ""
+
             current_args = {"modality": modality, "target": target, "timestamp": ev_ts}
+            reason = _llm_reason(llm, messages, "order_imaging", current_args)
 
-            reason = _llm_reason(messages, "order_imaging", current_args)
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": {
-                        "reason": reason,
-                        "action": "order_imaging",
-                        "args": current_args,
-                    },
-                }
-            )
+            messages.append({"role": "assistant", "content": {"reason": reason, "action": "order_imaging", "args": current_args}})
             messages.append(
                 {
                     "role": "user",
@@ -365,10 +263,10 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
                         "results": [
                             {
                                 "test": f"{target} {modality}".strip(),
-                                "content": content,
+                                "content": report,
                                 "raw_available": True,
                                 "timestamp": ev_ts,
-                                "event_id": ev.get("event_id"),
+                                "event_id": ev_id,
                             }
                         ],
                     },
@@ -376,77 +274,36 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
             )
             continue
 
-        # 4) medications/prescriptions
-        if ev_type == "prescription":
+        if ev_type == "medication":
             items = ev.get("items", []) or []
-
             rx_items: List[Dict[str, Any]] = []
-            admin_results: List[Dict[str, Any]] = []
             for it in items:
                 rx_items.append(
                     {
                         "timestamp": it.get("timestamp") or ev_ts,
-                        "drug_type": it.get("drug_type"),
                         "drug": it.get("drug"),
                         "dose": it.get("dose"),
                         "unit": it.get("unit"),
                         "route": it.get("route"),
-                        "end_timestamp": it.get("end_timestamp"),
-                    }
-                )
-                admin_results.append(
-                    {
-                        "drug": it.get("drug"),
                         "status": it.get("status"),
+                        "end_timestamp": it.get("end_timestamp"),
+                        "drug_type": it.get("drug_type"),
                     }
                 )
 
             current_args = {"timestamp": ev_ts, "prescriptions": rx_items}
-            reason = _llm_reason(messages, "medication", current_args)
+            reason = _llm_reason(llm, messages, "medication", current_args)
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": {
-                        "reason": reason,
-                        "action": "medication",
-                        "args": current_args,
-                    },
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": {
-                        "name": "environment",
-                        "observation_type": "medication",
-                        "notes": "Prescription recorded; eMAR fields reflect administration outcomes if available.",
-                        "timestamp": ev_ts,
-                        "event_id": ev.get("event_id"),
-                        "administration_results": admin_results,
-                    },
-                }
-            )
+            messages.append({"role": "assistant", "content": {"reason": reason, "action": "medication", "args": current_args}})
+            messages.append({"role": "user", "content": {"name": "environment", **_build_med_observation(items), "timestamp": ev_ts, "event_id": ev_id}})
             continue
 
-        # 5) procedures
         if ev_type == "procedure":
             proc_name = _clean_blank(ev.get("name")) or "procedure"
-            intent = ev.get("intent") or ["diagnostic"]
-            current_args = {"name": proc_name, "intent": intent, "timestamp": ev_ts}
+            current_args = {"name": proc_name, "timestamp": ev_ts}
+            reason = _llm_reason(llm, messages, "perform_procedure", current_args)
 
-            reason = _llm_reason(messages, "perform_procedure", current_args)
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": {
-                        "reason": reason,
-                        "action": "perform_procedure",
-                        "args": current_args,
-                    },
-                }
-            )
+            messages.append({"role": "assistant", "content": {"reason": reason, "action": "perform_procedure", "args": current_args}})
             messages.append(
                 {
                     "role": "user",
@@ -455,384 +312,305 @@ def render_session_to_messages(session_json: Dict[str, Any]) -> Tuple[List[Dict[
                         "observation_type": "procedure_result",
                         "procedure": {"name": proc_name, "brief": "procedure_performed"},
                         "timestamp": ev_ts,
-                        "event_id": ev.get("event_id"),
+                        "event_id": ev_id,
                     },
                 }
             )
             continue
 
-        # Unknown event type -> skip
         continue
 
-    # --------------------------
-    # Discharge (ground truth)
-    # --------------------------
-    final_dx = _clean_blank(dis_note.get("discharge_diagnosis"))
-    if not final_dx:
-        dx_list = visit.get("diagnosis", []) or []
-        if dx_list and isinstance(dx_list[0], dict):
-            final_dx = dx_list[0].get("description")
-        final_dx = final_dx or "Discharge diagnosis not_available"
-        
-    dx_aligned: List[str] = []
-    for d in (visit.get("diagnosis", []) or []):
-        if isinstance(d, dict):
-            desc = _clean_blank(d.get("description"))
-            if desc:
-                dx_aligned.append(desc)
-    discharge_ts = discharge_info.get("discharge_time") or "unknown_time"
-    
-    discharge_args = {
-        "final_diagnoses": [final_dx] if isinstance(final_dx, str) else final_dx,
-        "summary_style": "discharge_note_like",
-        "timestamp": discharge_ts,
-        "discharge_note": {
-            "discharge_location": discharge_info.get("discharge_location"),
-            "discharge_diagnosis": final_dx,
-            "diagnoses_icd_aligned": dx_aligned,
-            "hospital_course": dis_note.get("hospital_course"),
-            "discharge_instructions": dis_note.get("discharge_instructions"),
-        }
-    }
-    discharge_reason = _llm_reason(messages, "discharge", discharge_args)
-
-    messages.append(
-        {
-            "role": "assistant",
-            "content": {
-                "reason": discharge_reason,
-                "action": "discharge",
-                "args": discharge_args,
-            },
-        }
-    )
-
-    ground_truth = {
-        "ground_truth_available": True,
-        "source": "discharge_note",
-        "discharge_time": discharge_ts,
-        "discharge_location": discharge_info.get("discharge_location"),
-        "discharge_diagnosis": final_dx,
-        "diagnoses_icd_aligned": dx_aligned,
-        "hospital_course": dis_note.get("hospital_course"),
-        "discharge_instructions": dis_note.get("discharge_instructions"),
-    }
-
-    return messages, ground_truth
+    return messages
 
 
 # ============================================================
-# New schema adapter: P000001_sequenced.json -> legacy patient schema
+# IO
 # ============================================================
 
-def _parse_dt_str(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
+def load_patient_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict) or "visits" not in obj:
+        raise ValueError(f"Expected new-schema patient dict with 'visits', got: {type(obj)}")
+    return obj
 
 
-def _event_timestamp(ev: Dict[str, Any]) -> Optional[str]:
-    ts = ev.get("timestamp")
-    if ts:
-        return ts
-    c = ev.get("content") or {}
-    if isinstance(c, dict) and c.get("timestamp"):
-        return c.get("timestamp")
-    return None
+def find_visit(patient: Dict[str, Any], visit_id: str) -> Dict[str, Any]:
+    for v in patient.get("visits", []) or []:
+        if str(v.get("visit_id")) == str(visit_id):
+            return v
+    raise KeyError(f"visit_id not found: {visit_id}")
 
 
-def _adapt_sequenced_events_to_patient_json(events: List[Dict[str, Any]], patient_id: str) -> Dict[str, Any]:
+def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    yield obj
+            except Exception as e:
+                logger.warning(f"Skip bad JSONL line={ln}: {e}")
+
+
+def collect_visit_ids_from_questions(questions_jsonl: Path) -> Tuple[Set[str], Dict[str, List[str]]]:
     """
-    Adapt flat event list schema (P000001_sequenced.json) to:
-
-    {
-      "patient_info": {...},
-      "visits": [
-        {
-          "visit_id": "V1",
-          "admission_info": {...},
-          "discharge_info": {...},
-          "event_stream": [ {"type": "lab"/"vital"/"imaging"/"prescription"/"procedure"/"microbiology", ...}, ... ]
-        },
-        ...
-      ]
-    }
+    Return:
+      - unique visit_id set
+      - visit_id -> list[qid] (for optional debug / index)
+    Expected question schema contains "visit_id" and "qid" (like your sample).
     """
-    patient_info: Dict[str, Any] = {"patient_id": patient_id}
+    visit_ids: Set[str] = set()
+    visit2qids: Dict[str, List[str]] = {}
 
-    demo = next((e for e in events if e.get("event_type") == "PATIENT_DEMOGRAPHICS"), None)
-    if demo and isinstance(demo.get("content"), dict):
-        patient_info.update(demo["content"])
-
-    by_visit: Dict[str, List[Dict[str, Any]]] = {}
-    for e in events:
-        if e.get("event_type") == "PATIENT_DEMOGRAPHICS":
+    for q in iter_jsonl(questions_jsonl):
+        vid = q.get("visit_id")
+        if not vid:
             continue
-        vr = e.get("visit_ref") or "UNKNOWN_VISIT"
-        by_visit.setdefault(vr, []).append(e)
+        vid = str(vid)
+        visit_ids.add(vid)
 
-    visits: List[Dict[str, Any]] = []
+        qid = q.get("qid")
+        if qid is not None:
+            visit2qids.setdefault(vid, []).append(str(qid))
 
-    for vr, evs in sorted(by_visit.items(), key=lambda kv: kv[0]):
-        adm_ev = next((e for e in evs if e.get("event_type") == "ADMISSION"), None)
-        dis_ev = next((e for e in evs if e.get("event_type") == "DISCHARGE"), None)
-
-        admission_info: Dict[str, Any] = {}
-        discharge_info: Dict[str, Any] = {}
-
-        if adm_ev:
-            c = adm_ev.get("content") or {}
-            admission_info = {
-                "admission_time": _event_timestamp(adm_ev),
-                "location": c.get("location"),
-                "admission_type": c.get("admission_type"),
-                "insurance": c.get("insurance"),
-                "admission_note": {
-                    "chief_complaint": c.get("chief_complaint"),
-                    "history_of_present_illness": c.get("history_of_present_illness"),
-                    "allergies": c.get("allergies"),
-                    "family_history": c.get("family_history"),
-                    "attending": c.get("attending"),
-                },
-            }
-
-        if dis_ev:
-            c = dis_ev.get("content") or {}
-            discharge_info = {
-                "discharge_time": c.get("discharge_time") or _event_timestamp(dis_ev),
-                "discharge_location": c.get("discharge_location"),
-                "discharge_note": c.get("discharge_note") or {},
-            }
-
-        event_stream: List[Dict[str, Any]] = []
-        for e in evs:
-            et = e.get("event_type")
-            if et in ("ADMISSION", "DISCHARGE"):
-                continue
-            ts = _event_timestamp(e)
-            c = e.get("content") or {}
-
-            if et == "LAB":
-                event_stream.append(
-                    {
-                        "event_id": e.get("event_id"),
-                        "type": "lab",
-                        "timestamp": ts,
-                        "items": [
-                            {
-                                "name": c.get("name"),
-                                "category": c.get("category"),
-                                "fluid": c.get("fluid"),
-                                "value_num": c.get("value"),
-                                "value_text": c.get("value_text"),
-                                "unit": c.get("unit"),
-                                "flag": c.get("flag"),
-                            }
-                        ],
-                    }
-                )
-
-            elif et == "VITAL":
-                # standalone env events
-                event_stream.append(
-                    {
-                        "event_id": e.get("event_id"),
-                        "type": "vital",
-                        "timestamp": ts,
-                        "items": [
-                            {
-                                "name": c.get("name"),
-                                "value_num": c.get("value"),
-                                "value_text": str(c.get("value")) if c.get("value") is not None else None,
-                                "unit": c.get("unit"),
-                                "flag": "abnormal" if c.get("warning") else c.get("flag"),
-                            }
-                        ],
-                    }
-                )
-
-            elif et in ("MICROBIOLOGY", "CULTURE", "MICRO"):
-                event_stream.append(
-                    {
-                        "event_id": e.get("event_id"),
-                        "type": "microbiology",
-                        "timestamp": ts,
-                        "items": [
-                            {
-                                "test": c.get("test") or c.get("test_name") or c.get("name"),
-                                "specimen": c.get("specimen") or c.get("spec_type"),
-                                "organism": c.get("organism"),
-                                "result": c.get("result") or c.get("interpretation"),
-                                "abx_susceptibility": c.get("susceptibility") or c.get("abx_susceptibility"),
-                                "flag": "abnormal" if c.get("warning") else c.get("flag"),
-                            }
-                        ],
-                    }
-                )
-
-            elif et == "MEDICATION":
-                items = c.get("items") or []
-                rx_items = []
-                for it in items:
-                    rx_items.append({**it, "timestamp": it.get("timestamp") or c.get("timestamp") or ts})
-                event_stream.append(
-                    {
-                        "event_id": e.get("event_id"),
-                        "type": "prescription",
-                        "timestamp": c.get("timestamp") or ts,
-                        "items": rx_items,
-                    }
-                )
-
-            elif et == "IMAGING":
-                event_stream.append(
-                    {
-                        "event_id": e.get("event_id"),
-                        "type": "imaging",
-                        "timestamp": c.get("timestamp") or ts,
-                        "content": c.get("report") or c.get("content") or "",
-                    }
-                )
-
-            elif et == "PROCEDURE":
-                event_stream.append(
-                    {
-                        "event_id": e.get("event_id"),
-                        "type": "procedure",
-                        "timestamp": c.get("timestamp") or ts,
-                        "name": c.get("name"),
-                        "code": c.get("code"),
-                        "intent": ["diagnostic"],
-                    }
-                )
-
-            else:
-                continue
-
-        event_stream.sort(key=lambda x: _parse_dt_str(x.get("timestamp")) or datetime.min)
-
-        visits.append(
-            {
-                "visit_id": vr,
-                "admission_info": admission_info,
-                "discharge_info": discharge_info,
-                "event_stream": event_stream,
-            }
-        )
-
-    return {"patient_info": patient_info, "visits": visits}
+    return visit_ids, visit2qids
 
 
-# ============================================================
-# Batch building: each patient file -> multi-session output
-# ============================================================
+def build_all_visit_contexts_from_questions(
+    patient_json: Path,
+    questions_jsonl: Path,
+    out_dir: Path,
+    max_events_per_visit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    TASK-1:
+    - scan questions_jsonl -> all visit_ids
+    - render FULL visit context (no truncation) for each visit_id
+    - write one context json per visit into out_dir/{visit_id}.context.json
+    - also write an index file out_dir/index.json
+    """
+    patient = load_patient_json(patient_json)
+    patient_info = patient.get("patient_info", {}) or {}
+    patient_id = patient_info.get("patient_id") or "unknown_patient"
 
-def build_session_messages(
-    patient_info: Dict[str, Any],
-    visit: Dict[str, Any]
-) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-    visit_id = visit.get("visit_id", "UNKNOWN_VISIT")
-    session_key = str(visit_id)  # key per visit inside a patient file
+    visit_ids, visit2qids = collect_visit_ids_from_questions(questions_jsonl)
+    if not visit_ids:
+        raise ValueError(f"No visit_id found in questions: {questions_jsonl}")
 
-    session_json = {"patient_info": patient_info, "visits": [visit]}
-    messages, ground_truth = render_session_to_messages(session_json)
-    return session_key, messages, ground_truth
-
-
-def process_one_patient_file(pf_str: str, out_dir_str: str, inner_workers: int = 8) -> str:
-    pf = Path(pf_str)
-    out_dir = Path(out_dir_str)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(pf, "r", encoding="utf-8") as f:
-        patient_data = json.load(f)
+    llm = LLMUtil()  # reuse one llm util for token accounting
+    written = []
+    missing = []
 
-    # Support BOTH schemas:
-    # 1) legacy: {"patient_info":..., "visits":[...]}
-    # 2) new sequenced: [ {"event_type":..., "visit_ref":..., "content":...}, ... ]
-    if isinstance(patient_data, list):
-        patient_id = pf.stem
-        patient_data = _adapt_sequenced_events_to_patient_json(patient_data, patient_id)
-
-    patient_info = patient_data.get("patient_info", {}) or {}
-    visits = patient_data.get("visits", []) or []
-    patient_id = patient_info.get("patient_id", pf.stem)
-
-    sessions: Dict[str, Dict[str, Any]] = {}
-
-    # patient 内部：并行 visit -> session
-    with ThreadPoolExecutor(max_workers=inner_workers) as ex:
-        futures = [ex.submit(build_session_messages, patient_info, v) for v in visits]
-        pbar = tqdm(
-            total=len(futures),
-            desc=f"Visits({patient_id})",
-            position=1,
-            leave=False,
-            dynamic_ncols=True,
-        )
+    for vid in sorted(visit_ids):
         try:
-            for fu in as_completed(futures):
-                k, msgs, gt = fu.result()
-                sessions[k] = {"messages": msgs, "ground_truth": gt}
-                pbar.update(1)
-        finally:
-            pbar.close()
+            visit = find_visit(patient, vid)
+        except KeyError:
+            missing.append(vid)
+            logger.warning(f"visit_id {vid} not found in patient {patient_id}, skipping.")
+            continue
 
-    out_file = out_dir / f"{patient_id}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "patient_id": patient_id,
-                "patient_info": patient_info,
-                "sessions": sessions,  # {visit_id: {"messages": ..., "ground_truth": ...}}
+        messages = render_visit_prefix_to_messages(
+            llm=llm,
+            patient_info=patient_info,
+            visit=visit,
+            stop_before_event_id=None,
+            stop_before_timestamp=None,
+            max_events=max_events_per_visit,
+        )
+
+        out_obj = {
+            "patient_id": patient_id,
+            "visit_id": vid,
+            "messages": messages,
+            "token_usage": llm.get_token_usage(),
+            "source": {
+                "patient_json": str(patient_json),
+                "questions_jsonl": str(questions_jsonl),
+                "qids_in_visit": visit2qids.get(vid, []),
             },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+            "build_cfg": {
+                "max_events_per_visit": max_events_per_visit,
+            },
+        }
 
-    return str(out_file)
+        out_path = out_dir / f"{vid}.context.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out_obj, f, ensure_ascii=False, indent=2)
 
+        written.append(str(out_path))
+        logger.info(f"Wrote visit context: {out_path}")
 
-def build_context() -> None:
-    inp = Path(config.SEQUENCE_IN_PATH)
-    out_path = Path(config.CONTEXT_OUT_DIR)
-    out_path.mkdir(parents=True, exist_ok=True)
+    index = {
+        "patient_id": patient_id,
+        "num_visits_in_questions": len(visit_ids),
+        "num_written": len(written),
+        "num_missing_in_patient_json": len(missing),
+        "missing_visit_ids": missing,
+        "outputs": written,
+        "token_usage": llm.get_token_usage(),
+    }
 
-    if inp.is_dir():
-        patient_files = sorted([p for p in inp.glob("*.json") if p.is_file()])
-    else:
-        patient_files = [inp]
+    index_path = out_dir / "index.json"
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
 
-    outer_workers = getattr(config, "MAX_PATIENT_WORKERS", None) or 4
-    inner_workers = getattr(config, "MAX_SESSION_WORKERS", None) or 8
-    init_llm_util()
-    with ProcessPoolExecutor(max_workers=outer_workers) as ex:
-        futures = [
-            ex.submit(process_one_patient_file, str(p), str(out_path), inner_workers)
-            for p in patient_files
-        ]
+    logger.info(f"Wrote index: {index_path}")
+    logger.info(f"Token usage: {llm.get_token_usage()}")
 
-        outer_pbar = tqdm(
-            total=len(futures),
-            desc="Patients",
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-        )
+    return index
 
-        try:
-            for fu in as_completed(futures):
-                out_file = fu.result()
-                print("Wrote:", out_file)
-                outer_pbar.update(1)
-        finally:
-            outer_pbar.close()
-    logger.info(f"Token usage: {get_token_usage()}")
+def patient_event_stats(patient_json_path: Path) -> Dict[str, Any]:
+    """
+    Return stats for sorting:
+      - file_size_bytes
+      - num_visits
+      - total_events (sum of len(event_stream) across visits)
+      - max_visit_events
+    """
+    st = {
+        "file_size_bytes": patient_json_path.stat().st_size if patient_json_path.exists() else 0,
+        "num_visits": 0,
+        "total_events": 0,
+        "max_visit_events": 0,
+        "exists": patient_json_path.exists(),
+    }
+    if not patient_json_path.exists():
+        return st
 
+    try:
+        patient = load_patient_json(patient_json_path)
+        visits = patient.get("visits", []) or []
+        st["num_visits"] = len(visits)
+        total = 0
+        mx = 0
+        for v in visits:
+            n = len(v.get("event_stream", []) or [])
+            total += n
+            if n > mx:
+                mx = n
+        st["total_events"] = total
+        st["max_visit_events"] = mx
+    except Exception as e:
+        logger.warning(f"Failed to read {patient_json_path}: {e}")
+
+    return st
+from datetime import time
+import os
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if __name__ == "__main__":
-    build_context()
+    cfg = AgentTaskConfig()
+
+    files = list(iter_jsonl_files(cfg.QUESTIONS_DIR))
+    pids = sorted(set([f.name.split(".")[0] for f in files]))
+
+    # ---- pre-scan stats and sort (desc) ----
+    pid_stats = []
+    for pid in tqdm(pids, desc="Scanning patient sizes"):
+        p_path = Path(cfg.PATIENTS_DIR) / f"{pid}.json"
+        st = patient_event_stats(p_path)
+        pid_stats.append((pid, st))
+
+    # ALWAYS sort (desc) by: total_events, then file_size
+    pid_stats.sort(
+        key=lambda x: (x[1].get("total_events", 0), x[1].get("file_size_bytes", 0)),
+        reverse=True,
+    )
+
+    if cfg.DEMO_MODE:
+        top_k = cfg.DEMO_N
+        top = pid_stats[:top_k]
+        logger.info("Top patients by event_stream length (total_events desc, file_size desc):")
+        for rank, (pid, st) in enumerate(top, 1):
+            logger.info(
+                f"[{rank}] {pid} | total_events={st['total_events']} | "
+                f"max_visit_events={st['max_visit_events']} | visits={st['num_visits']} | "
+                f"file_size={st['file_size_bytes'] / (1024*1024):.2f} MB"
+            )
+    else:
+        top = pid_stats
+        logger.warning("DEMO_MODE is OFF, will process ALL patients sorted by size. This may take a long time!")
+
+    # ---- resume ----
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    final_report, final_report_name = {}, "final_report_agent_context_run.json"
+
+    log_dir = Path("log")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    already_run = set()
+    report_path = log_dir / final_report_name
+    if report_path.exists():
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                previous = json.load(f)
+            if isinstance(previous, dict):
+                final_report = previous  # load existing
+                already_run = set(previous.keys())
+                logger.info(f"Resume enabled: loaded {len(already_run)} finished pids from {report_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load previous report {report_path}: {e}")
+
+    # filter pending
+    pending = [(pid, st) for pid, st in top if pid not in already_run]
+    if not pending:
+        logger.info("Nothing to do: all selected patients already processed.")
+        logger.info(f"Existing report: {report_path}")
+        raise SystemExit(0)
+
+    logger.info(f"Will process {len(pending)} patients (skipping {len(top) - len(pending)} already-run).")
+
+    # ---- worker ----
+    def _run_one(pid: str, st: dict) -> Tuple[str, dict]:
+        out_dir = Path(cfg.CONTEXT_DIR) / pid
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        result = build_all_visit_contexts_from_questions(
+            patient_json=Path(cfg.PATIENTS_DIR) / f"{pid}.json",
+            questions_jsonl=Path(cfg.QUESTIONS_DIR) / f"{pid}.jsonl",
+            out_dir=out_dir,
+            max_events_per_visit=cfg.MAX_EVENTS_PER_VISIT,
+        )
+        return pid, result
+
+    # ---- concurrency ----
+    max_workers = getattr(cfg, "MAX_WORKERS", None)
+    if not max_workers:
+        max_workers = min(8, (os.cpu_count() or 8))
+    logger.info(f"Running with max_workers={max_workers}")
+
+    # 主线程收集结果 + 落盘，避免并发写文件
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_run_one, pid, st): (pid, st) for pid, st in pending}
+
+        for fut in tqdm(as_completed(futs), total=len(futs), desc=f"Building contexts (concurrent)"):
+            pid, st = futs[fut]
+            try:
+                pid_done, result = fut.result()
+            except Exception as e:
+                logger.exception(f"FAILED pid={pid}: {e}")
+                # 失败也写入报告，方便你后续定位/重跑
+                final_report[pid] = {"error": str(e), "stats": st}
+            else:
+                final_report[pid_done] = result
+                logger.info(f"Done pid={pid_done}: wrote contexts, token_usage={result.get('token_usage', {}).get('chat')}")
+
+                # accumulate usage (best-effort)
+                chat_usage = result.get("token_usage", {}).get("chat", {}) if isinstance(result, dict) else {}
+                for k in usage:
+                    usage[k] += int(chat_usage.get(k, 0) or 0)
+
+            # incremental save after each completion
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(final_report, f, ensure_ascii=False, indent=2)
+
+    logger.info("All done (concurrent).")
+    logger.info(f"Total token usage across processed patients: \n{json.dumps(usage, ensure_ascii=False, indent=2)}")
+    logger.info(f"Final report: {report_path}")

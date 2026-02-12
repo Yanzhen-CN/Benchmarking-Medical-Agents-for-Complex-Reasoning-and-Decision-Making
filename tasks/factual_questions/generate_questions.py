@@ -16,7 +16,10 @@ Env keys (Qwen/OpenAI compatible, per config.py):
 """
 
 from __future__ import annotations
-
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+from util.logUtil import setup_logger
+logger = setup_logger()
 # Ensure repo root is on sys.path when running this file directly.
 import sys
 from pathlib import Path
@@ -213,175 +216,482 @@ def _visit_sort_key(visit_ref: Optional[str]) -> Tuple[int, str]:
     return (0, visit_ref)
 
 
-def main() -> int:
-    args = parse_args()
-    rng = random.Random(args.seed)
-    llm = LLMUtil()
+# def main() -> int:
+#     args = parse_args()
+#     rng = random.Random(args.seed)
+#     llm = LLMUtil()
 
-    out_dir = args.out_dir
+#     out_dir = args.out_dir
+#     out_dir.mkdir(parents=True, exist_ok=True)
+
+#     patient_files = list(iter_patient_files(args.events_dir))
+#     if args.num_patients and args.num_patients > 0:
+#         patient_files = patient_files[: args.num_patients]
+
+#     for pf in patient_files:
+#         events = _load_events(pf)
+#         if not events:
+#             continue
+
+#         # Build per-patient LAB name pool for negative sampling
+#         all_lab_names: List[str] = []
+#         for e in events:
+#             if e.get("event_type") != "LAB":
+#                 continue
+#             items = _collect_lab_items(_safe_list((e.get("content") or {}).get("items")))
+#             names = [it.get("name") for it in items if it.get("name")]
+#             if not names:
+#                 continue
+#             all_lab_names.extend(names)
+
+#         patient_id = events[0].get("patient_id") or pf.stem
+#         out_path = out_dir / f"{patient_id}.jsonl"
+#         questions: List[Dict[str, Any]] = []
+
+#         # Group by visit for admission/discharge pairing
+#         by_visit: Dict[str, List[Dict[str, Any]]] = {}
+#         for ev in events:
+#             by_visit.setdefault(ev.get("visit_ref") or "UNKNOWN_VISIT", []).append(ev)
+
+#         # Prepare lab/med/imaging lists
+#         lab_items: List[Dict[str, Any]] = []
+#         med_items: List[Dict[str, Any]] = []
+#         imaging_items: List[Dict[str, Any]] = []
+#         adm_dis_items: List[Dict[str, Any]] = []
+
+#         for visit_ref, evs in by_visit.items():
+#             admission = next((e for e in evs if e.get("event_type") == "ADMISSION"), None)
+#             discharge = next((e for e in evs if e.get("event_type") == "DISCHARGE"), None)
+#             if admission and discharge:
+#                 adm_content = admission.get("content") or {}
+#                 dis_content = discharge.get("content") or {}
+#                 dis_note = dis_content.get("discharge_note") or {}
+#                 adm_dis_items.append(
+#                     {
+#                         "patient_id": patient_id,
+#                         "visit_ref": visit_ref,
+#                         "visit_num": _visit_num(visit_ref),
+#                         "chief_complaint": adm_content.get("chief_complaint"),
+#                         "discharge_diagnosis": dis_note.get("discharge_diagnosis")
+#                         or dis_content.get("discharge_diagnosis"),
+#                     }
+#                 )
+
+#             for e in evs:
+#                 et = e.get("event_type")
+#                 if et == "LAB":
+#                     items = _collect_lab_items(_safe_list((e.get("content") or {}).get("items")))
+#                     if not items:
+#                         continue
+#                     current_names = [it.get("name") for it in items if it.get("name")]
+#                     # 50/50 choose existing vs negative (fallback to existing if no negative)
+#                     use_existing = rng.random() < 0.5
+#                     pick = None
+#                     lab_name = None
+#                     if use_existing:
+#                         pick = rng.choice(items)
+#                         lab_name = pick.get("name")
+#                     else:
+#                         pool = [n for n in all_lab_names if n and n not in current_names]
+#                         neg = _pick_negative_lab_name(rng, current_names, pool)
+#                         if neg:
+#                             lab_name = neg
+#                         else:
+#                             pick = rng.choice(items)
+#                             lab_name = pick.get("name")
+#                     lab_items.append(
+#                         {
+#                             "id": _make_question_id(e.get("event_id") or "", "lab"),
+#                             "patient_id": patient_id,
+#                             "visit_ref": visit_ref,
+#                             "visit_num": _visit_num(visit_ref),
+#                             "visit_type_index": e.get("visit_type_index"),
+#                             "event_id": e.get("event_id"),
+#                             "timestamp": e.get("timestamp"),
+#                             "lab_name": lab_name,
+#                             "value_num": pick.get("value_num") if pick else None,
+#                             "value_text": pick.get("value_text") if pick else None,
+#                             "unit": pick.get("unit") if pick else None,
+#                             "lab_exists": bool(pick),
+#                             "event_content": e.get("content"),
+#                         }
+#                     )
+#                 elif et == "MEDICATION":
+#                     items = _safe_list((e.get("content") or {}).get("items"))
+#                     drugs = _collect_med_drugs_with_dose(items)
+#                     if not drugs:
+#                         continue
+#                     med_items.append(
+#                         {
+#                             "id": _make_question_id(e.get("event_id") or "", "med"),
+#                             "patient_id": patient_id,
+#                             "visit_ref": visit_ref,
+#                             "visit_num": _visit_num(visit_ref),
+#                             "visit_type_index": e.get("visit_type_index"),
+#                             "event_id": e.get("event_id"),
+#                             "timestamp": e.get("timestamp"),
+#                             "drugs": drugs,
+#                             "event_content": e.get("content"),
+#                         }
+#                     )
+#                 elif et == "IMAGING":
+#                     imaging_items.append(
+#                         {
+#                             "id": _make_question_id(e.get("event_id") or "", "img"),
+#                             "patient_id": patient_id,
+#                             "visit_ref": visit_ref,
+#                             "visit_num": _visit_num(visit_ref),
+#                             "visit_type_index": e.get("visit_type_index"),
+#                             "event_id": e.get("event_id"),
+#                             "timestamp": e.get("timestamp"),
+#                             "report": e.get("content"),
+#                         }
+#                     )
+
+#         # Admission/Discharge (single, no batch)
+#         for item in adm_dis_items:
+#             question = _format_adm_dis_question(item)
+#             keywords = _adm_dis_keywords(item)
+#             q = {
+#                 "question_id": f"{patient_id}-{item['visit_ref']}-adm_dis",
+#                 "patient_id": patient_id,
+#                 "visit_ref": item["visit_ref"],
+#                 "visit_num": item["visit_num"],
+#                 "event_type": "ADMISSION_DISCHARGE",
+#                 "question_variant": "single",
+#                 "question": question,
+#                 "keywords": keywords,
+#                 "ground_truth": {
+#                     "chief_complaint": item.get("chief_complaint"),
+#                     "discharge_diagnosis": item.get("discharge_diagnosis"),
+#                 },
+#             }
+#             questions.append(q)
+
+#         # Imaging (single, no batch)
+#         for item in imaging_items:
+#             system, user = _build_imaging_keywords_prompt(item)
+#             obj = _chat_json(llm, args.model, system, user)
+#             keywords = obj.get("keywords") if isinstance(obj, dict) else []
+#             base = {
+#                 "patient_id": patient_id,
+#                 "visit_ref": item["visit_ref"],
+#                 "visit_num": item["visit_num"],
+#                 "event_id": item["event_id"],
+#                 "event_type": "IMAGING",
+#                 "visit_type_index": item["visit_type_index"],
+#                 "timestamp": item["timestamp"],
+#                 "keywords": keywords,
+#                 "ground_truth": item.get("report"),
+#             }
+#             q_exp, q_rel = _format_imaging_questions(item)
+#             q1 = {
+#                 **base,
+#                 "question_id": f"{item['id']}",
+#                 "question_variant": "both",
+#                 "question_explicit": q_exp,
+#                 "question_relative": q_rel,
+#             }
+#             questions.append(q1)
+
+#         # LAB (batched)
+#         for i in range(0, len(lab_items), args.batch_lab):
+#             batch = lab_items[i : i + args.batch_lab]
+#             for item in batch:
+#                 q_exp, q_rel = _format_lab_questions(item)
+#                 answer = "not found"
+#                 if item.get("lab_exists"):
+#                     v = item.get("value_num") if item.get("value_num") not in (None, "") else item.get("value_text")
+#                     unit = item.get("unit") or ""
+#                     answer = f"{v} {unit}".strip()
+#                 keywords = ["not found"]
+#                 if item.get("lab_exists"):
+#                     keywords = ["found", answer]
+#                 base = {
+#                     "patient_id": patient_id,
+#                     "visit_ref": item["visit_ref"],
+#                     "visit_num": item["visit_num"],
+#                     "event_id": item["event_id"],
+#                     "event_type": "LAB",
+#                     "visit_type_index": item["visit_type_index"],
+#                     "timestamp": item["timestamp"],
+#                     "keywords": keywords,
+#                     "ground_truth": {
+#                         "event_content": item.get("event_content"),
+#                     },
+#                 }
+#                 q1 = {
+#                     **base,
+#                     "question_id": f"{item['id']}",
+#                     "question_variant": "both",
+#                     "question_explicit": q_exp,
+#                     "question_relative": q_rel,
+#                 }
+#                 questions.append(q1)
+
+#         # MEDICATION (batched)
+#         for i in range(0, len(med_items), args.batch_med):
+#             batch = med_items[i : i + args.batch_med]
+#             for item in batch:
+#                 q_exp, q_rel = _format_med_questions(item)
+#                 med_keywords = []
+#                 for d in item.get("drugs", []):
+#                     drug = d.get("drug")
+#                     if not drug:
+#                         continue
+#                     dose = d.get("dose") or "not recorded"
+#                     med_keywords.append(f"{drug} | {dose}")
+#                 base = {
+#                     "patient_id": patient_id,
+#                     "visit_ref": item["visit_ref"],
+#                     "visit_num": item["visit_num"],
+#                     "event_id": item["event_id"],
+#                     "event_type": "MEDICATION",
+#                     "visit_type_index": item["visit_type_index"],
+#                     "timestamp": item["timestamp"],
+#                     "keywords": med_keywords,
+#                     "ground_truth": {
+#                         "event_content": item.get("event_content"),
+#                         "drug_list": item.get("drugs"),
+#                     },
+#                 }
+#                 q1 = {
+#                     **base,
+#                     "question_id": f"{item['id']}",
+#                     "question_variant": "both",
+#                     "question_explicit": q_exp,
+#                     "question_relative": q_rel,
+#                 }
+#                 questions.append(q1)
+
+#         def _q_sort_key(q: Dict[str, Any]) -> Tuple[int, int, str]:
+#             vkey = _visit_sort_key(q.get("visit_ref"))
+#             is_adm_dis = 1 if q.get("event_type") == "ADMISSION_DISCHARGE" else 0
+#             return (vkey[0], is_adm_dis, q.get("question_id") or "")
+
+#         questions.sort(key=_q_sort_key)
+
+#         with out_path.open("w", encoding="utf-8") as out_f:
+#             for q in questions:
+#                 out_f.write(json.dumps(q, ensure_ascii=False) + "\n")
+
+#         logger.success(f"wrote={out_path}")
+
+#     return 0
+
+
+# if __name__ == "__main__":
+#     raise SystemExit(main())
+
+
+def _process_one_patient_file(
+    pf_str: str,
+    args_dict: Dict[str, Any],
+) -> Tuple[str, str, Dict[str, int]]:
+    """
+    Worker: process exactly one patient file (P*.jsonl) and write {patient_id}.jsonl in out_dir.
+    Returns (patient_id, out_path_str).
+    """
+    pf = Path(pf_str)
+    out_dir = Path(args_dict["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    patient_files = list(iter_patient_files(args.events_dir))
-    if args.num_patients and args.num_patients > 0:
-        patient_files = patient_files[: args.num_patients]
+    # IMPORTANT: init LLM per process (avoid shared state / thread-safety issues)
+    llm = LLMUtil()
+    model = args_dict["model"]
 
-    for pf in patient_files:
-        events = _load_events(pf)
-        if not events:
+    rng = random.Random(args_dict["seed"])
+
+    events = _load_events(pf)
+    if not events:
+        return (pf.stem, str(out_dir / f"{pf.stem}.jsonl"))
+
+    # Build per-patient LAB name pool for negative sampling
+    all_lab_names: List[str] = []
+    for e in events:
+        if e.get("event_type") != "LAB":
             continue
-
-        # Build per-patient LAB name pool for negative sampling
-        all_lab_names: List[str] = []
-        for e in events:
-            if e.get("event_type") != "LAB":
-                continue
-            items = _collect_lab_items(_safe_list((e.get("content") or {}).get("items")))
-            names = [it.get("name") for it in items if it.get("name")]
-            if not names:
-                continue
+        items = _collect_lab_items(_safe_list((e.get("content") or {}).get("items")))
+        names = [it.get("name") for it in items if it.get("name")]
+        if names:
             all_lab_names.extend(names)
 
-        patient_id = events[0].get("patient_id") or pf.stem
-        out_path = out_dir / f"{patient_id}.jsonl"
-        questions: List[Dict[str, Any]] = []
+    patient_id = events[0].get("patient_id") or pf.stem
+    out_path = out_dir / f"{patient_id}.jsonl"
+    questions: List[Dict[str, Any]] = []
 
-        # Group by visit for admission/discharge pairing
-        by_visit: Dict[str, List[Dict[str, Any]]] = {}
-        for ev in events:
-            by_visit.setdefault(ev.get("visit_ref") or "UNKNOWN_VISIT", []).append(ev)
+    # Group by visit for admission/discharge pairing
+    by_visit: Dict[str, List[Dict[str, Any]]] = {}
+    for ev in events:
+        by_visit.setdefault(ev.get("visit_ref") or "UNKNOWN_VISIT", []).append(ev)
 
-        # Prepare lab/med/imaging lists
-        lab_items: List[Dict[str, Any]] = []
-        med_items: List[Dict[str, Any]] = []
-        imaging_items: List[Dict[str, Any]] = []
-        adm_dis_items: List[Dict[str, Any]] = []
+    # Prepare lab/med/imaging lists
+    lab_items: List[Dict[str, Any]] = []
+    med_items: List[Dict[str, Any]] = []
+    imaging_items: List[Dict[str, Any]] = []
+    adm_dis_items: List[Dict[str, Any]] = []
 
-        for visit_ref, evs in by_visit.items():
-            admission = next((e for e in evs if e.get("event_type") == "ADMISSION"), None)
-            discharge = next((e for e in evs if e.get("event_type") == "DISCHARGE"), None)
-            if admission and discharge:
-                adm_content = admission.get("content") or {}
-                dis_content = discharge.get("content") or {}
-                dis_note = dis_content.get("discharge_note") or {}
-                adm_dis_items.append(
+    for visit_ref, evs in by_visit.items():
+        admission = next((e for e in evs if e.get("event_type") == "ADMISSION"), None)
+        discharge = next((e for e in evs if e.get("event_type") == "DISCHARGE"), None)
+        if admission and discharge:
+            adm_content = admission.get("content") or {}
+            dis_content = discharge.get("content") or {}
+            dis_note = dis_content.get("discharge_note") or {}
+            adm_dis_items.append(
+                {
+                    "patient_id": patient_id,
+                    "visit_ref": visit_ref,
+                    "visit_num": _visit_num(visit_ref),
+                    "chief_complaint": adm_content.get("chief_complaint"),
+                    "discharge_diagnosis": dis_note.get("discharge_diagnosis")
+                    or dis_content.get("discharge_diagnosis"),
+                }
+            )
+
+        for e in evs:
+            et = e.get("event_type")
+            if et == "LAB":
+                items = _collect_lab_items(_safe_list((e.get("content") or {}).get("items")))
+                if not items:
+                    continue
+                current_names = [it.get("name") for it in items if it.get("name")]
+                # 50/50 choose existing vs negative (fallback to existing if no negative)
+                use_existing = rng.random() < 0.5
+                pick = None
+                lab_name = None
+                if use_existing:
+                    pick = rng.choice(items)
+                    lab_name = pick.get("name")
+                else:
+                    pool = [n for n in all_lab_names if n and n not in current_names]
+                    neg = _pick_negative_lab_name(rng, current_names, pool)
+                    if neg:
+                        lab_name = neg
+                    else:
+                        pick = rng.choice(items)
+                        lab_name = pick.get("name")
+                lab_items.append(
                     {
+                        "id": _make_question_id(e.get("event_id") or "", "lab"),
                         "patient_id": patient_id,
                         "visit_ref": visit_ref,
                         "visit_num": _visit_num(visit_ref),
-                        "chief_complaint": adm_content.get("chief_complaint"),
-                        "discharge_diagnosis": dis_note.get("discharge_diagnosis")
-                        or dis_content.get("discharge_diagnosis"),
+                        "visit_type_index": e.get("visit_type_index"),
+                        "event_id": e.get("event_id"),
+                        "timestamp": e.get("timestamp"),
+                        "lab_name": lab_name,
+                        "value_num": pick.get("value_num") if pick else None,
+                        "value_text": pick.get("value_text") if pick else None,
+                        "unit": pick.get("unit") if pick else None,
+                        "lab_exists": bool(pick),
+                        "event_content": e.get("content"),
+                    }
+                )
+            elif et == "MEDICATION":
+                items = _safe_list((e.get("content") or {}).get("items"))
+                drugs = _collect_med_drugs_with_dose(items)
+                if not drugs:
+                    continue
+                med_items.append(
+                    {
+                        "id": _make_question_id(e.get("event_id") or "", "med"),
+                        "patient_id": patient_id,
+                        "visit_ref": visit_ref,
+                        "visit_num": _visit_num(visit_ref),
+                        "visit_type_index": e.get("visit_type_index"),
+                        "event_id": e.get("event_id"),
+                        "timestamp": e.get("timestamp"),
+                        "drugs": drugs,
+                        "event_content": e.get("content"),
+                    }
+                )
+            elif et == "IMAGING":
+                imaging_items.append(
+                    {
+                        "id": _make_question_id(e.get("event_id") or "", "img"),
+                        "patient_id": patient_id,
+                        "visit_ref": visit_ref,
+                        "visit_num": _visit_num(visit_ref),
+                        "visit_type_index": e.get("visit_type_index"),
+                        "event_id": e.get("event_id"),
+                        "timestamp": e.get("timestamp"),
+                        "report": e.get("content"),
                     }
                 )
 
-            for e in evs:
-                et = e.get("event_type")
-                if et == "LAB":
-                    items = _collect_lab_items(_safe_list((e.get("content") or {}).get("items")))
-                    if not items:
-                        continue
-                    current_names = [it.get("name") for it in items if it.get("name")]
-                    # 50/50 choose existing vs negative (fallback to existing if no negative)
-                    use_existing = rng.random() < 0.5
-                    pick = None
-                    lab_name = None
-                    if use_existing:
-                        pick = rng.choice(items)
-                        lab_name = pick.get("name")
-                    else:
-                        pool = [n for n in all_lab_names if n and n not in current_names]
-                        neg = _pick_negative_lab_name(rng, current_names, pool)
-                        if neg:
-                            lab_name = neg
-                        else:
-                            pick = rng.choice(items)
-                            lab_name = pick.get("name")
-                    lab_items.append(
-                        {
-                            "id": _make_question_id(e.get("event_id") or "", "lab"),
-                            "patient_id": patient_id,
-                            "visit_ref": visit_ref,
-                            "visit_num": _visit_num(visit_ref),
-                            "visit_type_index": e.get("visit_type_index"),
-                            "event_id": e.get("event_id"),
-                            "timestamp": e.get("timestamp"),
-                            "lab_name": lab_name,
-                            "value_num": pick.get("value_num") if pick else None,
-                            "value_text": pick.get("value_text") if pick else None,
-                            "unit": pick.get("unit") if pick else None,
-                            "lab_exists": bool(pick),
-                            "event_content": e.get("content"),
-                        }
-                    )
-                elif et == "MEDICATION":
-                    items = _safe_list((e.get("content") or {}).get("items"))
-                    drugs = _collect_med_drugs_with_dose(items)
-                    if not drugs:
-                        continue
-                    med_items.append(
-                        {
-                            "id": _make_question_id(e.get("event_id") or "", "med"),
-                            "patient_id": patient_id,
-                            "visit_ref": visit_ref,
-                            "visit_num": _visit_num(visit_ref),
-                            "visit_type_index": e.get("visit_type_index"),
-                            "event_id": e.get("event_id"),
-                            "timestamp": e.get("timestamp"),
-                            "drugs": drugs,
-                            "event_content": e.get("content"),
-                        }
-                    )
-                elif et == "IMAGING":
-                    imaging_items.append(
-                        {
-                            "id": _make_question_id(e.get("event_id") or "", "img"),
-                            "patient_id": patient_id,
-                            "visit_ref": visit_ref,
-                            "visit_num": _visit_num(visit_ref),
-                            "visit_type_index": e.get("visit_type_index"),
-                            "event_id": e.get("event_id"),
-                            "timestamp": e.get("timestamp"),
-                            "report": e.get("content"),
-                        }
-                    )
+    # Admission/Discharge (single, no batch)
+    for item in adm_dis_items:
+        question = _format_adm_dis_question(item)
+        keywords = _adm_dis_keywords(item)
+        q = {
+            "question_id": f"{patient_id}-{item['visit_ref']}-adm_dis",
+            "patient_id": patient_id,
+            "visit_ref": item["visit_ref"],
+            "visit_num": item["visit_num"],
+            "event_type": "ADMISSION_DISCHARGE",
+            "question_variant": "single",
+            "question": question,
+            "keywords": keywords,
+            "ground_truth": {
+                "chief_complaint": item.get("chief_complaint"),
+                "discharge_diagnosis": item.get("discharge_diagnosis"),
+            },
+        }
+        questions.append(q)
 
-        # Admission/Discharge (single, no batch)
-        for item in adm_dis_items:
-            question = _format_adm_dis_question(item)
-            keywords = _adm_dis_keywords(item)
-            q = {
-                "question_id": f"{patient_id}-{item['visit_ref']}-adm_dis",
-                "patient_id": patient_id,
-                "visit_ref": item["visit_ref"],
-                "visit_num": item["visit_num"],
-                "event_type": "ADMISSION_DISCHARGE",
-                "question_variant": "single",
-                "question": question,
-                "keywords": keywords,
-                "ground_truth": {
-                    "chief_complaint": item.get("chief_complaint"),
-                    "discharge_diagnosis": item.get("discharge_diagnosis"),
-                },
-            }
-            questions.append(q)
+    # Imaging (single, no batch) — uses LLM keyword extraction
+    for item in imaging_items:
+        system, user = _build_imaging_keywords_prompt(item)
+        obj = _chat_json(llm, model, system, user)
+        keywords = obj.get("keywords") if isinstance(obj, dict) else []
+        base = {
+            "patient_id": patient_id,
+            "visit_ref": item["visit_ref"],
+            "visit_num": item["visit_num"],
+            "event_id": item["event_id"],
+            "event_type": "IMAGING",
+            "visit_type_index": item["visit_type_index"],
+            "timestamp": item["timestamp"],
+            "keywords": keywords,
+            "ground_truth": item.get("report"),
+        }
+        q_exp, q_rel = _format_imaging_questions(item)
+        q1 = {
+            **base,
+            "question_id": f"{item['id']}",
+            "question_variant": "both",
+            "question_explicit": q_exp,
+            "question_relative": q_rel,
+        }
+        questions.append(q1)
 
-        # Imaging (single, no batch)
-        for item in imaging_items:
-            system, user = _build_imaging_keywords_prompt(item)
-            obj = _chat_json(llm, args.model, system, user)
-            keywords = obj.get("keywords") if isinstance(obj, dict) else []
+    # LAB (batched)
+    for i in range(0, len(lab_items), int(args_dict["batch_lab"])):
+        batch = lab_items[i : i + int(args_dict["batch_lab"])]
+        for item in batch:
+            q_exp, q_rel = _format_lab_questions(item)
+            answer = "not found"
+            if item.get("lab_exists"):
+                v = item.get("value_num") if item.get("value_num") not in (None, "") else item.get("value_text")
+                unit = item.get("unit") or ""
+                answer = f"{v} {unit}".strip()
+            keywords = ["not found"]
+            if item.get("lab_exists"):
+                keywords = ["found", answer]
             base = {
                 "patient_id": patient_id,
                 "visit_ref": item["visit_ref"],
                 "visit_num": item["visit_num"],
                 "event_id": item["event_id"],
-                "event_type": "IMAGING",
+                "event_type": "LAB",
                 "visit_type_index": item["visit_type_index"],
                 "timestamp": item["timestamp"],
                 "keywords": keywords,
-                "ground_truth": item.get("report"),
+                "ground_truth": {
+                    "event_content": item.get("event_content"),
+                },
             }
-            q_exp, q_rel = _format_imaging_questions(item)
             q1 = {
                 **base,
                 "question_id": f"{item['id']}",
@@ -391,89 +701,90 @@ def main() -> int:
             }
             questions.append(q1)
 
-        # LAB (batched)
-        for i in range(0, len(lab_items), args.batch_lab):
-            batch = lab_items[i : i + args.batch_lab]
-            for item in batch:
-                q_exp, q_rel = _format_lab_questions(item)
-                answer = "not found"
-                if item.get("lab_exists"):
-                    v = item.get("value_num") if item.get("value_num") not in (None, "") else item.get("value_text")
-                    unit = item.get("unit") or ""
-                    answer = f"{v} {unit}".strip()
-                keywords = ["not found"]
-                if item.get("lab_exists"):
-                    keywords = ["found", answer]
-                base = {
-                    "patient_id": patient_id,
-                    "visit_ref": item["visit_ref"],
-                    "visit_num": item["visit_num"],
-                    "event_id": item["event_id"],
-                    "event_type": "LAB",
-                    "visit_type_index": item["visit_type_index"],
-                    "timestamp": item["timestamp"],
-                    "keywords": keywords,
-                    "ground_truth": {
-                        "event_content": item.get("event_content"),
-                    },
-                }
-                q1 = {
-                    **base,
-                    "question_id": f"{item['id']}",
-                    "question_variant": "both",
-                    "question_explicit": q_exp,
-                    "question_relative": q_rel,
-                }
-                questions.append(q1)
+    # MEDICATION (batched)
+    for i in range(0, len(med_items), int(args_dict["batch_med"])):
+        batch = med_items[i : i + int(args_dict["batch_med"])]
+        for item in batch:
+            q_exp, q_rel = _format_med_questions(item)
+            med_keywords = []
+            for d in item.get("drugs", []):
+                drug = d.get("drug")
+                if not drug:
+                    continue
+                dose = d.get("dose") or "not recorded"
+                med_keywords.append(f"{drug} | {dose}")
+            base = {
+                "patient_id": patient_id,
+                "visit_ref": item["visit_ref"],
+                "visit_num": item["visit_num"],
+                "event_id": item["event_id"],
+                "event_type": "MEDICATION",
+                "visit_type_index": item["visit_type_index"],
+                "timestamp": item["timestamp"],
+                "keywords": med_keywords,
+                "ground_truth": {
+                    "event_content": item.get("event_content"),
+                    "drug_list": item.get("drugs"),
+                },
+            }
+            q1 = {
+                **base,
+                "question_id": f"{item['id']}",
+                "question_variant": "both",
+                "question_explicit": q_exp,
+                "question_relative": q_rel,
+            }
+            questions.append(q1)
 
-        # MEDICATION (batched)
-        for i in range(0, len(med_items), args.batch_med):
-            batch = med_items[i : i + args.batch_med]
-            for item in batch:
-                q_exp, q_rel = _format_med_questions(item)
-                med_keywords = []
-                for d in item.get("drugs", []):
-                    drug = d.get("drug")
-                    if not drug:
-                        continue
-                    dose = d.get("dose") or "not recorded"
-                    med_keywords.append(f"{drug} | {dose}")
-                base = {
-                    "patient_id": patient_id,
-                    "visit_ref": item["visit_ref"],
-                    "visit_num": item["visit_num"],
-                    "event_id": item["event_id"],
-                    "event_type": "MEDICATION",
-                    "visit_type_index": item["visit_type_index"],
-                    "timestamp": item["timestamp"],
-                    "keywords": med_keywords,
-                    "ground_truth": {
-                        "event_content": item.get("event_content"),
-                        "drug_list": item.get("drugs"),
-                    },
-                }
-                q1 = {
-                    **base,
-                    "question_id": f"{item['id']}",
-                    "question_variant": "both",
-                    "question_explicit": q_exp,
-                    "question_relative": q_rel,
-                }
-                questions.append(q1)
+    def _q_sort_key(q: Dict[str, Any]) -> Tuple[int, int, str]:
+        vkey = _visit_sort_key(q.get("visit_ref"))
+        is_adm_dis = 1 if q.get("event_type") == "ADMISSION_DISCHARGE" else 0
+        return (vkey[0], is_adm_dis, q.get("question_id") or "")
 
-        def _q_sort_key(q: Dict[str, Any]) -> Tuple[int, int, str]:
-            vkey = _visit_sort_key(q.get("visit_ref"))
-            is_adm_dis = 1 if q.get("event_type") == "ADMISSION_DISCHARGE" else 0
-            return (vkey[0], is_adm_dis, q.get("question_id") or "")
+    questions.sort(key=_q_sort_key)
 
-        questions.sort(key=_q_sort_key)
+    with out_path.open("w", encoding="utf-8") as out_f:
+        for q in questions:
+            out_f.write(json.dumps(q, ensure_ascii=False) + "\n")
+    logger.info(f"Token Usage for patient {patient_id}: {llm.get_token_usage().get('chat', {})}")
+    return patient_id, str(out_path), (llm.get_token_usage().get("chat", {}))
 
-        with out_path.open("w", encoding="utf-8") as out_f:
-            for q in questions:
-                out_f.write(json.dumps(q, ensure_ascii=False) + "\n")
 
-        print(f"wrote={out_path}")
+def main() -> int:
+    args = parse_args()
 
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    patient_files = list(iter_patient_files(args.events_dir))
+    if args.num_patients and args.num_patients > 0:
+        patient_files = patient_files[: args.num_patients]
+
+    # tune this if you want; default: min(8, cpu_count)
+    max_workers = min(8, os.cpu_count() or 4)
+
+    args_dict = {
+        "out_dir": str(args.out_dir),
+        "model": args.model,
+        "batch_lab": args.batch_lab,
+        "batch_med": args.batch_med,
+        "seed": args.seed,
+    }
+    usage_stats: Dict[str, int] = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+    # Run per-patient in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_process_one_patient_file, str(pf), args_dict) for pf in patient_files]
+        for fut in as_completed(futs):
+            pid, out_path, usage = fut.result()
+            logger.success(f"wrote={out_path} patient={pid}")
+            usage_stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            usage_stats["completion_tokens"] += usage.get("completion_tokens", 0)
+            usage_stats["total_tokens"] += usage.get("total_tokens", 0)
+    logger.info(f"LLM token usage: {usage_stats}")
     return 0
 
 
