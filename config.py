@@ -198,7 +198,8 @@ class TimelineGenConfig:
         # 继承基础配置 (如果有的话)
         # build = BuildConfig() 
     
-        self.PATIENTS_SEQ_DIR: Path = Path("./EHR_pipeline/bench_data/patients_sequence")
+        base = Path(__file__).resolve().parent  # 假设config.py在项目根目录
+        self.PATIENTS_SEQ_DIR = base / "EHR_pipeline" / "bench_data" / "patients_sequence"
 
         # --- 输出路径 ---
         # 建议把两个子任务分开存放，方便评测脚本读取
