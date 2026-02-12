@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
-
+from mem0 import MemoryClient 
 
 @dataclass
 class MemorySearchResult:
@@ -157,12 +157,7 @@ class Mem0MemoryProvider(MemoryProvider):
     """
 
     def __init__(self, api_key: Optional[str] = None) -> None:
-        try:
-            from mem0 import MemoryClient  # type: ignore
-        except Exception as exc:  # pragma: no cover - import guard
-            raise RuntimeError(
-                "mem0ai is not installed. Install with `pip install mem0ai`."
-            ) from exc
+            
         self._client = MemoryClient(api_key=api_key)
 
     def add_memory(

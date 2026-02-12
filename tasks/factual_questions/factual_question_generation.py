@@ -36,14 +36,25 @@ import argparse
 import json
 import math
 from collections import defaultdict
+from dotenv import load_dotenv
 
+from config import LLMConfig
+llm_cfg = LLMConfig()
+load_dotenv()  # 从 .env 文件加载环境变量
 # ================= 配置区域 =================
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-ROOT = Path(__file__).resolve().parent
-PATIENTS_DIR = ROOT / "bench_data" / "patients_sequence"
-SUM_DIR = ROOT / "bench_data" / "patients_summary"
-QUESTIONS_DIR = ROOT / "bench_data" / "patients_questions"
+client = openai.OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"), 
+    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+)
 
+# ROOT = Path(__file__).resolve().parent
+# PATIENTS_DIR = ROOT / "bench_data" / "patients_sequence"
+# SUM_DIR = ROOT / "bench_data" / "patients_summary"
+# QUESTIONS_DIR = ROOT / "bench_data" / "patients_questions"
+
+PATIENTS_DIR = Path("bench_data/patients_sequence")
+SUM_DIR = Path("bench_data/patients_summary")
+QUESTIONS_DIR = Path("bench_data/patients_questions")
 SUM_DIR.mkdir(parents=True, exist_ok=True)
 QUESTIONS_DIR.mkdir(parents=True, exist_ok=True) 
 
@@ -52,7 +63,7 @@ BATCH_SIZE = 5
 
 # ================= 工具函数 =================
 
-def get_chat_response(prompt, model="gpt-4o", as_json=False):
+def get_chat_response(prompt, model=llm_cfg.chat_model, as_json=False):
     """通用请求函数，带超时和异常处理"""
     try:
         response_format = {"type": "json_object"} if as_json else None
@@ -98,7 +109,7 @@ def test_connection():
         return
 
     # 3. 发起实际测试请求
-    print("\n>>> 正在发送测试请求给 OpenAI (GPT-4o)...")
+    print("\n>>> 正在发送测试请求给 OpenAI (qwen-turbo)...")
     test_prompt = "Hello! Please reply with the single word 'Connected' if you receive this."
     result = get_chat_response(test_prompt)
     
