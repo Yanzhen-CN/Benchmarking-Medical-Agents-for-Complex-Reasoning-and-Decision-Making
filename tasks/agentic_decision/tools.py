@@ -55,7 +55,10 @@ def make_indicator_key(name: str, fluid: str, unit: str) -> str:
 
 def parse_time(ts: str) -> datetime:
     # e.g. "2160-03-23 10:00:00"
-    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except:
+        return datetime.strptime(ts, "%Y-%m-%d")
 
 def iter_json_files(root: Path):
     for p in root.rglob("*.json"):
@@ -387,3 +390,61 @@ def generate_reason_from_messages_llm(
         reason = reason[:1024].rstrip() + "..."
 
     return reason
+
+
+def parse_qid(qid: str) -> Dict[str, Any]:
+    """
+    Parse:
+        P000001-V12-T0002-T3-N-0
+
+    Return:
+    {
+        patient_id: "P000001",
+        visit_id: "P000001-V12",
+        visit_ref: "V12",
+        turn_ref: "T0002",
+        turn_index: 2,
+        task: "T3",
+        subtype: "N",
+        q_index: 0,
+    }
+    """
+    if not isinstance(qid, str) or "-" not in qid:
+        raise ValueError(f"Invalid qid format: {qid}")
+
+    parts = qid.split("-")
+
+    if len(parts) < 6:
+        raise ValueError(f"Invalid qid parts (expect 6+): {qid}")
+
+    patient_id = parts[0]
+    visit_ref = parts[1]
+    turn_ref = parts[2]
+    task = parts[3]
+    subtype = parts[4]
+    q_index = parts[5]
+
+    # ---------- derive ----------
+    visit_id = f"{patient_id}-{visit_ref}"
+
+    # T0002 → 2
+    try:
+        turn_index = int(turn_ref[1:])
+    except Exception:
+        raise ValueError(f"Invalid turn_ref in qid: {qid}")
+
+    try:
+        q_index = int(q_index)
+    except Exception:
+        raise ValueError(f"Invalid question index in qid: {qid}")
+
+    return {
+        "patient_id": patient_id,
+        "visit_id": visit_id,
+        "visit_ref": visit_ref,
+        "turn_ref": turn_ref,
+        "turn_index": turn_index,
+        "task": task,
+        "subtype": subtype,
+        "q_index": q_index,
+    }

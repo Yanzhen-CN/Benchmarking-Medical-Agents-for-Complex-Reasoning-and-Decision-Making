@@ -259,5 +259,7 @@ class AgentTaskConfig:
         
         self.CONTEXT_DIR: Path = Path("./tasks/agentic_decision/context")
         
-        self.DEMO_MODE: bool = True
+        self.DEMO_MODE: bool = False
         self.DEMO_N: int = 5
+        
+        self.KEEP_LAST_N_TURNS: int = 8
