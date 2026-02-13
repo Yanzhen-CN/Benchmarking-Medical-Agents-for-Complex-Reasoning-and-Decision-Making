@@ -91,7 +91,12 @@ class MemoryAugmentedChatAgent:
 
         retrieval_query = query
         memories: List[MemorySearchResult] = []
-        if self._config.include_memory_in_prompt and query and self._should_retrieve(query):
+        if (
+            self._config.include_memory_in_prompt
+            and self._config.memory_top_k > 0
+            and query
+            and self._should_retrieve(query=query, last_user=last_user)
+        ):
             if self._config.query_rewrite and self._is_question(query):
                 retrieval_query = self._rewrite_retrieval_query(query=query)
             memories = self._memory.search(
@@ -121,7 +126,14 @@ class MemoryAugmentedChatAgent:
         )
         return reply, trace
 
-    def _should_retrieve(self, query: str) -> bool:
+    def _should_retrieve(self, *, query: str, last_user: Optional[Dict[str, str]] = None) -> bool:
+        # Authoritative gating: if caller provides a semantic type, trust it.
+        # Only explicit question type can trigger retrieval.
+        if last_user is not None:
+            msg_type = (last_user.get("type") or "").strip().lower()
+            if msg_type:
+                return msg_type == "question"
+
         policy = (self._config.retrieval_policy or "always").lower()
         if policy == "never":
             return False
@@ -170,11 +182,23 @@ class MemoryAugmentedChatAgent:
             prompt.append({"role": "system", "content": mem_block})
 
         if self._config.max_recent_turns > 0:
-            prompt.extend(messages[-self._config.max_recent_turns :])
+            prompt.extend(self._sanitize_messages_for_llm(messages[-self._config.max_recent_turns :]))
         else:
-            prompt.extend(messages)
+            prompt.extend(self._sanitize_messages_for_llm(messages))
 
         return prompt
+
+    @staticmethod
+    def _sanitize_messages_for_llm(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Drop non-standard message keys (e.g., custom `type`) before LLM API call.
+        """
+        out: List[Dict[str, str]] = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            out.append({"role": role, "content": content})
+        return out
 
     def _write_memory(
         self,

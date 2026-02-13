@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from pathlib import Path
 import json
 import os
@@ -34,8 +35,11 @@ def load_local_env() -> None:
 def build_agent():
     llm = OpenAICompatibleLLMProvider()
 
+    memory_top_k = int(os.getenv("MEMORY_TOP_K", "5"))
+    no_memory_mode = memory_top_k <= 0
+
     provider = os.getenv("MEMORY_PROVIDER", "mem0").lower()
-    if provider == "in_memory":
+    if no_memory_mode or provider == "in_memory":
         mem = InMemoryProvider()
     else:
         mem = Mem0MemoryProvider()
@@ -43,11 +47,14 @@ def build_agent():
     obs = LLMObservationExtractor(llm)
 
     cfg = AgentConfig(
-        max_recent_turns=int(os.getenv("AGENT_MAX_RECENT_TURNS", "6")),
-        memory_top_k=int(os.getenv("MEMORY_TOP_K", "5")),
-        store_dialog=os.getenv("AGENT_STORE_DIALOG", "1") == "1",
-        store_observations=os.getenv("AGENT_STORE_OBS", "1") == "1",
-        include_memory_in_prompt=os.getenv("AGENT_INCLUDE_MEMORY", "1") == "1",
+        # run_test manages recent context window explicitly (turn queue).
+        # Keep core-side slicing disabled here so all prepared messages are sent.
+        max_recent_turns=0,
+        memory_top_k=memory_top_k,
+        # In no-memory mode, disable all memory reads/writes.
+        store_dialog=(os.getenv("AGENT_STORE_DIALOG", "1") == "1") and (not no_memory_mode),
+        store_observations=(os.getenv("AGENT_STORE_OBS", "1") == "1") and (not no_memory_mode),
+        include_memory_in_prompt=(os.getenv("AGENT_INCLUDE_MEMORY", "1") == "1") and (not no_memory_mode),
         retrieval_policy=os.getenv("AGENT_RETRIEVAL_POLICY", "question_only"),
         query_rewrite=os.getenv("AGENT_QUERY_REWRITE", "1") == "1",
     )
@@ -57,7 +64,7 @@ def build_agent():
         memory=mem,
         observation_extractor=obs,
         config=cfg,
-    ), mem
+    ), mem, no_memory_mode
 
 
 def iter_jsonl(path: Path):
@@ -123,7 +130,8 @@ def main() -> None:
         if not item_names:
             raise SystemExit("No items provided")
 
-    agent, mem = build_agent()
+    agent, mem, no_memory_mode = build_agent()
+    recent_turns_k = int(os.getenv("AGENT_MAX_RECENT_TURNS", "6"))
 
     app_id = os.getenv("AGENT_APP_ID", "medagentbench")
     agent_id = os.getenv("AGENT_ID", "bench-agent")
@@ -144,6 +152,17 @@ def main() -> None:
         user_id = item
 
         answers = []
+        # One turn = list[message]. We keep at most recent_turns_k turns.
+        # fact turn: [{"role":"user","type":"fact","content":fact}]
+        # qa turn: [{"role":"user","type":"question","content":question},{"role":"assistant","content":answer}]
+        recent_turns = deque()
+
+        def push_turn(turn_messages):
+            if recent_turns_k <= 0:
+                return
+            recent_turns.append(turn_messages)
+            while len(recent_turns) > recent_turns_k:
+                recent_turns.popleft()
 
         for obj in iter_jsonl(path):
             obj_type = obj.get("type")
@@ -151,14 +170,22 @@ def main() -> None:
             data = obj.get("data", "")
 
             if obj_type == "fact":
-                store_fact(mem, data, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
+                if not no_memory_mode:
+                    store_fact(mem, data, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
+                push_turn([{"role": "user", "type": "fact", "content": data}])
                 continue
 
             if obj_type == "question":
                 index_wait = float(os.getenv("MEM0_INDEX_WAIT_S", "0"))
                 if index_wait > 0:
                     time.sleep(index_wait)
-                messages = [{"role": "user", "content": data}]
+                if recent_turns_k <= 0:
+                    messages = [{"role": "user", "type": "question", "content": data}]
+                else:
+                    messages = []
+                    for t in recent_turns:
+                        messages.extend(t)
+                    messages.append({"role": "user", "type": "question", "content": data})
                 if args.debug:
                     reply, trace = agent.chat_with_trace(
                         messages=messages,
@@ -192,6 +219,13 @@ def main() -> None:
                     out_record["debug_retrieval_query"] = trace.retrieval_query
                     out_record["debug_retrieved"] = [r.text for r in trace.memories]
                 answers.append(out_record)
+                if not no_memory_mode:
+                    push_turn(
+                        [
+                            {"role": "user", "type": "question", "content": data},
+                            {"role": "assistant", "content": reply},
+                        ]
+                    )
                 continue
 
             # ignore unknown types
@@ -206,7 +240,9 @@ def main() -> None:
         print(f"Results saved to: {out_path}")
 
         # Flush memory for this file after finishing
-        if args.no_delete:
+        if no_memory_mode:
+            pass
+        elif args.no_delete:
             if isinstance(mem, Mem0MemoryProvider):
                 try:
                     index_wait = float(os.getenv("MEM0_INDEX_WAIT_S", "0"))
