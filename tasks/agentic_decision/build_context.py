@@ -323,37 +323,6 @@ Use the following format for your messages:
     return messages
 
 
-# ============================================================
-# IO
-# ============================================================
-
-def load_patient_json(path: Path) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-    if not isinstance(obj, dict) or "visits" not in obj:
-        raise ValueError(f"Expected new-schema patient dict with 'visits', got: {type(obj)}")
-    return obj
-
-
-def find_visit(patient: Dict[str, Any], visit_id: str) -> Dict[str, Any]:
-    for v in patient.get("visits", []) or []:
-        if str(v.get("visit_id")) == str(visit_id):
-            return v
-    raise KeyError(f"visit_id not found: {visit_id}")
-
-
-def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as f:
-        for ln, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    yield obj
-            except Exception as e:
-                logger.warning(f"Skip bad JSONL line={ln}: {e}")
 
 
 def collect_visit_ids_from_questions(questions_jsonl: Path) -> Tuple[Set[str], Dict[str, List[str]]]:
@@ -465,41 +434,6 @@ def build_all_visit_contexts_from_questions(
 
     return index
 
-def patient_event_stats(patient_json_path: Path) -> Dict[str, Any]:
-    """
-    Return stats for sorting:
-      - file_size_bytes
-      - num_visits
-      - total_events (sum of len(event_stream) across visits)
-      - max_visit_events
-    """
-    st = {
-        "file_size_bytes": patient_json_path.stat().st_size if patient_json_path.exists() else 0,
-        "num_visits": 0,
-        "total_events": 0,
-        "max_visit_events": 0,
-        "exists": patient_json_path.exists(),
-    }
-    if not patient_json_path.exists():
-        return st
-
-    try:
-        patient = load_patient_json(patient_json_path)
-        visits = patient.get("visits", []) or []
-        st["num_visits"] = len(visits)
-        total = 0
-        mx = 0
-        for v in visits:
-            n = len(v.get("event_stream", []) or [])
-            total += n
-            if n > mx:
-                mx = n
-        st["total_events"] = total
-        st["max_visit_events"] = mx
-    except Exception as e:
-        logger.warning(f"Failed to read {patient_json_path}: {e}")
-
-    return st
 from datetime import time
 import os
 import os

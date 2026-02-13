@@ -11,7 +11,7 @@ import uuid
 import dotenv
 
 from util import logUtil
-from config 
+from config import AgentTaskConfig
 logger = logUtil.setup_logger()
 
 from agents.mem0_agent import (
@@ -26,15 +26,8 @@ from agents.mem0_agent.core import AgentConfig
 dotenv.load_dotenv(Path(__file__).parent / ".env", override=True)
 def build_agent():
     llm = OpenAICompatibleLLMProvider()
-
-    provider = os.getenv("MEMORY_PROVIDER", "mem0").lower()
-    if provider == "in_memory":
-        mem = InMemoryProvider()
-    else:
-        mem = Mem0MemoryProvider()
-
+    mem = Mem0MemoryProvider()
     obs = LLMObservationExtractor(llm)
-    
     cfg = AgentConfig(
         max_recent_turns=int(os.getenv("AGENT_MAX_RECENT_TURNS", "6")),
         memory_top_k=int(os.getenv("MEMORY_TOP_K", "5")),
@@ -81,10 +74,8 @@ def maybe_flush(mem: Mem0MemoryProvider, *, user_id: str, agent_id: str, app_id:
         print(f"[warn] Memory cleanup failed: {exc}", file=sys.stderr)
         
 def feed_facts(mem: Mem0MemoryProvider, facts: list[str], *, user_id: str, agent_id: str, app_id: str, run_id: str) -> None:
-    pass
-def generate_agent_context():
-    # For future use: generate context from facts if needed, e.g. for non-Mem0 providers or to prime the agent.
-    pass
+    for fact in facts:
+        store_fact(mem, fact, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
 
 def main() -> None:
 

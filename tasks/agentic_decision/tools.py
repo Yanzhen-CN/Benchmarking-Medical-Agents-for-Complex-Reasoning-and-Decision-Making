@@ -545,7 +545,7 @@ def build_event_memory_from_sequence_json(
             continue
         if visit_order[vref] >= cur_idx:
             continue
-
+        
         mem.append({
             "memory_type": "event",
             "visit_ref": vref,
@@ -555,3 +555,200 @@ def build_event_memory_from_sequence_json(
             "content": ev.get("content"),
         })
     return mem
+
+# ============================================================
+# IO
+# ============================================================
+
+def load_patient_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict) or "visits" not in obj:
+        raise ValueError(f"Expected new-schema patient dict with 'visits', got: {type(obj)}")
+    return obj
+
+
+def find_visit(patient: Dict[str, Any], visit_id: str) -> Dict[str, Any]:
+    for v in patient.get("visits", []) or []:
+        if str(v.get("visit_id")) == str(visit_id):
+            return v
+    raise KeyError(f"visit_id not found: {visit_id}")
+
+
+def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    yield obj
+            except Exception as e:
+                logger.warning(f"Skip bad JSONL line={ln}: {e}")
+
+def patient_event_stats(patient_json_path: Path) -> Dict[str, Any]:
+    """
+    Return stats for sorting:
+      - file_size_bytes
+      - num_visits
+      - total_events (sum of len(event_stream) across visits)
+      - max_visit_events
+    """
+    st = {
+        "file_size_bytes": patient_json_path.stat().st_size if patient_json_path.exists() else 0,
+        "num_visits": 0,
+        "total_events": 0,
+        "max_visit_events": 0,
+        "exists": patient_json_path.exists(),
+    }
+    if not patient_json_path.exists():
+        return st
+
+    try:
+        patient = load_patient_json(patient_json_path)
+        visits = patient.get("visits", []) or []
+        st["num_visits"] = len(visits)
+        total = 0
+        mx = 0
+        for v in visits:
+            n = len(v.get("event_stream", []) or [])
+            total += n
+            if n > mx:
+                mx = n
+        st["total_events"] = total
+        st["max_visit_events"] = mx
+    except Exception as e:
+        logger.warning(f"Failed to read {patient_json_path}: {e}")
+
+    return st
+
+
+# ============================================================
+# Memory item to docs
+# ============================================================
+def _safe_str(x: Any) -> str:
+    return "" if x is None else str(x).strip()
+
+def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
+    t = _safe_str(text)
+    if not t:
+        return []
+    if len(t) <= max_chars:
+        return [t]
+    out = []
+    i = 0
+    while i < len(t):
+        j = min(len(t), i + max_chars)
+        out.append(t[i:j])
+        if j == len(t):
+            break
+        i = max(0, j - overlap)
+    return out
+
+def memory_item_to_docs(patient_id: str, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    把 note/event memory item 变成若干条 doc（text+meta）
+    NOTE: 这里不做可视范围约束；可视范围过滤放到检索阶段。
+    """
+    mtype = item.get("memory_type")
+    docs: List[Dict[str, Any]] = []
+
+    if mtype == "note":
+        text = _safe_str(item.get("text"))
+        if not text:
+            return []
+        meta = {
+            "patient_id": patient_id,
+            "memory_type": "note",
+            "visit_id": item.get("visit_id"),
+            "visit_ref": item.get("visit_ref"),   # ✅ 新增：可选
+            "visit_idx": item.get("visit_idx"),   # ✅ 新增：可选
+            "note_type": item.get("note_type"),
+        }
+        docs.append({"text": text, "meta": meta})
+        return docs
+
+    if mtype != "event":
+        return []
+
+    et = _safe_str(item.get("event_type"))
+    ts = item.get("timestamp")
+    vref = _safe_str(item.get("visit_ref"))
+    eid = _safe_str(item.get("event_id"))
+    content = item.get("content") or {}
+
+    base_meta = {
+        "patient_id": patient_id,
+        "memory_type": "event",
+        "visit_ref": vref,
+        "visit_idx": item.get("visit_idx"),  # ✅ 新增：可选（我们会补上）
+        "event_id": eid,
+        "event_type": et,
+        "timestamp": ts,
+    }
+
+    if et == "LAB":
+        for idx, x in enumerate(content.get("items") or []):
+            text = (
+                f"[LAB] t={ts} visit={vref} | "
+                f"name={_safe_str(x.get('name'))} | "
+                f"value={_safe_str(x.get('value_text') or x.get('value_num'))} {_safe_str(x.get('unit'))} | "
+                f"flag={_safe_str(x.get('flag'))} | fluid={_safe_str(x.get('fluid'))} | "
+                f"category={_safe_str(x.get('category'))}"
+            )
+            meta = dict(base_meta)
+            meta["item_index"] = idx
+            docs.append({"text": text, "meta": meta})
+        return docs
+
+    if et == "MEDICATION":
+        for idx, x in enumerate(content.get("items") or []):
+            text = (
+                f"[MED] t={ts} visit={vref} | "
+                f"drug={_safe_str(x.get('drug'))} | route={_safe_str(x.get('route'))} | "
+                f"dose={_safe_str(x.get('dose'))} | status={_safe_str(x.get('status'))} | "
+                f"end={_safe_str(x.get('end_timestamp'))}"
+            )
+            meta = dict(base_meta)
+            meta["item_index"] = idx
+            docs.append({"text": text, "meta": meta})
+        return docs
+
+    if et == "MICROBIOLOGY":
+        specimen = content.get("specimen") or {}
+        results = content.get("results") or {}
+        comments = results.get("comments") or []
+        text = (
+            f"[MICRO] t={ts} visit={vref} | "
+            f"spec_type={_safe_str(specimen.get('spec_type'))} | test={_safe_str(specimen.get('test_name'))} | "
+            f"negative={_safe_str(results.get('negative'))} | "
+            f"organisms={_safe_str(results.get('organisms'))} | "
+            f"comments={' '.join(map(_safe_str, comments))}"
+        )
+        docs.append({"text": text, "meta": base_meta})
+        return docs
+
+    if et == "IMAGING":
+        report = _safe_str(content.get("report"))
+        chunks = _chunk_text(report, max_chars=1200, overlap=150)
+        for k, ch in enumerate(chunks):
+            meta = dict(base_meta)
+            meta["chunk_id"] = k
+            docs.append({"text": f"[IMAGING] t={ts} visit={vref} | chunk={k+1}/{len(chunks)}: {ch}", "meta": meta})
+        return docs
+
+    if et == "PROCEDURE":
+        items = content.get("items") or []
+        text = (
+            f"[PROC] t={ts} visit={vref} | "
+            f"items={'; '.join(_safe_str(x.get('name')) for x in items)}"
+        )
+        docs.append({"text": text, "meta": base_meta})
+        return docs
+
+    brief = _safe_str(json.dumps(content, ensure_ascii=False))
+    if brief:
+        docs.append({"text": f"[{et}] t={ts} visit={vref} | {brief[:2000]}", "meta": base_meta})
+    return docs
