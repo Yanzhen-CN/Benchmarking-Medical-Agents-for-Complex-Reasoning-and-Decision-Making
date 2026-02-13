@@ -21,7 +21,8 @@ from agents.mem0_agent.core import AgentConfig
 
 def load_local_env() -> None:
     env_path = Path(__file__).parent / ".env"
-    dotenv.load_dotenv(env_path)
+    # Force local env to take precedence over repo/global .env
+    dotenv.load_dotenv(env_path, override=True)
 
 
 def build_agent() -> MemoryAugmentedChatAgent:
@@ -36,6 +37,7 @@ def build_agent() -> MemoryAugmentedChatAgent:
         store_observations=os.getenv("AGENT_STORE_OBS", "1") == "1",
         include_memory_in_prompt=os.getenv("AGENT_INCLUDE_MEMORY", "1") == "1",
         retrieval_policy=os.getenv("AGENT_RETRIEVAL_POLICY", "always"),
+        query_rewrite=os.getenv("AGENT_QUERY_REWRITE", "1") == "1",
     )
 
     return MemoryAugmentedChatAgent(

@@ -20,7 +20,7 @@ python run.py
 
 ### run_test（测试序列任务）
 ```bash
-python run_test.py --task tests --items P0001 --debug
+python run_test.py --task test --items P0001 --debug
 ```
 
 输出会写入到：

@@ -11,6 +11,7 @@ from .prompts import (
     MEMORY_BLOCK_HEADER,
     OBSERVATION_STORE_TAG,
     DIALOG_STORE_TAG,
+    QUERY_REWRITE_SYSTEM_PROMPT,
 )
 
 
@@ -23,7 +24,16 @@ class AgentConfig:
     include_memory_in_prompt: bool = True
     # Retrieval policy: "always" | "question_only" | "never"
     retrieval_policy: str = "always"
+    # Whether to rewrite user questions before retrieval
+    query_rewrite: bool = True
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+
+
+@dataclass
+class RetrievalTrace:
+    original_query: str
+    retrieval_query: str
+    memories: List[MemorySearchResult]
 
 
 class MemoryAugmentedChatAgent:
@@ -54,6 +64,24 @@ class MemoryAugmentedChatAgent:
         app_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> str:
+        reply, _ = self.chat_with_trace(
+            messages=messages,
+            user_id=user_id,
+            agent_id=agent_id,
+            app_id=app_id,
+            run_id=run_id,
+        )
+        return reply
+
+    def chat_with_trace(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        app_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> tuple[str, RetrievalTrace]:
         if not messages:
             raise ValueError("messages cannot be empty")
 
@@ -61,10 +89,13 @@ class MemoryAugmentedChatAgent:
         last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
         query = (last_user or messages[-1]).get("content", "").strip()
 
+        retrieval_query = query
         memories: List[MemorySearchResult] = []
         if self._config.include_memory_in_prompt and query and self._should_retrieve(query):
+            if self._config.query_rewrite and self._is_question(query):
+                retrieval_query = self._rewrite_retrieval_query(query=query)
             memories = self._memory.search(
-                query=query,
+                query=retrieval_query,
                 top_k=self._config.memory_top_k,
                 user_id=user_id,
                 agent_id=agent_id,
@@ -83,7 +114,12 @@ class MemoryAugmentedChatAgent:
             app_id=app_id,
             run_id=run_id,
         )
-        return reply
+        trace = RetrievalTrace(
+            original_query=query,
+            retrieval_query=retrieval_query,
+            memories=memories,
+        )
+        return reply, trace
 
     def _should_retrieve(self, query: str) -> bool:
         policy = (self._config.retrieval_policy or "always").lower()
@@ -92,21 +128,36 @@ class MemoryAugmentedChatAgent:
         if policy == "always":
             return True
         if policy == "question_only":
-            q = query.strip()
-            if not q:
-                return False
-            if "?" in q or "？" in q:
-                return True
-            # Simple heuristic for question intent (English + Chinese)
-            cues = [
-                "what", "why", "how", "when", "where", "which", "who",
-                "什么", "为啥", "为什么", "怎么", "如何", "是否", "吗",
-                "几", "多少", "哪", "哪种", "哪位", "多大", "多久", "何时", "请问",
-            ]
-            q_lower = q.lower()
-            return any(cue in q_lower for cue in cues)
+            return self._is_question(query)
         # Fallback to safe default
         return True
+
+    def _is_question(self, text: str) -> bool:
+        q = text.strip()
+        if not q:
+            return False
+        if "?" in q or "？" in q:
+            return True
+        cues = [
+            "what", "why", "how", "when", "where", "which", "who",
+            "什么", "为啥", "为什么", "怎么", "如何", "是否", "吗",
+            "几", "多少", "哪", "哪种", "哪位", "多大", "多久", "何时", "请问",
+        ]
+        q_lower = q.lower()
+        return any(cue in q_lower for cue in cues)
+
+    def _rewrite_retrieval_query(self, *, query: str) -> str:
+        try:
+            rewritten = self._llm.chat(
+                [
+                    {"role": "system", "content": QUERY_REWRITE_SYSTEM_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.0,
+            ).strip()
+            return rewritten or query
+        except Exception:
+            return query
 
     def _compose_prompt(
         self, messages: List[Dict[str, str]], memories: List[MemorySearchResult]

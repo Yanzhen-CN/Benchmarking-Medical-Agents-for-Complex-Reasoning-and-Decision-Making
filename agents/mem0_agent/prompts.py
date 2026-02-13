@@ -10,5 +10,11 @@ OBSERVATION_EXTRACT_SYSTEM = (
     "Return ONLY a JSON array of short statements, no extra text."
 )
 
+QUERY_REWRITE_SYSTEM_PROMPT = (
+    "You rewrite a user's question into a concise memory-retrieval query. "
+    "Keep key medical entities, symptoms, findings, time cues, and asked target. "
+    "Keep your output concise, but be sure to retrieve everything you need to answer the question."
+)
+
 DIALOG_STORE_TAG = "dialog"
 OBSERVATION_STORE_TAG = "observation"
