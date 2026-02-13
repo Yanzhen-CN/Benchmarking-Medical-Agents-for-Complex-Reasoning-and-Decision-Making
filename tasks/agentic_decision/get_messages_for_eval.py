@@ -285,6 +285,8 @@ if __name__ == "__main__":
         qid="P000001-V12-T0002-T3-N-0",
         memory_type="event",  # or "note"
     )
+    print("question:", out["question"]["question"])
+    print(json.dumps(out, indent=2))
 
     print("memories:", len(out["memories"]))
     print("context_messages:", len(out["context_messages"]))

@@ -14,135 +14,15 @@ from tasks.agentic_decision.tools import *  # parse_qid 等
 from util.logUtil import setup_logger
 logger = setup_logger()
 from tqdm import tqdm
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import os
+from config import AgentTaskConfig
 # =========================
 # memory item 转成 embedding 文本（稳定、可检索）——原样保留
 # =========================
 
-def _safe_str(x: Any) -> str:
-    return "" if x is None else str(x).strip()
 
-def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
-    t = _safe_str(text)
-    if not t:
-        return []
-    if len(t) <= max_chars:
-        return [t]
-    out = []
-    i = 0
-    while i < len(t):
-        j = min(len(t), i + max_chars)
-        out.append(t[i:j])
-        if j == len(t):
-            break
-        i = max(0, j - overlap)
-    return out
-
-def memory_item_to_docs(patient_id: str, item: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    把 note/event memory item 变成若干条 doc（text+meta）
-    NOTE: 这里不做可视范围约束；可视范围过滤放到检索阶段。
-    """
-    mtype = item.get("memory_type")
-    docs: List[Dict[str, Any]] = []
-
-    if mtype == "note":
-        text = _safe_str(item.get("text"))
-        if not text:
-            return []
-        meta = {
-            "patient_id": patient_id,
-            "memory_type": "note",
-            "visit_id": item.get("visit_id"),
-            "visit_ref": item.get("visit_ref"),   # ✅ 新增：可选
-            "visit_idx": item.get("visit_idx"),   # ✅ 新增：可选
-            "note_type": item.get("note_type"),
-        }
-        docs.append({"text": text, "meta": meta})
-        return docs
-
-    if mtype != "event":
-        return []
-
-    et = _safe_str(item.get("event_type"))
-    ts = item.get("timestamp")
-    vref = _safe_str(item.get("visit_ref"))
-    eid = _safe_str(item.get("event_id"))
-    content = item.get("content") or {}
-
-    base_meta = {
-        "patient_id": patient_id,
-        "memory_type": "event",
-        "visit_ref": vref,
-        "visit_idx": item.get("visit_idx"),  # ✅ 新增：可选（我们会补上）
-        "event_id": eid,
-        "event_type": et,
-        "timestamp": ts,
-    }
-
-    if et == "LAB":
-        for idx, x in enumerate(content.get("items") or []):
-            text = (
-                f"[LAB] t={ts} visit={vref} | "
-                f"name={_safe_str(x.get('name'))} | "
-                f"value={_safe_str(x.get('value_text') or x.get('value_num'))} {_safe_str(x.get('unit'))} | "
-                f"flag={_safe_str(x.get('flag'))} | fluid={_safe_str(x.get('fluid'))} | "
-                f"category={_safe_str(x.get('category'))}"
-            )
-            meta = dict(base_meta)
-            meta["item_index"] = idx
-            docs.append({"text": text, "meta": meta})
-        return docs
-
-    if et == "MEDICATION":
-        for idx, x in enumerate(content.get("items") or []):
-            text = (
-                f"[MED] t={ts} visit={vref} | "
-                f"drug={_safe_str(x.get('drug'))} | route={_safe_str(x.get('route'))} | "
-                f"dose={_safe_str(x.get('dose'))} | status={_safe_str(x.get('status'))} | "
-                f"end={_safe_str(x.get('end_timestamp'))}"
-            )
-            meta = dict(base_meta)
-            meta["item_index"] = idx
-            docs.append({"text": text, "meta": meta})
-        return docs
-
-    if et == "MICROBIOLOGY":
-        specimen = content.get("specimen") or {}
-        results = content.get("results") or {}
-        comments = results.get("comments") or []
-        text = (
-            f"[MICRO] t={ts} visit={vref} | "
-            f"spec_type={_safe_str(specimen.get('spec_type'))} | test={_safe_str(specimen.get('test_name'))} | "
-            f"negative={_safe_str(results.get('negative'))} | "
-            f"organisms={_safe_str(results.get('organisms'))} | "
-            f"comments={' '.join(map(_safe_str, comments))}"
-        )
-        docs.append({"text": text, "meta": base_meta})
-        return docs
-
-    if et == "IMAGING":
-        report = _safe_str(content.get("report"))
-        chunks = _chunk_text(report, max_chars=1200, overlap=150)
-        for k, ch in enumerate(chunks):
-            meta = dict(base_meta)
-            meta["chunk_id"] = k
-            docs.append({"text": f"[IMAGING] t={ts} visit={vref} | chunk={k+1}/{len(chunks)}: {ch}", "meta": meta})
-        return docs
-
-    if et == "PROCEDURE":
-        items = content.get("items") or []
-        text = (
-            f"[PROC] t={ts} visit={vref} | "
-            f"items={'; '.join(_safe_str(x.get('name')) for x in items)}"
-        )
-        docs.append({"text": text, "meta": base_meta})
-        return docs
-
-    brief = _safe_str(json.dumps(content, ensure_ascii=False))
-    if brief:
-        docs.append({"text": f"[{et}] t={ts} visit={vref} | {brief[:2000]}", "meta": base_meta})
-    return docs
 
 
 # =========================
@@ -366,29 +246,210 @@ def build_patient_global_stores(
     logger.info(f"[DONE] patient={patient_id} note={build_note} event={build_event} -> {base}")
     return llm.get_token_usage()
 
-from config import AgentTaskConfig
+
+def _store_done_on_disk(store_root: Path, pid: str, build_note: bool, build_event: bool) -> bool:
+    """
+    兜底：如果 report 丢了，也能通过磁盘判断是否已经构建完成。
+    判定标准：对应 index.faiss 存在（note/event 按开关）。
+    """
+    base = store_root / pid
+    ok = True
+    if build_note:
+        ok = ok and (base / "note" / "index.faiss").exists()
+    if build_event:
+        ok = ok and (base / "event" / "index.faiss").exists()
+    return ok
+
 
 if __name__ == "__main__":
-    patient_id = "P000001"
     cfg = AgentTaskConfig()
-    patients_dir = cfg.PATIENTS_DIR
-    sequence_dir = cfg.EVENT_SEQ_DIR
-    vector_store_dir = cfg.VECTOR_STORE_DIR
-    usage = {
-        "input_tokens": 0,
-        "total_tokens": 0,
-    }
-    
-    result = build_patient_global_stores(
-        patient_json_path=Path(f"{patients_dir}/{patient_id}.json"),
-        sequenced_json_path=Path(f"{sequence_dir}/{patient_id}_sequenced.json"),
-        out_root=Path(vector_store_dir),
-        emb_model=cfg.EMBEDDING_MODEL,
-        batch_size=cfg.BATCH_SIZE,
-        normalize=cfg.NORMALIZE_EMBEDDINGS,
-        build_note=True,
-        build_event=True,
+
+    # -------------------------
+    # 1) 确定要处理的 patient 列表
+    # -------------------------
+    # 推荐：仍然沿用 QUESTIONS_DIR 里的 pid 列表（与你跑 context 的一致）
+    files = list(iter_jsonl_files(cfg.QUESTIONS_DIR))
+    pids = sorted(set([f.name.split(".")[0] for f in files]))
+    if not pids:
+        logger.error(f"No pid found from QUESTIONS_DIR={cfg.QUESTIONS_DIR}")
+        raise SystemExit(1)
+
+    # -------------------------
+    # 2) pre-scan stats + sort
+    # -------------------------
+    pid_stats: List[Tuple[str, dict]] = []
+    for pid in tqdm(pids, desc="Scanning patient sizes"):
+        p_path = Path(cfg.PATIENTS_DIR) / f"{pid}.json"
+        st = patient_event_stats(p_path)
+        pid_stats.append((pid, st))
+
+    pid_stats.sort(
+        key=lambda x: (x[1].get("total_events", 0), x[1].get("file_size_bytes", 0)),
+        reverse=True,
     )
-    usage["input_tokens"] += result["embeddings"]["input_tokens"]
-    usage["total_tokens"] += result["embeddings"]["total_tokens"]
-    logger.info(f"embedding token usage: {json.dumps(usage, indent=2)}")
+
+    if cfg.DEMO_MODE:
+        top_k = cfg.DEMO_N
+        top = pid_stats[:top_k]
+        logger.info("Top patients by event_stream length (total_events desc, file_size desc):")
+        for rank, (pid, st) in enumerate(top, 1):
+            logger.info(
+                f"[{rank}] {pid} | total_events={st.get('total_events')} | "
+                f"max_visit_events={st.get('max_visit_events')} | visits={st.get('num_visits')} | "
+                f"file_size={st.get('file_size_bytes', 0) / (1024*1024):.2f} MB"
+            )
+    else:
+        top = pid_stats
+        logger.warning("DEMO_MODE is OFF, will process ALL patients sorted by size. This may take a long time!")
+
+    # -------------------------
+    # 3) resume report
+    # -------------------------
+    log_dir = Path("log")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    final_report_name = "final_report_vector_store.json"
+    report_path = log_dir / final_report_name
+
+    final_report: Dict[str, Any] = {}
+    already_run = set()
+
+    if report_path.exists():
+        try:
+            previous = json.loads(report_path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict):
+                final_report = previous
+                already_run = set(previous.keys())
+                logger.info(f"Resume enabled: loaded {len(already_run)} finished pids from {report_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load previous report {report_path}: {e}")
+
+    # -------------------------
+    # 4) filter pending（report优先；磁盘存在也跳过）
+    # -------------------------
+    build_note = True
+    build_event = True
+
+    pending: List[Tuple[str, dict]] = []
+    for pid, st in top:
+        if pid in already_run:
+            continue
+        # 兜底：磁盘已完成也跳过（避免 report 丢了重复跑）
+        if _store_done_on_disk(Path(cfg.VECTOR_STORE_DIR), pid, build_note, build_event):
+            # 写一条“磁盘判定跳过”的记录（可选）
+            final_report[pid] = {
+                "skipped": True,
+                "reason": "store_exists_on_disk",
+                "stats": st,
+            }
+            already_run.add(pid)
+            continue
+        pending.append((pid, st))
+
+    # 立即落盘一次（把 disk-skip 写进去）
+    report_path.write_text(json.dumps(final_report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if not pending:
+        logger.info("Nothing to do: all selected patients already processed (report or disk).")
+        logger.info(f"Existing report: {report_path}")
+        raise SystemExit(0)
+
+    logger.info(f"Will process {len(pending)} patients (skipping {len(top) - len(pending)} already-run).")
+
+    # -------------------------
+    # 5) token usage accumulate
+    # -------------------------
+    usage = {
+        "embeddings": {
+            "input_tokens": 0,
+            "total_tokens": 0,
+        }
+    }
+
+    # -------------------------
+    # 6) worker
+    # -------------------------
+    def _run_one(pid: str, st: dict) -> Tuple[str, dict]:
+        """
+        每个 pid：
+          - 读取 patient.json + sequenced.json
+          - 写 vector_store/{pid}/note, event
+          - 返回一个 result dict 供主线程记报告
+        """
+        patients_dir = Path(cfg.PATIENTS_DIR)
+        sequence_dir = Path(cfg.EVENT_SEQ_DIR)
+        store_root = Path(cfg.VECTOR_STORE_DIR)
+
+        patient_json = patients_dir / f"{pid}.json"
+        sequenced_json = sequence_dir / f"{pid}_sequenced.json"
+
+        if not patient_json.exists():
+            raise FileNotFoundError(f"missing patient_json: {patient_json}")
+        if not sequenced_json.exists():
+            raise FileNotFoundError(f"missing sequenced_json: {sequenced_json}")
+
+        t0 = time.time()
+        token_usage = build_patient_global_stores(
+            patient_json_path=patient_json,
+            sequenced_json_path=sequenced_json,
+            out_root=store_root,
+            emb_model=cfg.EMBEDDING_MODEL,
+            batch_size=getattr(cfg, "BATCH_SIZE", 8),
+            normalize=getattr(cfg, "NORMALIZE_EMBEDDINGS", True),
+            build_note=build_note,
+            build_event=build_event,
+        )
+        dt = time.time() - t0
+
+        # 统一返回结构：便于 resume / debug
+        result = {
+            "ok": True,
+            "seconds": dt,
+            "stats": st,
+            "store_root": str((store_root / pid).resolve()),
+            "build_note": build_note,
+            "build_event": build_event,
+            "token_usage": token_usage,  # llm.get_token_usage()
+        }
+        return pid, result
+
+    # -------------------------
+    # 7) concurrency
+    # -------------------------
+    max_workers = getattr(cfg, "MAX_WORKERS", None)
+    if not max_workers:
+        max_workers = min(8, (os.cpu_count() or 8))
+    logger.info(f"Running with max_workers={max_workers}")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_run_one, pid, st): (pid, st) for pid, st in pending}
+
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Building vector stores (concurrent)"):
+            pid, st = futs[fut]
+            try:
+                pid_done, result = fut.result()
+            except Exception as e:
+                logger.exception(f"FAILED pid={pid}: {e}")
+                final_report[pid] = {
+                    "ok": False,
+                    "error": str(e),
+                    "stats": st,
+                }
+            else:
+                final_report[pid_done] = result
+                # accumulate embeddings usage (best-effort)
+                tu = (result.get("token_usage") or {}).get("embeddings") or {}
+                usage["embeddings"]["input_tokens"] += int(tu.get("input_tokens", 0) or 0)
+                usage["embeddings"]["total_tokens"] += int(tu.get("total_tokens", 0) or 0)
+
+                logger.info(
+                    f"Done pid={pid_done}: store={result.get('store_root')} "
+                    f"emb_tokens={tu.get('total_tokens', 0)} time={result.get('seconds', 0):.1f}s"
+                )
+
+            # incremental save after each completion
+            report_path.write_text(json.dumps(final_report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    logger.info("All done (concurrent).")
+    logger.info(f"Total embedding token usage across processed patients:\n{json.dumps(usage, ensure_ascii=False, indent=2)}")
+    logger.info(f"Final report: {report_path}")
