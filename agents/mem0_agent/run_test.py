@@ -27,7 +27,8 @@ from agents.mem0_agent.core import AgentConfig
 
 def load_local_env() -> None:
     env_path = Path(__file__).parent / ".env"
-    dotenv.load_dotenv(env_path)
+    # Force local env to take precedence over repo/global .env
+    dotenv.load_dotenv(env_path, override=True)
 
 
 def build_agent():
@@ -48,6 +49,7 @@ def build_agent():
         store_observations=os.getenv("AGENT_STORE_OBS", "1") == "1",
         include_memory_in_prompt=os.getenv("AGENT_INCLUDE_MEMORY", "1") == "1",
         retrieval_policy=os.getenv("AGENT_RETRIEVAL_POLICY", "question_only"),
+        query_rewrite=os.getenv("AGENT_QUERY_REWRITE", "1") == "1",
     )
 
     return MemoryAugmentedChatAgent(
@@ -153,36 +155,39 @@ def main() -> None:
                 if index_wait > 0:
                     time.sleep(index_wait)
                 messages = [{"role": "user", "content": data}]
-                reply = agent.chat(
-                    messages=messages,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    app_id=app_id,
-                    run_id=run_id,
-                )
                 if args.debug:
-                    try:
-                        retrieved = mem.search(
-                            query=data,
-                            top_k=int(os.getenv("MEMORY_TOP_K", "5")),
-                            user_id=user_id,
-                            agent_id=agent_id,
-                            app_id=app_id,
-                            run_id=run_id,
-                        )
-                        print(
-                            json.dumps(
-                                {
-                                    "id": obj_id,
-                                    "debug_retrieved": [r.text for r in retrieved],
-                                },
-                                ensure_ascii=False,
-                            ),
-                            file=sys.stderr,
-                        )
-                    except Exception as exc:
-                        print(f"[warn] debug retrieve failed: {exc}", file=sys.stderr)
-                answers.append({"id": obj_id, "answer": reply})
+                    reply, trace = agent.chat_with_trace(
+                        messages=messages,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        app_id=app_id,
+                        run_id=run_id,
+                    )
+                else:
+                    reply = agent.chat(
+                        messages=messages,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        app_id=app_id,
+                        run_id=run_id,
+                    )
+                if args.debug:
+                    print(
+                        json.dumps(
+                            {
+                                "id": obj_id,
+                                "debug_retrieval_query": trace.retrieval_query,
+                                "debug_retrieved": [r.text for r in trace.memories],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                    )
+                out_record = {"id": obj_id, "answer": reply}
+                if args.debug:
+                    out_record["debug_retrieval_query"] = trace.retrieval_query
+                    out_record["debug_retrieved"] = [r.text for r in trace.memories]
+                answers.append(out_record)
                 continue
 
             # ignore unknown types

@@ -176,7 +176,6 @@ class Mem0MemoryProvider(MemoryProvider):
         res = self._client.add(
             messages=messages,
             user_id=user_id,
-            agent_id=agent_id,
             app_id=app_id,
             run_id=run_id,
             metadata=metadata or {},
@@ -215,19 +214,16 @@ class Mem0MemoryProvider(MemoryProvider):
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[MemorySearchResult]:
-        # Prefer explicit filters if provided; else scope with OR across entity ids.
-        # Mem0 stores memories per-entity; AND across user/agent often returns empty.
+        # Prefer explicit filters if provided; else scope retrieval by user+run+app.
         if filters is None:
-            ors: List[Dict[str, Any]] = []
-            if run_id is not None:
-                ors.append({"run_id": run_id})
+            ands: List[Dict[str, Any]] = []
             if user_id is not None:
-                ors.append({"user_id": user_id})
-            if agent_id is not None:
-                ors.append({"agent_id": agent_id})
+                ands.append({"user_id": user_id})
+            if run_id is not None:
+                ands.append({"run_id": run_id})
             if app_id is not None:
-                ors.append({"app_id": app_id})
-            filters = {"OR": ors} if ors else None
+                ands.append({"app_id": app_id})
+            filters = {"AND": ands} if ands else None
 
         threshold = float(os.getenv("MEM0_SEARCH_THRESHOLD", "0.0"))
         keyword_search = os.getenv("MEM0_KEYWORD_SEARCH", "1") == "1"
