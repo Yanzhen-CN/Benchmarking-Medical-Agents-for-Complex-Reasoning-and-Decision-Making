@@ -263,3 +263,9 @@ class AgentTaskConfig:
         self.DEMO_N: int = 5
         
         self.KEEP_LAST_N_TURNS: int = 8
+        
+        self.VECTOR_STORE_DIR: Path = Path("./agents/rag_agent/agentic_decision/vector_store")
+        self.EMBEDDING_MODEL: str = "text-embedding-v4"
+        self.BATCH_SIZE: int = 10
+        self.NORMALIZE_EMBEDDINGS: bool = True
+        self.CACHE_INDEXES: bool = True

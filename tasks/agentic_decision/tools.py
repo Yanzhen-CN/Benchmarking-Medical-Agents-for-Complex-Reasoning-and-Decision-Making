@@ -6,7 +6,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 from collections import Counter, defaultdict
 from pathlib import Path as _Path
 from util.llmUtil import LLMUtil, ChatTokenUsage
@@ -448,3 +448,110 @@ def parse_qid(qid: str) -> Dict[str, Any]:
         "subtype": subtype,
         "q_index": q_index,
     }
+
+
+# ============================================================
+# Memory builders
+# ============================================================
+
+
+def _note_dict_to_text(note: Any) -> str:
+    """
+    admission_note / discharge_note 在你的 patient json 里是 dict。
+    这里用一种朴素但稳定的“自然语言组织”：按 key 输出。
+    """
+    if note is None:
+        return ""
+    if isinstance(note, str):
+        return note.strip()
+    if isinstance(note, dict):
+        parts = []
+        for k, v in note.items():
+            if v is None:
+                continue
+            vv = v.strip() if isinstance(v, str) else str(v)
+            if not vv:
+                continue
+            parts.append(f"{k}: {vv}")
+        return "\n".join(parts).strip()
+    return str(note).strip()
+
+
+def build_note_memory_from_patient_json(
+    patient_json: Dict[str, Any],
+    *,
+    current_visit_id: str,
+) -> List[Dict[str, Any]]:
+    """
+    记忆类型1：笔记记忆
+    - 收集 current_visit 之前所有 visit 的 admission_note + discharge_note
+    - 每条记忆一条 item（visit 粒度 / note 粒度）
+    """
+    visits = patient_json.get("visits") or []
+    vid2idx = {v.get("visit_id"): i for i, v in enumerate(visits)}
+    if current_visit_id not in vid2idx:
+        raise ValueError(f"[note_memory] current_visit_id not found in patient_json: {current_visit_id}")
+    cur_idx = vid2idx[current_visit_id]
+
+    mem: List[Dict[str, Any]] = []
+    for i in range(cur_idx):
+        v = visits[i]
+        vid = v.get("visit_id")
+
+        adm = (((v.get("admission_info") or {}).get("admission_note")))
+        dis = (((v.get("discharge_info") or {}).get("discharge_note")))
+
+        adm_text = _note_dict_to_text(adm)
+        dis_text = _note_dict_to_text(dis)
+
+        if adm_text:
+            mem.append({
+                "memory_type": "note",
+                "visit_id": vid,
+                "note_type": "admission_note",
+                "text": adm_text,
+            })
+        if dis_text:
+            mem.append({
+                "memory_type": "note",
+                "visit_id": vid,
+                "note_type": "discharge_note",
+                "text": dis_text,
+            })
+    return mem
+
+
+def build_event_memory_from_sequence_json(
+    sequenced_events: List[Dict[str, Any]],
+    *,
+    visit_order: Dict[str, int],
+    current_visit_ref: str,  # 形如 "V12"
+) -> List[Dict[str, Any]]:
+    """
+    记忆类型2：事件记忆
+    - 收集 current_visit 之前所有 visit 的“每一条事件”作为单独记忆
+    - 事件来源：扁平化 sequenced json（包含 ADMISSION/DISCHARGE/各类事件）
+    """
+    if current_visit_ref not in visit_order:
+        raise ValueError(f"[event_memory] current_visit_ref not in visit_order: {current_visit_ref}")
+    cur_idx = visit_order[current_visit_ref]
+
+    mem: List[Dict[str, Any]] = []
+    for ev in sequenced_events:
+        vref = ev.get("visit_ref")
+        if vref is None:
+            continue
+        if vref not in visit_order:
+            continue
+        if visit_order[vref] >= cur_idx:
+            continue
+
+        mem.append({
+            "memory_type": "event",
+            "visit_ref": vref,
+            "event_id": ev.get("event_id"),
+            "event_type": ev.get("event_type"),
+            "timestamp": ev.get("timestamp"),
+            "content": ev.get("content"),
+        })
+    return mem

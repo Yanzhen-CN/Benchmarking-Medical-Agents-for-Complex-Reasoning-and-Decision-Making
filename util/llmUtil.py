@@ -315,7 +315,7 @@ Do not include markdown, code fences, or explanations.
         texts: Sequence[str],
         *,
         model: str = "text-embedding-v4",
-        batch_size: int = 4096,
+        batch_size: int = 512,
         normalize_newlines: bool = True,
     ) -> List[List[float]]:
         """
@@ -461,72 +461,72 @@ Do not include markdown, code fences, or explanations.
 # -----------------------------
 # Minimal self-test (optional)
 # -----------------------------
-if __name__ == "__main__":
-    # Quick smoke test:
-    #   export DASHSCOPE_API_KEY=...
-    #   python util/llmUtil.py
-    llm = LLMUtil()
-    logger.info("Running LLMUtil self-test...")
-    test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="qwen3:4b", temperature=0.0)
-    obj = llm.chat_json(
-        system_prompt="You are a JSON generator.",
-        user_text='Return {"ok": true, "x": "___", "y": "____"}',
-    )
-    print("chat_json:", obj)
-
-    vecs = llm.embed_texts(["hello", "world"])
-    print("embeddings:", len(vecs), len(vecs[0]) if vecs else 0)
-
-
-# from concurrent.futures import ThreadPoolExecutor, as_completed
-# import time
-# import json
-# import os
-    
-    
-# llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
-# def _one_job(i: int) -> dict:
-
-#     t0 = time.time()
-#     obj = llm.chat_json(
-#         system_prompt="You are a JSON generator. Output JSON only.",
-#         user_text=f'{{"job": {i}, "ok": true, "ts": "{time.time()}"}}',
-#         model=getattr(config, "model", "qwen-turbo"),
-#         temperature=0.0,
-#     )
-#     dt = time.time() - t0
-#     return {"i": i, "dt": dt, "obj": obj}
-
-# def limiter_smoke_test():
-#     # 你可以用环境变量临时调参（如果你在 LLMConfig 里接了 env）
-#     # os.environ["LLM_MAX_INFLIGHT"] = "4"
-#     # os.environ["LLM_QPS"] = "2"
-
-#     total_jobs = 1000          # 总请求数
-#     thread_workers = 20      # 启很多线程，看看 limiter 是否能“压住”
-
-#     t_all = time.time()
-#     results = []
-#     fails = 0
-
-#     with ThreadPoolExecutor(max_workers=thread_workers) as ex:
-#         futs = [ex.submit(_one_job, i) for i in range(total_jobs)]
-#         for fu in as_completed(futs):
-#             try:
-#                 r = fu.result()
-#                 results.append(r)
-#                 print(f"job {r['i']:02d} done in {r['dt']:.2f}s -> keys={list(r['obj'].keys())}")
-#             except Exception as e:
-#                 fails += 1
-#                 print("FAILED:", repr(e))
-
-#     total_dt = time.time() - t_all
-#     results.sort(key=lambda x: x["dt"])
-#     print("\n========== SUMMARY ==========")
-#     print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
-#     if results:
-#         print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
-#     print(f"Token usage:{llm.get_token_usage()}")
-
 # if __name__ == "__main__":
-#     limiter_smoke_test()
+#     # Quick smoke test:
+#     #   export DASHSCOPE_API_KEY=...
+#     #   python util/llmUtil.py
+#     llm = LLMUtil()
+#     logger.info("Running LLMUtil self-test...")
+#     test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="gpt-5.2", temperature=1.0)
+#     obj = llm.chat_json(
+#         system_prompt="You are a JSON generator.",
+#         user_text='Return {"ok": true, "x": "___", "y": "____"}',
+#     )
+#     print("chat_json:", obj)
+
+#     vecs = llm.embed_texts(["hello", "world"])
+#     print("embeddings:", len(vecs), len(vecs[0]) if vecs else 0)
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import json
+import os
+    
+    
+llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
+def _one_job(i: int) -> dict:
+
+    t0 = time.time()
+    obj = llm.chat_json(
+        system_prompt="You are a JSON generator. Output JSON only.",
+        user_text=f'{{"job": {i}, "ok": true, "ts": "{time.time()}"}}',
+        model=getattr(config, "model", "gpt-5.2"),
+        temperature=0.0,
+    )
+    dt = time.time() - t0
+    return {"i": i, "dt": dt, "obj": obj}
+
+def limiter_smoke_test():
+    # 你可以用环境变量临时调参（如果你在 LLMConfig 里接了 env）
+    # os.environ["LLM_MAX_INFLIGHT"] = "4"
+    # os.environ["LLM_QPS"] = "2"
+
+    total_jobs = 1000          # 总请求数
+    thread_workers = 20      # 启很多线程，看看 limiter 是否能“压住”
+
+    t_all = time.time()
+    results = []
+    fails = 0
+
+    with ThreadPoolExecutor(max_workers=thread_workers) as ex:
+        futs = [ex.submit(_one_job, i) for i in range(total_jobs)]
+        for fu in as_completed(futs):
+            try:
+                r = fu.result()
+                results.append(r)
+                print(f"job {r['i']:02d} done in {r['dt']:.2f}s -> keys={list(r['obj'].keys())}")
+            except Exception as e:
+                fails += 1
+                print("FAILED:", repr(e))
+
+    total_dt = time.time() - t_all
+    results.sort(key=lambda x: x["dt"])
+    print("\n========== SUMMARY ==========")
+    print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
+    if results:
+        print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
+    print(f"Token usage:{llm.get_token_usage()}")
+
+if __name__ == "__main__":
+    limiter_smoke_test()
