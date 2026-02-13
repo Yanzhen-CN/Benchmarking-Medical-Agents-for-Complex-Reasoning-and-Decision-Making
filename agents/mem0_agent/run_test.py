@@ -92,7 +92,7 @@ def main() -> None:
     load_local_env()
 
     parser = argparse.ArgumentParser(description="Run mock sequence test")
-    parser.add_argument("--task", required=True, help="task name under tasks/<task>/sequence")
+    parser.add_argument("--task", required=True, help="task name under question_data/<task>")
     parser.add_argument(
         "--items",
         required=True,
@@ -110,10 +110,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    seq_dir = ROOT / "tasks" / args.task / "sequence"
+    seq_dir = ROOT / "question_data" / args.task
 
     if args.items.strip().lower() == "all":
-        item_names = [p.stem for p in sorted(seq_dir.glob("*.json"))]
+        item_names = [p.stem for p in sorted(seq_dir.glob("*.jsonl"))]
+        if not item_names:
+            item_names = [p.stem for p in sorted(seq_dir.glob("*.json"))]
         if not item_names:
             raise SystemExit(f"No items found in {seq_dir}")
     else:
@@ -132,7 +134,9 @@ def main() -> None:
     run_id = f"{ts}-{rid}"
 
     for item in item_names:
-        path = seq_dir / f"{item}.json"
+        path = seq_dir / f"{item}.jsonl"
+        if not path.exists():
+            path = seq_dir / f"{item}.json"
         if not path.exists():
             raise SystemExit(f"Missing file: {path}")
 
