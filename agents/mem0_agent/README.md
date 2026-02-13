@@ -130,7 +130,9 @@ python run_test.py --task tests --items P0001 --no-delete
 
 ## 4) 输入格式（run_test）
 
-`tasks/<task>/sequence/<patient_id>.json` 为 JSONL，每行一个事件：
+读取路径固定为 `question_data/<task>/<patient_id>.jsonl`。
+
+每个患者文件为 JSONL（兼容 `.jsonl` / `.json` 扩展名），每行一个事件：
 
 ```json
 {"id": 0, "type": "fact", "data": "患者三天前开始发热并咳嗽。"}
