@@ -46,8 +46,11 @@ def main():
     # ================= 配置区 =================
     # 这里的列表元素必须对应 .env 中的前缀
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
+    LLM_LIST = LLM_LIST[:1]
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
     # ==========================================
+    DEMO_N = 5 # 全量运行时设为 None
+
 
     # 1. 构建模型映射表
     llm_configs = {}
@@ -68,6 +71,9 @@ def main():
         input_dir = os.path.join("context_data", sub_dir)
         
         files = glob.glob(os.path.join(input_dir, "P*.jsonl"))
+        if DEMO_N is not None:
+            files = files[:DEMO_N]
+            
         for fpath in files:
             pid = os.path.basename(fpath).replace(".jsonl", "")
             with open(fpath, 'r', encoding='utf-8') as f:
