@@ -55,7 +55,8 @@ def main():
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
     LLM_LIST = LLM_LIST[:1]  # for quick testing, only run the first model
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
-    DEMO_N = None               # set to None to process all patients
+    TASK_LIST = TASK_LIST[:1]
+    DEMO_N = 5               # set to None to process all patients
     # ==================================================
 
     # Build model configs from environment
@@ -73,8 +74,7 @@ def main():
     all_tasks = []
     for task_type in TASK_LIST:
         # Folder name mapping
-        sub_dir = task_type if "sorting" in task_type else f"visit_{task_type}"
-        input_dir = os.path.join(ROOT_DIR, "context_data", sub_dir)
+        input_dir = os.path.join(ROOT_DIR, "context_data", task_type)
         
         if not os.path.exists(input_dir):
             print(f"⚠️ Directory not found, skipping: {input_dir}")
