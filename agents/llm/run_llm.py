@@ -82,8 +82,7 @@ def main():
     all_tasks = []
     for task_type in TASK_LIST:
         # Folder name mapping
-        sub_dir = task_type if "sorting" in task_type else f"visit_{task_type}"
-        input_dir = os.path.join(ROOT_DIR, "context_data", sub_dir)
+        input_dir = os.path.join(ROOT_DIR, "context_data", task_type)
         
         if not os.path.exists(input_dir):
             print(f"⚠️ Directory not found, skipping: {input_dir}")
