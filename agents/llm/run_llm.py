@@ -12,9 +12,27 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 # Load environment variables from the root .env file
 dotenv.load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
+# ================= Configuration for cost estimation =================
+# Model price per 1K tokens (in USD). Update as needed.
+PRICE_PER_1K = {
+    "qwen-turbo": {"prompt": 0.0005, "completion": 0.0015},   # example
+    "gpt-5-mini": {"prompt": 0.00015, "completion": 0.0006},
+    "deepseek-v3-2": {"prompt": 0.00014, "completion": 0.00028},
+    "default": {"prompt": 0.0, "completion": 0.0}
+}
+# ====================================================================
+
+def calculate_cost(model_label, prompt_tokens, completion_tokens):
+    """Estimate cost in USD based on token usage and predefined prices."""
+    model_key = model_label.lower()
+    price = PRICE_PER_1K.get(model_key, PRICE_PER_1K["default"])
+    cost_prompt = (prompt_tokens / 1000) * price["prompt"]
+    cost_completion = (completion_tokens / 1000) * price["completion"]
+    return cost_prompt + cost_completion
+
 def call_llm_task(task_item, model_config):
     """
-    Execute a single LLM call. No global environment pollution.
+    Execute a single LLM call. Returns result with token usage if successful.
     """
     try:
         # Create client directly from config
@@ -32,8 +50,9 @@ def call_llm_task(task_item, model_config):
             temperature=0.1
         )
         response = completion.choices[0].message.content
-        
-        return {
+        usage = completion.usage  # Extract usage information
+
+        result = {
             "status": "success",
             "llm_label": model_config['label'],
             "task_type": task_item['task_type'],
@@ -42,6 +61,16 @@ def call_llm_task(task_item, model_config):
             "prediction": response,
             "ground_truth": task_item['ground_truth']
         }
+        if usage:
+            result["usage"] = {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens
+            }
+        else:
+            result["usage"] = None
+
+        return result
     except Exception as e:
         return {
             "status": "error", 
@@ -113,6 +142,7 @@ def main():
 
     # Concurrent execution
     results_collector = {}
+    token_usage = {}  # key: model_label, value: {"prompt": 0, "completion": 0, "total": 0}
     max_workers = int(os.getenv("MAX_WORKERS", 10))
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -128,6 +158,15 @@ def main():
                 if key not in results_collector:
                     results_collector[key] = []
                 results_collector[key].append(res)
+
+                # Accumulate token usage
+                if res.get('usage'):
+                    model = res['llm_label']
+                    if model not in token_usage:
+                        token_usage[model] = {"prompt": 0, "completion": 0, "total": 0}
+                    token_usage[model]["prompt"] += res['usage']['prompt_tokens']
+                    token_usage[model]["completion"] += res['usage']['completion_tokens']
+                    token_usage[model]["total"] += res['usage']['total_tokens']
             else:
                 print(f"❌ Failed: PID {res.get('pid')} on LLM {res.get('llm')} - {res.get('error')}")
 
@@ -149,6 +188,24 @@ def main():
                     "prediction": entry['prediction'],
                     "ground_truth": entry['ground_truth']
                 }, ensure_ascii=False) + "\n")
+
+    # Print token usage summary and calculate cost
+    print("\n💰 Token Usage and Cost Summary:")
+    total_cost = 0.0
+    for model, tokens in token_usage.items():
+        cost = calculate_cost(model, tokens["prompt"], tokens["completion"])
+        total_cost += cost
+        print(f"  {model}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}, cost=${cost:.4f}")
+    print(f"  Total cost: ${total_cost:.4f}")
+
+    # Save token usage stats to a JSON file
+    stats_path = os.path.join(final_run_dir, "token_usage.json")
+    with open(stats_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            "token_usage": token_usage,
+            "total_cost_usd": total_cost
+        }, f, indent=2)
+    print(f"📊 Token usage stats saved to {stats_path}")
 
     print(f"\n✅ All tests done. Check '{final_run_dir}' for results.")
 
