@@ -245,9 +245,20 @@ class AgentQaGenConfig:
         self.DISCHARGE_NO_MARGIN_H = 6.0        # No 采样在 (X, X+margin] 区间内（靠近但为 No）
         self.DISCHARGE_SAMPLE_K = 1             # 每个 visit 生成几个 T3-D
         
+        self.SAMPLE_QUESTIONS: bool = True
+        self.SAMPLE_RATIO: float = 0.10         # 如果 SAMPLE_QUESTIONS
+        self.SAMPLE_MODE: str = "global"        # global or per_file
+        self.SAMPLE_OUTPUT_DIR: Path = Path("./tasks/agentic_decision/questions_sampled")
+        self.SAMPLE_SEED: int = 42
+        self.SAMPLE_MIN_KEEP: int = 0             # 如果 SAMPLE_QUESTIONS，至少保留多少题（全局或每文件）
+        
 class AgentTaskConfig:
     def __init__(self):
-        self.QUESTIONS_DIR: Path = Path("./tasks/agentic_decision/questions_generated")
+        gencfg = AgentQaGenConfig()
+        if gencfg.SAMPLE_QUESTIONS:
+            self.QUESTIONS_DIR: Path = gencfg.SAMPLE_OUTPUT_DIR
+        else:
+            self.QUESTIONS_DIR: Path = Path("./tasks/agentic_decision/questions_generated")
         self.PATIENTS_DIR: Path = Path("./bench_data/patients")
         self.EVENT_SEQ_DIR: Path = Path("./bench_data/patients_sequence")
         
