@@ -10,14 +10,14 @@ from openai import OpenAI
 # Project root (two levels up from this file)
 ROOT_DIR = Path(__file__).resolve().parents[2]
 # Load environment variables from the root .env file
-dotenv.load_dotenv(ROOT_DIR / ".env", override=True)
+dotenv.load_dotenv(Path(__file__) / ".env", override=True)
 
 def call_llm_task(task_item, model_config):
     """
     Execute a single LLM call. No global environment pollution.
     """
     try:
-        # Create client directly from config, no need to touch os.environ
+        # Create client directly from config
         client = OpenAI(
             api_key=model_config['api_key'],
             base_url=model_config['base_url']
@@ -55,26 +55,35 @@ def main():
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
     LLM_LIST = LLM_LIST[:1]  # for quick testing, only run the first model
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
-    TASK_LIST = TASK_LIST[:1]
     DEMO_N = 5               # set to None to process all patients
     # ==================================================
 
-    # Build model configs from environment
+    # Build model configs and filter out those without API key
     llm_configs = {}
+    valid_llm_names = []
     for name in LLM_LIST:
+        api_key = os.getenv(f"{name}_API_KEY")
+        base_url = os.getenv(f"{name}_BASE_URL")
+        if not api_key:
+            print(f"⚠️ Skipping {name}: API Key not found in environment.")
+            continue
         llm_configs[name] = {
             "label": name.lower().replace("_", "-"), 
-            "api_key": os.getenv(f"{name}_API_KEY"),
-            "base_url": os.getenv(f"{name}_BASE_URL")
+            "api_key": api_key,
+            "base_url": base_url
         }
-        if not llm_configs[name]["api_key"]:
-            print(f"⚠️ Warning: {name} API Key not found in .env")
+        valid_llm_names.append(name)
+
+    if not valid_llm_names:
+        print("❌ No valid LLM configurations. Exiting.")
+        return
 
     # Scan and build task pool
     all_tasks = []
     for task_type in TASK_LIST:
         # Folder name mapping
-        input_dir = os.path.join(ROOT_DIR, "context_data", task_type)
+        sub_dir = task_type if "sorting" in task_type else f"visit_{task_type}"
+        input_dir = os.path.join(ROOT_DIR, "context_data", sub_dir)
         
         if not os.path.exists(input_dir):
             print(f"⚠️ Directory not found, skipping: {input_dir}")
@@ -90,7 +99,7 @@ def main():
                 task_lines = [json.loads(line) for line in f if line.strip()]
             
             for item in task_lines:
-                for llm_name in LLM_LIST:
+                for llm_name in valid_llm_names:   # use only valid models
                     all_tasks.append({
                         "task_type": task_type,
                         "pid": pid,
@@ -100,7 +109,7 @@ def main():
                         "llm_name": llm_name
                     })
 
-    print(f"🚀 Benchmarking {len(LLM_LIST)} models on {len(TASK_LIST)} tasks.")
+    print(f"🚀 Benchmarking {len(valid_llm_names)} models on {len(TASK_LIST)} tasks.")
     print(f"📦 Total Parallel Requests: {len(all_tasks)}")
 
     # Concurrent execution
