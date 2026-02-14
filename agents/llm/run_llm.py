@@ -3,6 +3,8 @@ import json
 import glob
 import yaml
 import dotenv
+import time
+import random
 from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,48 +34,64 @@ def load_config(config_path):
     print(f"⚠️ Config file not found: {config_path}. Using default settings.")
     return default
 
-def call_llm_task(task_item, model_config):
-    """Execute a single LLM call and return result with token usage."""
-    try:
-        client = OpenAI(
-            api_key=model_config['api_key'],
-            base_url=model_config['base_url']
-        )
-        model_id = os.getenv(f"{task_item['llm_name'].upper()}_MODEL_ID", model_config['label'])
+def call_llm_task(task_item, model_config, max_retries=3):
+    """Execute a single LLM call with retry on rate limit errors."""
+    for attempt in range(max_retries):
+        try:
+            client = OpenAI(
+                api_key=model_config['api_key'],
+                base_url=model_config['base_url']
+            )
+            model_id = os.getenv(f"{task_item['llm_name'].upper()}_MODEL_ID", model_config['label'])
 
-        completion = client.chat.completions.create(
-            model=model_id,
-            messages=task_item['messages'],
-            temperature=0.1
-        )
-        response = completion.choices[0].message.content
-        usage = completion.usage
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=task_item['messages'],
+                temperature=0.1
+            )
+            response = completion.choices[0].message.content
+            usage = completion.usage
 
-        result = {
-            "status": "success",
-            "llm_label": model_config['label'],
-            "task_type": task_item['task_type'],
-            "pid": task_item['pid'],
-            "id": task_item['id'],
-            "prediction": response,
-            "ground_truth": task_item['ground_truth']
-        }
-        if usage:
-            result["usage"] = {
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens
+            result = {
+                "status": "success",
+                "llm_label": model_config['label'],
+                "task_type": task_item['task_type'],
+                "pid": task_item['pid'],
+                "id": task_item['id'],
+                "prediction": response,
+                "ground_truth": task_item['ground_truth']
             }
-        else:
-            result["usage"] = None
-        return result
-    except Exception as e:
-        return {
-            "status": "error",
-            "pid": task_item['pid'],
-            "llm": model_config['label'],
-            "error": str(e)
-        }
+            if usage:
+                result["usage"] = {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens
+                }
+            else:
+                result["usage"] = None
+            return result
+        except Exception as e:
+            # Check for rate limit error (429)
+            status_code = getattr(e, 'status_code', None)
+            if status_code == 429:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"⚠️ Rate limit hit for {model_config['label']}, retrying in {wait_time:.2f}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                # Other errors: return immediately
+                return {
+                    "status": "error",
+                    "pid": task_item['pid'],
+                    "llm": model_config['label'],
+                    "error": str(e)
+                }
+    # Retries exhausted
+    return {
+        "status": "error",
+        "pid": task_item['pid'],
+        "llm": model_config['label'],
+        "error": "Max retries exceeded due to rate limit."
+    }
 
 def main():
     # Load configuration
@@ -181,7 +199,7 @@ def main():
             print(f"  {model} | {task}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
 
     # Save token usage to separate files
-    stats_dir = os.path.join(ROOT_DIR, "agents",  "llm", "usage")
+    stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
     os.makedirs(stats_dir, exist_ok=True)
     for model, tasks in token_usage.items():
         for task, tokens in tasks.items():
