@@ -12,23 +12,6 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 # Load environment variables from the root .env file
 dotenv.load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-# ================= Configuration for cost estimation =================
-# Model price per 1K tokens (in USD). Update as needed.
-PRICE_PER_1K = {
-    "qwen-turbo": {"prompt": 0.0005, "completion": 0.0015},   # example
-    "gpt-5-mini": {"prompt": 0.00015, "completion": 0.0006},
-    "deepseek-v3-2": {"prompt": 0.00014, "completion": 0.00028},
-    "default": {"prompt": 0.0, "completion": 0.0}
-}
-# ====================================================================
-
-def calculate_cost(model_label, prompt_tokens, completion_tokens):
-    """Estimate cost in USD based on token usage and predefined prices."""
-    model_key = model_label.lower()
-    price = PRICE_PER_1K.get(model_key, PRICE_PER_1K["default"])
-    cost_prompt = (prompt_tokens / 1000) * price["prompt"]
-    cost_completion = (completion_tokens / 1000) * price["completion"]
-    return cost_prompt + cost_completion
 
 def call_llm_task(task_item, model_config):
     """
@@ -84,6 +67,7 @@ def main():
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
     LLM_LIST = LLM_LIST[:1]  # for quick testing, only run the first model
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
+    TASK_LIST = TASK_LIST[:1]
     DEMO_N = 5               # set to None to process all patients
     # ==================================================
 
@@ -189,21 +173,16 @@ def main():
                     "ground_truth": entry['ground_truth']
                 }, ensure_ascii=False) + "\n")
 
-    # Print token usage summary and calculate cost
-    print("\n💰 Token Usage and Cost Summary:")
-    total_cost = 0.0
+    # Print token usage summary (without cost)
+    print("\n🔢 Token Usage Summary:")
     for model, tokens in token_usage.items():
-        cost = calculate_cost(model, tokens["prompt"], tokens["completion"])
-        total_cost += cost
-        print(f"  {model}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}, cost=${cost:.4f}")
-    print(f"  Total cost: ${total_cost:.4f}")
+        print(f"  {model}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
 
     # Save token usage stats to a JSON file
     stats_path = os.path.join(final_run_dir, "token_usage.json")
     with open(stats_path, 'w', encoding='utf-8') as f:
         json.dump({
-            "token_usage": token_usage,
-            "total_cost_usd": total_cost
+            "token_usage": token_usage
         }, f, indent=2)
     print(f"📊 Token usage stats saved to {stats_path}")
 
