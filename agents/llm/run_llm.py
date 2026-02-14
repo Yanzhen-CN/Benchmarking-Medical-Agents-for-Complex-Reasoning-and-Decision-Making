@@ -55,7 +55,7 @@ def main():
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
     LLM_LIST = LLM_LIST[:1]  # for quick testing, only run the first model
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
-    DEMO_N = 5               # set to None to process all patients
+    DEMO_N = None               # set to None to process all patients
     # ==================================================
 
     # Build model configs from environment
