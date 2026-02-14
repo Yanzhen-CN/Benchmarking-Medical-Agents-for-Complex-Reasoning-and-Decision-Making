@@ -5,25 +5,34 @@ import dotenv
 from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# 导入你的 Provider
-from agents.mem0_agent import OpenAICompatibleLLMProvider
+# 彻底干掉 mem0，直接用官方轻量级客户端
+from openai import OpenAI
 
-# 1. 加载环境变量
-dotenv.load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+# 1. 锁定项目的绝对根目录 (llm 文件夹的上一级)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+# 加载根目录的环境变量
+dotenv.load_dotenv(ROOT_DIR / ".env", override=True)
 
 def call_llm_task(task_item, model_config):
     """
-    具体的执行单元
+    具体的执行单元：完全不污染全局环境变量，安全并发
     """
-    # 在线程内局部设置环境变量，防止 Key 冲突
-    # 注意：Provider 初始化必须在环境变量设置之后
-    os.environ["OPENAI_API_KEY"] = model_config['api_key']
-    os.environ["OPENAI_BASE_URL"] = model_config['base_url']
-    
     try:
-        # 实例化 Provider
-        llm = OpenAICompatibleLLMProvider()
-        response = llm.generate_response(task_item['messages'])
+        # 直接把配置喂给 Client，不需要碰 os.environ
+        client = OpenAI(
+            api_key=model_config['api_key'],
+            base_url=model_config['base_url']
+        )
+        
+        # 允许在 .env 中指定真实的模型名称，如果没有就用 label
+        model_id = os.getenv(f"{task_item['llm_name'].upper()}_MODEL_ID", model_config['label'])
+
+        completion = client.chat.completions.create(
+            model=model_id,
+            messages=task_item['messages'],
+            temperature=0.1
+        )
+        response = completion.choices[0].message.content
         
         return {
             "status": "success",
@@ -44,19 +53,17 @@ def call_llm_task(task_item, model_config):
 
 def main():
     # ================= 配置区 =================
-    # 这里的列表元素必须对应 .env 中的前缀
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
-    LLM_LIST = LLM_LIST[:1]
+    LLM_LIST = LLM_LIST[:1]  # 测试时只跑第一个
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
     # ==========================================
     DEMO_N = 5 # 全量运行时设为 None
-
 
     # 1. 构建模型映射表
     llm_configs = {}
     for name in LLM_LIST:
         llm_configs[name] = {
-            "label": name.lower().replace("_", "-"), # 文件夹命名更美观
+            "label": name.lower().replace("_", "-"), 
             "api_key": os.getenv(f"{name}_API_KEY"),
             "base_url": os.getenv(f"{name}_BASE_URL")
         }
@@ -68,8 +75,13 @@ def main():
     for task_type in TASK_LIST:
         # 适配文件夹名称
         sub_dir = task_type if "sorting" in task_type else f"visit_{task_type}"
-        input_dir = os.path.join("context_data", sub_dir)
+        # 回到根目录找 context_data
+        input_dir = os.path.join(ROOT_DIR, "context_data", sub_dir)
         
+        if not os.path.exists(input_dir):
+            print(f"⚠️ 找不到目录跳过: {input_dir}")
+            continue
+
         files = glob.glob(os.path.join(input_dir, "P*.jsonl"))
         if DEMO_N is not None:
             files = files[:DEMO_N]
@@ -89,8 +101,6 @@ def main():
                         "ground_truth": item['ground_truth'],
                         "llm_name": llm_name
                     })
-
-    
 
     print(f"🚀 Benchmarking {len(LLM_LIST)} models on {len(TASK_LIST)} tasks.")
     print(f"📦 Total Parallel Requests: {len(all_tasks)}")
@@ -115,10 +125,11 @@ def main():
             else:
                 print(f"❌ Failed: PID {res.get('pid')} on LLM {res.get('llm')} - {res.get('error')}")
 
-    # 4. 结果聚合持久化
+    # 4. 结果聚合持久化 (直接输出到根目录的 run_llm)
+    final_run_dir = os.path.join(ROOT_DIR, "run_llm")
+    
     for (t_name, m_label, pid), data_list in results_collector.items():
-        # 结果存放在 run_llm / task / model / pid.jsonl
-        output_dir = os.path.join("run_llm", t_name, m_label)
+        output_dir = os.path.join(final_run_dir, t_name, m_label)
         os.makedirs(output_dir, exist_ok=True)
         
         # 确保同一个 PID 下的 ID 是顺序的
@@ -133,7 +144,7 @@ def main():
                     "ground_truth": entry['ground_truth']
                 }, ensure_ascii=False) + "\n")
 
-    print(f"\n✅ All tests done. Check 'run_llm/' for results.")
+    print(f"\n✅ All tests done. Check '{final_run_dir}' for results.")
 
 if __name__ == "__main__":
     main()
