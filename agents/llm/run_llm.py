@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 彻底干掉 mem0，直接用官方轻量级客户端
 from openai import OpenAI
 
-# 1. 锁定项目的绝对根目录 (llm 文件夹的上一级)
-ROOT_DIR = Path(__file__).resolve().parent.parent
+# 1. 锁定项目的绝对根目录 (llm 文件夹的上两级)
+ROOT_DIR = Path(__file__).resolve().parents[2]
 # 加载根目录的环境变量
 dotenv.load_dotenv(ROOT_DIR / ".env", override=True)
 
