@@ -66,9 +66,9 @@ def main():
     # ================= Configuration =================
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
     LLM_LIST = LLM_LIST[:1]  # for quick testing, only run the first model
-    TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
+    TASK_LIST = ["trajectory_sorting", "visit_cloze"]
     TASK_LIST = TASK_LIST[:1]
-    DEMO_N = 5               # set to None to process all patients
+    DEMO_N = 1               # set to None to process all patients
     # ==================================================
 
     # Build model configs and filter out those without API key
@@ -126,7 +126,8 @@ def main():
 
     # Concurrent execution
     results_collector = {}
-    token_usage = {}  # key: model_label, value: {"prompt": 0, "completion": 0, "total": 0}
+    # token_usage[model_label][task_type] = {"prompt":..., "completion":..., "total":...}
+    token_usage = {}
     max_workers = int(os.getenv("MAX_WORKERS", 10))
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -143,14 +144,17 @@ def main():
                     results_collector[key] = []
                 results_collector[key].append(res)
 
-                # Accumulate token usage
+                # Accumulate token usage by model and task
                 if res.get('usage'):
                     model = res['llm_label']
+                    task = res['task_type']
                     if model not in token_usage:
-                        token_usage[model] = {"prompt": 0, "completion": 0, "total": 0}
-                    token_usage[model]["prompt"] += res['usage']['prompt_tokens']
-                    token_usage[model]["completion"] += res['usage']['completion_tokens']
-                    token_usage[model]["total"] += res['usage']['total_tokens']
+                        token_usage[model] = {}
+                    if task not in token_usage[model]:
+                        token_usage[model][task] = {"prompt": 0, "completion": 0, "total": 0}
+                    token_usage[model][task]["prompt"] += res['usage']['prompt_tokens']
+                    token_usage[model][task]["completion"] += res['usage']['completion_tokens']
+                    token_usage[model][task]["total"] += res['usage']['total_tokens']
             else:
                 print(f"❌ Failed: PID {res.get('pid')} on LLM {res.get('llm')} - {res.get('error')}")
 
@@ -173,20 +177,35 @@ def main():
                     "ground_truth": entry['ground_truth']
                 }, ensure_ascii=False) + "\n")
 
-    # Print token usage summary (without cost)
+    # Print token usage summary
     print("\n🔢 Token Usage Summary:")
-    for model, tokens in token_usage.items():
-        print(f"  {model}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
+    for model, tasks in token_usage.items():
+        for task, tokens in tasks.items():
+            print(f"  {model} | {task}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
 
-    # Save token usage stats to a JSON file
-    stats_path = os.path.join(final_run_dir, "token_usage.json")
-    with open(stats_path, 'w', encoding='utf-8') as f:
-        json.dump({
-            "token_usage": token_usage
-        }, f, indent=2)
-    print(f"📊 Token usage stats saved to {stats_path}")
+    # Save token usage stats to separate files for each model and task
+    # Create a "llm" folder at the project root (same level as run_llm)
+    stats_base_dir = os.path.join(ROOT_DIR, "llm")
+    os.makedirs(stats_base_dir, exist_ok=True)
 
-    print(f"\n✅ All tests done. Check '{final_run_dir}' for results.")
+    for model, tasks in token_usage.items():
+        for task, tokens in tasks.items():
+            # Filename: model_task_usage_summary.json
+            safe_model = model.replace("/", "_")  # in case model name contains slash
+            safe_task = task.replace("/", "_")
+            filename = f"{safe_model}_{safe_task}_usage_summary.json"
+            filepath = os.path.join(stats_base_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "model": model,
+                    "task": task,
+                    "prompt_tokens": tokens["prompt"],
+                    "completion_tokens": tokens["completion"],
+                    "total_tokens": tokens["total"]
+                }, f, indent=2)
+            print(f"📊 Token usage stats saved to {filepath}")
+
+    print(f"\n✅ All tests done. Check '{final_run_dir}' for results and '{stats_base_dir}' for token stats.")
 
 if __name__ == "__main__":
     main()
