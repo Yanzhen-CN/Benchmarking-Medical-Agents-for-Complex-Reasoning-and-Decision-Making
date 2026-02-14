@@ -10,7 +10,7 @@ from openai import OpenAI
 # Project root (two levels up from this file)
 ROOT_DIR = Path(__file__).resolve().parents[2]
 # Load environment variables from the root .env file
-dotenv.load_dotenv(Path(__file__) / ".env", override=True)
+dotenv.load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 def call_llm_task(task_item, model_config):
     """
