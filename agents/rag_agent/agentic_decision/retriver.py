@@ -198,7 +198,7 @@ class PatientRetriever:
 
         # faiss top
         prefetch_k = max(k, int(prefetch_k))
-        scores, ids = index.search(q, x=prefetch_k)
+        scores, ids = index.search(x=q, k=prefetch_k)
 
         cutoff_vi = None
         cutoff_ts = None

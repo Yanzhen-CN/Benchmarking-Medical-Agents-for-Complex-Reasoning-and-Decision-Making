@@ -263,6 +263,7 @@ Do not include markdown, code fences, or explanations.
             sys = system_prompt.strip()
 
         last_err: Optional[str] = None
+        text = None
         for attempt in range(1, self.max_retries + 1):
             messages = [
                 {"role": "system", "content": sys},
@@ -319,6 +320,7 @@ Do not include markdown, code fences, or explanations.
         enable_thinking: bool = False,
     ) -> Dict[str, Any]:
         messages = copy.deepcopy(messages)
+        text, last_err = None, None
         for i in range(self.max_retries):
             try:
                 text = self.chat(
