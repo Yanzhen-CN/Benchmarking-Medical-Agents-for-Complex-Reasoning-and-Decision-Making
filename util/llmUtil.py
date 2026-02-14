@@ -305,6 +305,54 @@ Do not include markdown, code fences, or explanations.
                 _retry_sleep(attempt)
 
         raise RuntimeError(f"chat_json failed after {self.max_retries} retries. Last error: {last_err}")
+    
+    def chat_json_ctx(self,
+        messages: List[Dict[str, str]],
+        *,
+        model: str = config.chat_model,
+        temperature: float = 0.0,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        strict_only_json: bool = True,
+        normalize_placeholders: bool = True,
+        extra: Optional[Dict[str, Any]] = None,
+        enable_thinking: bool = False,
+    ) -> Dict[str, Any]:
+        messages = copy.deepcopy(messages)
+        for i in range(self.max_retries):
+            try:
+                text = self.chat(
+                    messages=messages,
+                    model=model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    extra=extra,
+                    enable_thinking=enable_thinking,
+                )
+                cand = _extract_json_candidate(text) or text.strip()
+
+                parsed = json.loads(cand)
+                if normalize_placeholders:
+                    parsed = _normalize_placeholders(parsed)
+                return parsed  # type: ignore[return-value]
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning(f"chat_json_ctx failed to parse JSON: {last_err}")
+                if e == json.JSONDecodeError:
+                    logger.warning(f"Response text was: {text}")
+                repair_user = (
+                    "Your output could not be parsed as JSON.\n"
+                    f"Error: {last_err}\n"
+                    "Please output ONLY corrected valid JSON that matches the required schema.\n"
+                    "Do not add any extra text.\n"
+                    "Original task input was the same as the previous attempt."
+                )
+                # small backoff
+                messages.append({"role": "user", "content": repair_user})
+                _retry_sleep(i + 1)
+        raise RuntimeError(f"chat_json_ctx failed after {self.max_retries} retries. Last error: {last_err}")
+            
 
 
     # -----------------------------

@@ -63,6 +63,7 @@ class MemoryAugmentedChatAgent:
         agent_id: Optional[str] = None,
         app_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json: Optional[bool] = False,
     ) -> str:
         reply, _ = self.chat_with_trace(
             messages=messages,
@@ -70,6 +71,7 @@ class MemoryAugmentedChatAgent:
             agent_id=agent_id,
             app_id=app_id,
             run_id=run_id,
+            json=json,
         )
         return reply
 
@@ -81,6 +83,7 @@ class MemoryAugmentedChatAgent:
         agent_id: Optional[str] = None,
         app_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json: Optional[bool] = False,
     ) -> tuple[str, RetrievalTrace]:
         if not messages:
             raise ValueError("messages cannot be empty")
@@ -109,7 +112,11 @@ class MemoryAugmentedChatAgent:
             )
 
         prompt_messages = self._compose_prompt(messages, memories)
-        reply = self._llm.chat(prompt_messages)
+        prompt_messages[0] = messages[0] 
+        if not json:
+            reply = self._llm.chat(prompt_messages)
+        else:
+            reply = self._llm.chat_json_ctx(prompt_messages)
 
         self._write_memory(
             messages=messages,
@@ -172,7 +179,7 @@ class MemoryAugmentedChatAgent:
             return query
 
     def _compose_prompt(
-        self, messages: List[Dict[str, str]], memories: List[MemorySearchResult]
+        self, messages: List[Dict[str, str]], memories: List[MemorySearchResult], max_recent_turns: Optional[int] = None
     ) -> List[Dict[str, str]]:
         prompt: List[Dict[str, str]] = [{"role": "system", "content": self._config.system_prompt}]
 
