@@ -24,9 +24,9 @@ logger = logUtil.setup_logger()
 # ---- LLM Provider (OpenAI-compatible) ----
 from agents.mem0_agent import OpenAICompatibleLLMProvider  # reuse your provider
 # ---- Context builder (your existing API) ----
-from get_messages_for_eval import get_memory_and_context_for_qid
-
-
+from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_for_qid
+from tasks.agentic_decision.eval_utils import *
+from tasks.agentic_decision.prompts import get_agent_qa_prompt, AGENT_ACTION_PROMPT
 # ============================================================
 # IO
 # ============================================================
@@ -79,62 +79,6 @@ def normalize_messages(msgs: List[Dict[str, Any]], *, max_chars: int = 12000) ->
             content = content[:max_chars] + "\n...[TRUNCATED]..."
         out.append({"role": role, "content": content})
     return out
-
-
-# ============================================================
-# Build question prompt (MCQ)
-# ============================================================
-
-def format_mcq_user_content(q: Dict[str, Any]) -> str:
-    question = q.get("question", "")
-    if not isinstance(question, str):
-        question = _to_str(question)
-
-    options = q.get("options") or []
-    if not isinstance(options, list):
-        options = []
-
-    lines = [question.strip(), "", "Options:"]
-    for i, opt in enumerate(options):
-        if not isinstance(opt, str):
-            opt = _to_str(opt)
-        lines.append(f"{i+1}. {opt}")
-    lines += [
-        "",
-        "Instruction: Answer with EXACTLY one option string from the list above (copy-paste).",
-    ]
-    return "\n".join(lines)
-
-
-def extract_pred_option(reply: Any, options: List[str]) -> str:
-    r = reply if isinstance(reply, str) else _to_str(reply)
-    r_strip = r.strip()
-    r_low = r_strip.lower()
-
-    # exact match
-    for opt in options:
-        if isinstance(opt, str) and opt.strip().lower() == r_low:
-            return opt
-
-    # substring match (first hit)
-    for opt in options:
-        if isinstance(opt, str) and opt.strip() and opt.strip().lower() in r_low:
-            return opt
-
-    return r_strip
-
-
-def score_weighted_acc(gt_answer: Any, pred: str) -> float:
-    """
-    Supports:
-      - gt_answer: str
-      - gt_answer: dict {option_str: weight, ...}
-    """
-    if isinstance(gt_answer, dict):
-        return float(gt_answer.get(pred, 0.0) or 0.0)
-    if isinstance(gt_answer, str):
-        return 1.0 if pred == gt_answer else 0.0
-    return 0.0
 
 
 # ============================================================
@@ -261,7 +205,7 @@ def llm_chat_once(
     model: Optional[str] = None,
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
-) -> str:
+) -> Dict[str, Any]:
     """
     Wrapper for your OpenAICompatibleLLMProvider.
     Adjust this function if your provider uses different method signature.
@@ -273,7 +217,7 @@ def llm_chat_once(
     kwargs["temperature"] = temperature
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-    return llm.chat(messages=messages, **kwargs)  # type: ignore
+    return llm.chat_json_ctx(messages=messages, **kwargs)  # type: ignore
 
 
 # ============================================================
@@ -284,9 +228,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions_jsonl", type=str, required=True, help="A single patient question jsonl (e.g. P000001.jsonl)")
     ap.add_argument("--memory_type", type=str, default="event", choices=["event", "note"], help="Which memory type get_memory_and_context_for_qid uses")
-    ap.add_argument("--mem_chars", type=int, default=24000, help="Total char budget for longitudinal supplement block")
-    ap.add_argument("--item_chars", type=int, default=900, help="Max chars per memory item")
-    ap.add_argument("--ctx_msg_chars", type=int, default=12000, help="Max chars per existing context message content")
+    ap.add_argument("--mem_chars", type=int, default=64000, help="Total char budget for longitudinal supplement block")
+    ap.add_argument("--item_chars", type=int, default=64000, help="Max chars per memory item")
+    ap.add_argument("--ctx_msg_chars", type=int, default=64000, help="Max chars per existing context message content")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--max_tokens", type=int, default=512)
     ap.add_argument("--model", type=str, default=os.getenv("LLM_MODEL", ""), help="Optional model override")
@@ -357,10 +301,15 @@ def main() -> None:
         # 4) build user MCQ
         user_content = format_mcq_user_content(q)
 
-        # 5) final messages: context + system supplement + user question
-        messages = ctx + [{"role": "system", "content": supp_text}, {"role": "user", "content": user_content}]
+        # 5) final messages: context + system supplement + user question        
+        messages = [
+            {"role": "system", "content": AGENT_ACTION_PROMPT}, 
+            {"role": "system", "content": supp_text}
+        ] + ctx[1:] + [
+            get_agent_qa_prompt(),
+            {"role": "user", "content": user_content}
+        ]
         messages = normalize_messages(messages, max_chars=args.ctx_msg_chars)  # safety re-normalize
-
         # 6) call llm
         try:
             reply = llm_chat_once(
@@ -370,6 +319,7 @@ def main() -> None:
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
             )
+            reply = reply["answer"] if isinstance(reply, dict) and "answer" in reply else [str(reply)]
         except Exception as e:
             # record failure but continue
             rec = {
@@ -382,8 +332,7 @@ def main() -> None:
             records.append(rec)
             continue
 
-        pred = extract_pred_option(reply, options)
-        score = score_weighted_acc(gt, pred)
+        score = score_weighted_acc(gt, pred_list=reply)
 
         scores_by_type[qtype].append(score)
         records.append(
@@ -391,7 +340,7 @@ def main() -> None:
                 "qid": qid,
                 "qtype": qtype,
                 "memory_type": args.memory_type,
-                "pred": pred,
+                "pred": reply,
                 "score": score,
                 "gt": gt,
                 "supp_meta": supp_meta,

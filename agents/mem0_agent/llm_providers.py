@@ -14,6 +14,9 @@ class LLMProvider:
 
     def chat_json(self, system_prompt: str, user_text: str, **kwargs: Any) -> Any:
         raise NotImplementedError
+    
+    def chat_json_ctx(self, messages: List[Dict[str, str]], **kwargs: Any) -> Any:
+        raise NotImplementedError
 
 
 class OpenAICompatibleLLMProvider(LLMProvider):
@@ -48,3 +51,13 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             model=model,
             temperature=temperature,
         )
+    
+    def chat_json_ctx(self, messages: List[Dict[str, str]], **kwargs: Any) -> Any:
+        model = kwargs.pop("model", self._config.chat_model)
+        temperature = kwargs.pop("temperature", 0.0)
+        return self._llm.chat_json_ctx(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+        )
+        
