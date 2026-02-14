@@ -5,26 +5,25 @@ import dotenv
 from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# 彻底干掉 mem0，直接用官方轻量级客户端
 from openai import OpenAI
 
-# 1. 锁定项目的绝对根目录 (llm 文件夹的上两级)
+# Project root (two levels up from this file)
 ROOT_DIR = Path(__file__).resolve().parents[2]
-# 加载根目录的环境变量
+# Load environment variables from the root .env file
 dotenv.load_dotenv(ROOT_DIR / ".env", override=True)
 
 def call_llm_task(task_item, model_config):
     """
-    具体的执行单元：完全不污染全局环境变量，安全并发
+    Execute a single LLM call. No global environment pollution.
     """
     try:
-        # 直接把配置喂给 Client，不需要碰 os.environ
+        # Create client directly from config, no need to touch os.environ
         client = OpenAI(
             api_key=model_config['api_key'],
             base_url=model_config['base_url']
         )
         
-        # 允许在 .env 中指定真实的模型名称，如果没有就用 label
+        # Allow overriding the actual model name via .env (e.g., QWEN_TURBO_MODEL_ID)
         model_id = os.getenv(f"{task_item['llm_name'].upper()}_MODEL_ID", model_config['label'])
 
         completion = client.chat.completions.create(
@@ -52,14 +51,14 @@ def call_llm_task(task_item, model_config):
         }
 
 def main():
-    # ================= 配置区 =================
+    # ================= Configuration =================
     LLM_LIST = ["QWEN_TURBO", "GPT5_MINI", "DEEPSEEK_V3_2"]
-    LLM_LIST = LLM_LIST[:1]  # 测试时只跑第一个
+    LLM_LIST = LLM_LIST[:1]  # for quick testing, only run the first model
     TASK_LIST = ["trajectory_sorting", "visit_cloze"] 
-    # ==========================================
-    DEMO_N = 5 # 全量运行时设为 None
+    DEMO_N = 5               # set to None to process all patients
+    # ==================================================
 
-    # 1. 构建模型映射表
+    # Build model configs from environment
     llm_configs = {}
     for name in LLM_LIST:
         llm_configs[name] = {
@@ -70,16 +69,15 @@ def main():
         if not llm_configs[name]["api_key"]:
             print(f"⚠️ Warning: {name} API Key not found in .env")
 
-    # 2. 扫描并构建任务池
+    # Scan and build task pool
     all_tasks = []
     for task_type in TASK_LIST:
-        # 适配文件夹名称
+        # Folder name mapping
         sub_dir = task_type if "sorting" in task_type else f"visit_{task_type}"
-        # 回到根目录找 context_data
         input_dir = os.path.join(ROOT_DIR, "context_data", sub_dir)
         
         if not os.path.exists(input_dir):
-            print(f"⚠️ 找不到目录跳过: {input_dir}")
+            print(f"⚠️ Directory not found, skipping: {input_dir}")
             continue
 
         files = glob.glob(os.path.join(input_dir, "P*.jsonl"))
@@ -105,7 +103,7 @@ def main():
     print(f"🚀 Benchmarking {len(LLM_LIST)} models on {len(TASK_LIST)} tasks.")
     print(f"📦 Total Parallel Requests: {len(all_tasks)}")
 
-    # 3. 高并发执行
+    # Concurrent execution
     results_collector = {}
     max_workers = int(os.getenv("MAX_WORKERS", 10))
     
@@ -125,14 +123,14 @@ def main():
             else:
                 print(f"❌ Failed: PID {res.get('pid')} on LLM {res.get('llm')} - {res.get('error')}")
 
-    # 4. 结果聚合持久化 (直接输出到根目录的 run_llm)
+    # Save results to run_llm/ under the project root
     final_run_dir = os.path.join(ROOT_DIR, "run_llm")
     
     for (t_name, m_label, pid), data_list in results_collector.items():
         output_dir = os.path.join(final_run_dir, t_name, m_label)
         os.makedirs(output_dir, exist_ok=True)
         
-        # 确保同一个 PID 下的 ID 是顺序的
+        # Ensure entries are sorted by id
         data_list.sort(key=lambda x: x['id'])
         
         out_path = os.path.join(output_dir, f"{pid}.jsonl")
