@@ -23,7 +23,7 @@ def generate_cloze_context(input_dir, output_dir):
                 messages = [
                     {
                         "role": "system", 
-                        "content": "You are analyzing a patient's clinical event stream. Some key events are missing, marked as [GAP]. Predict the missing events based on the provided context."
+                        "content": "You are analyzing a patient's clinical event stream. Some key events are missing, marked as [GAP]. Fill in the missing events based on the provided context. Think step by step to ensure accuracy: first understand the clinical timeline, identify patterns, then infer the most appropriate events to complete the sequence. Output only the completed event stream in the required format."
                     }
                 ]
                 

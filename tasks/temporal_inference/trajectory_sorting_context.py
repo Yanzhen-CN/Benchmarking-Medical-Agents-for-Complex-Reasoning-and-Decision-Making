@@ -27,7 +27,7 @@ def generate_sorting_context(input_dir, output_dir):
                 messages = [
                     {
                         "role": "system", 
-                        "content": "You are a medical logic expert. Your task is to arrange the following disjointed clinical snippets in chronological order based on clinical progression and logic."
+                        "content": "You are a medical logic expert. Your task is to arrange the following disjointed clinical snippets in chronological order based on clinical progression and logic. Think step by step: first identify key events (diagnosis, surgeries, treatments, complications, admissions/discharges), then determine their temporal relationships, and finally output the sorted sequence. Provide your reasoning internally, but output only the final JSON list of keys."
                     },
                     {
                         "role": "user", 
