@@ -1,0 +1,16 @@
+# 要测试的模型列表（与 .env 中的 API Key 名称对应）
+models:
+  - QWEN_TURBO
+  # - GPT5_MINI        # 注释掉即可跳过
+  # - DEEPSEEK_V3_2
+
+# 要测试的任务类型（对应 context_data 下的子目录）
+tasks:
+  - trajectory_sorting
+  - visit_cloze
+
+# 每个任务最多处理的患者数量（设为 null 表示全部）
+demo_n: null
+
+# 并发线程数（也可从环境变量 MAX_WORKERS 读取）
+max_workers: 10
