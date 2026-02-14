@@ -23,7 +23,7 @@ def run_script(script_name: str, description: str = ""):
     print(f"Executing: {script_path}")
 
     # Use the same Python interpreter to run the sub‑script
-    result = subprocess.run([sys.executable, str(script_path)], cwd=BASE_DIR)
+    result = subprocess.run([sys.executable, str(script_path)])
 
     if result.returncode != 0:
         print(f"[ERROR] Script {script_name} failed with return code {result.returncode}")
