@@ -3,12 +3,17 @@ models:
   - QWEN_TURBO
   # - GPT5_MINI        # 注释掉即可跳过
   # - DEEPSEEK_V3_2
+  - DEEPSEEK_V3.2_THINKING
 
 # 要测试的任务类型（对应 context_data 下的子目录）
 tasks:
   - trajectory_sorting
   - visit_cloze
 
+specific_patients:
+  - P000175
+  - P000123
+  
 # 每个任务最多处理的患者数量（设为 null 表示全部）
 demo_n: null
 
