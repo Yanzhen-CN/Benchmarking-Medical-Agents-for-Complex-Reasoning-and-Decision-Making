@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from util import logUtil
 logger = logUtil.setup_logger()
@@ -27,6 +28,8 @@ from agents.mem0_agent import OpenAICompatibleLLMProvider  # reuse your provider
 from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_for_qid
 from tasks.agentic_decision.eval_utils import *
 from tasks.agentic_decision.prompts import get_agent_qa_prompt, AGENT_ACTION_PROMPT
+
+from config import AgentTaskConfig  
 # ============================================================
 # IO
 # ============================================================
@@ -223,25 +226,19 @@ def llm_chat_once(
 # ============================================================
 # Main
 # ============================================================
+cfg = AgentTaskConfig()
+def run_one_visit(
+    questions_jsonl: Path,
+    memory_type: str = "event",
+    temperature: float = 0.0,
+    model: Optional[str] = None,
+    ) -> Dict[str, Any]:
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--questions_jsonl", type=str, required=True, help="A single patient question jsonl (e.g. P000001.jsonl)")
-    ap.add_argument("--memory_type", type=str, default="event", choices=["event", "note"], help="Which memory type get_memory_and_context_for_qid uses")
-    ap.add_argument("--mem_chars", type=int, default=64000, help="Total char budget for longitudinal supplement block")
-    ap.add_argument("--item_chars", type=int, default=64000, help="Max chars per memory item")
-    ap.add_argument("--ctx_msg_chars", type=int, default=64000, help="Max chars per existing context message content")
-    ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--max_tokens", type=int, default=512)
-    ap.add_argument("--model", type=str, default=os.getenv("LLM_MODEL", ""), help="Optional model override")
-    ap.add_argument("--out_dir", type=str, default="log/llm_eval")
-    args = ap.parse_args()
-
-    qpath = Path(args.questions_jsonl)
+    qpath = questions_jsonl
     if not qpath.exists():
         raise SystemExit(f"Missing: {qpath}")
 
-    out_dir = Path(args.out_dir)
+    out_dir = cfg.RESULT_OUTPUT_DIR
     safe_mkdir(out_dir)
 
     # run id
@@ -266,7 +263,7 @@ def main() -> None:
     records: List[Dict[str, Any]] = []
 
     questions = list(iter_jsonl(qpath))
-    for q in tqdm(questions, desc=f"LLM-only Eval {qpath.name} ({args.memory_type})"):
+    for q in tqdm(questions, desc=f"LLM-only Eval {qpath.name} ({memory_type})"):
         qid = q.get("qid")
         qtype = q.get("qtype", "UNKNOWN")
         options = q.get("options") or []
@@ -278,7 +275,7 @@ def main() -> None:
             options = []
 
         # 1) get context + memories
-        pack = get_memory_and_context_for_qid(qid=qid, memory_type=args.memory_type)
+        pack = get_memory_and_context_for_qid(qid=qid, memory_type=memory_type)
         memories = pack.get("memories") or []
         context_messages = pack.get("context_messages") or []
         if not isinstance(memories, list):
@@ -287,14 +284,14 @@ def main() -> None:
             context_messages = []
 
         # 2) normalize context messages for OpenAI compatibility
-        ctx = normalize_messages(context_messages, max_chars=args.ctx_msg_chars)
+        ctx = normalize_messages(context_messages, max_chars=cfg.CTX_CHARS)
 
         # 3) build longitudinal supplement (pack as much as possible)
         supp_text, supp_meta = build_memory_supplement_block(
             memories,
             visit_order=None,  # if you have V->idx mapping, pass it here
-            max_total_chars=args.mem_chars,
-            max_item_chars=args.item_chars,
+            max_total_chars=cfg.MEM_CHARS,
+            max_item_chars=cfg.ITEM_CHARS,
             prefer_notes_first=True,
         )
 
@@ -309,15 +306,15 @@ def main() -> None:
             get_agent_qa_prompt(),
             {"role": "user", "content": user_content}
         ]
-        messages = normalize_messages(messages, max_chars=args.ctx_msg_chars)  # safety re-normalize
+        messages = normalize_messages(messages, max_chars=cfg.CTX_CHARS)  # safety re-normalize
         # 6) call llm
         try:
             reply = llm_chat_once(
                 llm,
                 messages,
-                model=(args.model.strip() or None),
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
+                model=(model.strip() if model else None),
+                temperature=temperature,
+                max_tokens=cfg.MAX_TOKENS,
             )
             reply = reply["answer"] if isinstance(reply, dict) and "answer" in reply else [str(reply)]
         except Exception as e:
@@ -325,7 +322,7 @@ def main() -> None:
             rec = {
                 "qid": qid,
                 "qtype": qtype,
-                "memory_type": args.memory_type,
+                "memory_type": memory_type,
                 "error": str(e),
                 "supp_meta": supp_meta,
             }
@@ -339,7 +336,7 @@ def main() -> None:
             {
                 "qid": qid,
                 "qtype": qtype,
-                "memory_type": args.memory_type,
+                "memory_type": memory_type,
                 "pred": reply,
                 "score": score,
                 "gt": gt,
@@ -358,19 +355,20 @@ def main() -> None:
     overall = float(np.mean(all_scores)) if all_scores else 0.0
     summary_out = {
         "patient_id": patient_id,
-        "memory_type": args.memory_type,
+        "memory_type": memory_type,
         "overall_acc": overall,
         "by_type": summary,
         "run_id": run_id,
+        "usage": llm.get_token_usage()
     }
 
     # write outputs
-    pred_path = out_dir / f"{patient_id}.{args.memory_type}.{run_id}.pred.jsonl"
+    pred_path = out_dir / f"{patient_id}.{memory_type}.{run_id}.pred.jsonl"
     with pred_path.open("w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    sum_path = out_dir / f"{patient_id}.{args.memory_type}.{run_id}.summary.json"
+    sum_path = out_dir / f"{patient_id}.{memory_type}.{run_id}.summary.json"
     sum_path.write_text(json.dumps(summary_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # plot acc by type
@@ -378,21 +376,81 @@ def main() -> None:
     keys = sorted(summary.keys(), key=lambda k: (order.index(k) if k in order else 999, k))
     vals = [summary[k]["acc"] for k in keys]
 
-    fig_path = out_dir / f"{patient_id}.{args.memory_type}.{run_id}.acc_by_type.png"
+    fig_path = out_dir / f"{patient_id}.{memory_type}.{run_id}.acc_by_type.png"
     plt.figure(figsize=(7, 4))
     plt.bar(keys, vals)
     plt.ylim(0, 1.0)
     plt.xlabel("Question Type")
     plt.ylabel("Weighted Accuracy")
-    plt.title(f"LLM-only Acc by Type ({patient_id}, {args.memory_type})")
+    plt.title(f"LLM-only Acc by Type ({patient_id}, {memory_type})")
     plt.tight_layout()
     plt.savefig(fig_path)
     plt.close()
 
-    logger.info(f"[DONE] patient={patient_id} memory_type={args.memory_type} overall_acc={overall:.4f}")
+    logger.info(f"[DONE] patient={patient_id} memory_type={memory_type} overall_acc={overall:.4f}")
     logger.info(f"predictions: {pred_path}")
     logger.info(f"summary:     {sum_path}")
     logger.info(f"figure:      {fig_path}")
+    
+    return summary_out
+    
+
+def main():
+    parser = argparse.ArgumentParser(description="LLM-only evaluation for agentic decision task")
+    parser.add_argument("--memory_type", type=str, default="event", help="Type of memory to use (e.g., 'event' or 'note')")
+    parser.add_argument("--temperature", type=float, default=0.0, help="LLM temperature for response generation")
+    parser.add_argument("--model", type=str, default=None, help="LLM model name (if applicable)")
+    args = parser.parse_args()
+
+    question_dir =cfg.QUESTIONS_DIR
+    if not cfg.CLIP_PAITENT:
+        qfiles = sorted(question_dir.glob("*.jsonl"))
+    else:
+        qfiles = sorted([question_dir / f"P{str(pid).zfill(6)}.jsonl" for pid in cfg.CLIP_PATIENT_IDS])
+    
+    if not qfiles:
+        logger.error(f"No question files found in {question_dir}")
+        return
+    
+    if cfg.DEMO_MODE:
+        qfiles = qfiles[:cfg.DEMO_N]
+        logger.info(f"DEMO MODE: Only processing {len(qfiles)} files")
+    else:
+        logger.info(f"Found {len(qfiles)} question files to process")
+        
+    # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
+    #     futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model): qf for qf in qfiles}
+    #     for future in as_completed(futures):
+    #         qf = futures[future]
+    #         try:
+    #             future.result()
+    #         except Exception as e:
+    #             logger.error(f"Error processing {qf}: {e}")
+    
+    total_usage = {
+        "chat": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        },
+        "embedding": {
+            "input_tokens": 0,
+            "total_tokens": 0
+        },
+    }
+    
+    for qf in tqdm(qfiles):
+        try:
+            res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
+            logger.info(f"Result for {qf}: {res}")
+            for k, v in res.get("usage", {}).get("chat", {}).items():
+                total_usage["chat"][k] += v
+            for k, v in res.get("usage", {}).get("embedding", {}).items():
+                total_usage["embedding"][k] += v
+        except Exception as e:
+            logger.error(f"Error processing {qf}: {e}")
+    
+    logger.info(f"Total LLM token usage across all files: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 
 
 if __name__ == "__main__":
