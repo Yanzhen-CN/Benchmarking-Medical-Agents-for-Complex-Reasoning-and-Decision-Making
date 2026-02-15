@@ -14,7 +14,7 @@ specific_patients:
   - P000001
   
 # 每个任务最多处理的患者数量（设为 null 表示全部）
-demo_n: null
+demo_n: 1
 
 # 并发线程数（也可从环境变量 MAX_WORKERS 读取）
 max_workers: 10
