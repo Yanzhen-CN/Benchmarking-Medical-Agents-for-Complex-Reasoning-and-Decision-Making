@@ -13,11 +13,11 @@ CONFIG_PATH = Path(__file__).resolve().parent / "grading_config.yaml"
 def load_config():
     default = {
         "tasks": ["trajectory_sorting", "visit_cloze"],
-        "models": None,  # None means all models
+        "models": None,
         "metric": "kendall_tau"
     }
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        with open(CONFIG_PATH, 'rb') as f:
             cfg = yaml.safe_load(f)
         for k in default:
             cfg.setdefault(k, default[k])
