@@ -44,7 +44,7 @@ def call_llm_task(task_item, model_config, max_retries=3):
                 base_url=model_config['base_url']
             )
             # 模型 ID 可通过环境变量覆盖，例如 DEEPSEEK_V3_2_MODEL_ID
-            env_model_id_key = f"{model_config['env_prefix']}_MODEL_ID"
+            env_model_id_key = f"{model_config['env_name']}_MODEL_ID"
             model_id = os.getenv(env_model_id_key, model_config['label'])
 
             completion = client.chat.completions.create(
@@ -134,12 +134,10 @@ def main():
         name = m["name"]
         env_name = m["env_name"]
         params = m["params"]
-        env_prefix = env_name.replace(".", "_")  # 将点号替换为下划线
-
-        api_key = os.getenv(f"{env_prefix}_API_KEY")
-        base_url = os.getenv(f"{env_prefix}_BASE_URL")
+        api_key = os.getenv(f"{env_name}_API_KEY")
+        base_url = os.getenv(f"{env_name}_BASE_URL")
         if not api_key:
-            print(f"⚠️ Skipping {name} (env prefix: {env_prefix}): API key missing.")
+            print(f"⚠️ Skipping {name} (env prefix: {env_name}): API key missing.")
             continue
 
         label = name.lower().replace("_", "-")
@@ -149,7 +147,7 @@ def main():
             "api_key": api_key,
             "base_url": base_url,
             "params": params,
-            "env_prefix": env_prefix
+            "env_name": env_name
         }
         valid_models.append(name)
 
