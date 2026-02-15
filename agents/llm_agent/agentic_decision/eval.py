@@ -320,7 +320,7 @@ def run_one_visit(
 
         # 5) final messages: context + system supplement + user question        
         messages = [{"role": "system", "content": AGENT_ACTION_PROMPT}] \
-        + [ {"role": "system", "content": supp_text}] if supp_text != "" else [] \
+        + ([ {"role": "system", "content": supp_text}] if supp_text != "" else []) \
         + ctx[1:] + [
             get_agent_qa_prompt(),
             {"role": "user", "content": user_content}
@@ -465,40 +465,40 @@ def main():
     }
     total_log = {}
     safe_mkdir(out_dir)
-    with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
-        futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model, args.visible_visits, args.enable_thinking): qf for qf in qfiles}
-        for future in as_completed(futures):
-            qf = futures[future]
-            try:
-                log = future.result()
-                logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
-                # Aggregate usage
-                for k, v in log.get("usage", {}).get("chat", {}).items():
-                    total_usage["chat"][k] += v
-                for k, v in log.get("usage", {}).get("embedding", {}).items():
-                    total_usage["embedding"][k] += v
-                total_log[qf.name] = log
-                with open(out_dir / log_name, "w", encoding="utf-8") as f:
-                    json.dump(total_log, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                logger.error(f"Error processing {qf}: {e}")
+    # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
+    #     futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model, args.visible_visits, args.enable_thinking): qf for qf in qfiles}
+    #     for future in as_completed(futures):
+    #         qf = futures[future]
+    #         try:
+    #             log = future.result()
+    #             logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+    #             # Aggregate usage
+    #             for k, v in log.get("usage", {}).get("chat", {}).items():
+    #                 total_usage["chat"][k] += v
+    #             for k, v in log.get("usage", {}).get("embedding", {}).items():
+    #                 total_usage["embedding"][k] += v
+    #             total_log[qf.name] = log
+    #             with open(out_dir / log_name, "w", encoding="utf-8") as f:
+    #                 json.dump(total_log, f, ensure_ascii=False, indent=2)
+    #         except Exception as e:
+    #             logger.error(f"Error processing {qf}: {e}")
     
 
     
-    # for qf in tqdm(qfiles):
-    #     try:
-    #         res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
-    #         logger.info(f"Result for {qf}: {res}")
-    #         for k, v in res.get("usage", {}).get("chat", {}).items():
-    #             total_usage["chat"][k] += v
-    #         for k, v in res.get("usage", {}).get("embedding", {}).items():
-    #             total_usage["embedding"][k] += v
-    #         total_log[qf.name] = res
-    #         with open(out_dir / log_name, "w", encoding="utf-8") as f:
-    #             json.dump(total_log, f, ensure_ascii=False, indent=2)
+    for qf in tqdm(qfiles):
+        try:
+            res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model, visible_visits=args.visible_visits, enable_thinking=args.enable_thinking)
+            logger.info(f"Result for {qf}: {res}")
+            for k, v in res.get("usage", {}).get("chat", {}).items():
+                total_usage["chat"][k] += v
+            for k, v in res.get("usage", {}).get("embedding", {}).items():
+                total_usage["embedding"][k] += v
+            total_log[qf.name] = res
+            with open(out_dir / log_name, "w", encoding="utf-8") as f:
+                json.dump(total_log, f, ensure_ascii=False, indent=2)
 
-    #     except Exception as e:
-    #         logger.error(f"Error processing {qf}: {e}")
+        except Exception as e:
+            logger.error(f"Error processing {qf}: {e}")
     
     logger.info(f"Total LLM token usage across all files: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 
