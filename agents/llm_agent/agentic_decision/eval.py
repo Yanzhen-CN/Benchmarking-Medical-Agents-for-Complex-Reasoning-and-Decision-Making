@@ -30,7 +30,7 @@ from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_
 from tasks.agentic_decision.eval_utils import *
 from tasks.agentic_decision.prompts import get_agent_qa_prompt, AGENT_ACTION_PROMPT
 
-
+out_dir = Path("./agents/llm_agent/agentic_decision/results")
 # ============================================================
 # IO
 # ============================================================
@@ -239,7 +239,7 @@ def run_one_visit(
     if not qpath.exists():
         raise SystemExit(f"Missing: {qpath}")
 
-    out_dir = cfg.RESULT_OUTPUT_DIR
+
     safe_mkdir(out_dir)
 
     # run id
@@ -420,6 +420,17 @@ def main():
     else:
         logger.info(f"Found {len(qfiles)} question files to process")
     
+    log_name = f"llm_eval_{args.memory_type}_{args.temperature}_{args.model}.log"
+    if os.path.exists(out_dir/log_name):
+        with open(out_dir/log_name, "r", encoding="utf-8") as f:
+            existing_log = json.load(f)
+            done_files = set(existing_log.keys())
+            qfiles = [qf for qf in qfiles if qf.name not in done_files]
+            logger.info(f"Resuming from existing log. {len(qfiles)} files left to process.")
+    else:
+        existing_log = {}
+        logger.info(f"No existing log found. Starting fresh.")
+        
     total_usage = {
         "chat": {
             "prompt_tokens": 0,
@@ -431,6 +442,8 @@ def main():
             "total_tokens": 0
         },
     }
+    total_log = {}
+    safe_mkdir(out_dir)
     with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
         futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model): qf for qf in qfiles}
         for future in as_completed(futures):
@@ -443,21 +456,28 @@ def main():
                     total_usage["chat"][k] += v
                 for k, v in log.get("usage", {}).get("embedding", {}).items():
                     total_usage["embedding"][k] += v
+                total_log[qf.name] = log
+                with open(out_dir / log_name, "w", encoding="utf-8") as f:
+                    json.dump(total_log, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 logger.error(f"Error processing {qf}: {e}")
     
 
     
-    # for qf in tqdm(qfiles):
-    #     try:
-    #         res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
-    #         logger.info(f"Result for {qf}: {res}")
-    #         for k, v in res.get("usage", {}).get("chat", {}).items():
-    #             total_usage["chat"][k] += v
-    #         for k, v in res.get("usage", {}).get("embedding", {}).items():
-    #             total_usage["embedding"][k] += v
-    #     except Exception as e:
-    #         logger.error(f"Error processing {qf}: {e}")
+    for qf in tqdm(qfiles):
+        try:
+            res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
+            logger.info(f"Result for {qf}: {res}")
+            for k, v in res.get("usage", {}).get("chat", {}).items():
+                total_usage["chat"][k] += v
+            for k, v in res.get("usage", {}).get("embedding", {}).items():
+                total_usage["embedding"][k] += v
+            total_log[qf.name] = res
+            with open(out_dir / log_name, "w", encoding="utf-8") as f:
+                json.dump(total_log, f, ensure_ascii=False, indent=2)
+
+        except Exception as e:
+            logger.error(f"Error processing {qf}: {e}")
     
     logger.info(f"Total LLM token usage across all files: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 
