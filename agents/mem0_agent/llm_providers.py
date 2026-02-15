@@ -33,6 +33,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         temperature = kwargs.pop("temperature", self._config.temperature)
         top_p = kwargs.pop("top_p", self._config.top_p)
         max_tokens = kwargs.pop("max_tokens", self._config.max_tokens)
+        enable_thinking = kwargs.pop("enable_thinking", False)
         return self._llm.chat(
             messages=messages,
             model=model,
@@ -40,25 +41,30 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             top_p=top_p,
             max_tokens=max_tokens,
             extra=kwargs or None,
+            enable_thinking=enable_thinking,
         )
 
     def chat_json(self, system_prompt: str, user_text: str, **kwargs: Any) -> Any:
         model = kwargs.pop("model", self._config.chat_model)
         temperature = kwargs.pop("temperature", 0.0)
+        enable_thinking = kwargs.pop("enable_thinking", False)
         return self._llm.chat_json(
             system_prompt=system_prompt,
             user_text=user_text,
             model=model,
             temperature=temperature,
+            enable_thinking=enable_thinking,
         )
     
     def chat_json_ctx(self, messages: List[Dict[str, str]], **kwargs: Any) -> Any:
         model = kwargs.pop("model", self._config.chat_model)
         temperature = kwargs.pop("temperature", 0.0)
+        enable_thinking = kwargs.pop("enable_thinking", False)
         return self._llm.chat_json_ctx(
             messages=messages,
             model=model,
             temperature=temperature,
+            enable_thinking=enable_thinking,
         )
         
     def get_token_usage(self) -> Dict[str, int]:

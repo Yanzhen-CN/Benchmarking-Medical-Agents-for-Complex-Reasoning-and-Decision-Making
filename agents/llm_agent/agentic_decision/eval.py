@@ -464,20 +464,20 @@ def main():
     
 
     
-    for qf in tqdm(qfiles):
-        try:
-            res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
-            logger.info(f"Result for {qf}: {res}")
-            for k, v in res.get("usage", {}).get("chat", {}).items():
-                total_usage["chat"][k] += v
-            for k, v in res.get("usage", {}).get("embedding", {}).items():
-                total_usage["embedding"][k] += v
-            total_log[qf.name] = res
-            with open(out_dir / log_name, "w", encoding="utf-8") as f:
-                json.dump(total_log, f, ensure_ascii=False, indent=2)
+    # for qf in tqdm(qfiles):
+    #     try:
+    #         res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
+    #         logger.info(f"Result for {qf}: {res}")
+    #         for k, v in res.get("usage", {}).get("chat", {}).items():
+    #             total_usage["chat"][k] += v
+    #         for k, v in res.get("usage", {}).get("embedding", {}).items():
+    #             total_usage["embedding"][k] += v
+    #         total_log[qf.name] = res
+    #         with open(out_dir / log_name, "w", encoding="utf-8") as f:
+    #             json.dump(total_log, f, ensure_ascii=False, indent=2)
 
-        except Exception as e:
-            logger.error(f"Error processing {qf}: {e}")
+    #     except Exception as e:
+    #         logger.error(f"Error processing {qf}: {e}")
     
     logger.info(f"Total LLM token usage across all files: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 

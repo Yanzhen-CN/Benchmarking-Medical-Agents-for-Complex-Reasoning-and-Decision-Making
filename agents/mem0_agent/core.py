@@ -28,7 +28,6 @@ class AgentConfig:
     query_rewrite: bool = True
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
 
-
 @dataclass
 class RetrievalTrace:
     original_query: str
@@ -64,6 +63,7 @@ class MemoryAugmentedChatAgent:
         app_id: Optional[str] = None,
         run_id: Optional[str] = None,
         json: Optional[bool] = False,
+        **kwargs
     ) -> str:
         reply, _ = self.chat_with_trace(
             messages=messages,
@@ -72,6 +72,7 @@ class MemoryAugmentedChatAgent:
             app_id=app_id,
             run_id=run_id,
             json=json,
+            **kwargs
         )
         return reply
 
@@ -84,6 +85,7 @@ class MemoryAugmentedChatAgent:
         app_id: Optional[str] = None,
         run_id: Optional[str] = None,
         json: Optional[bool] = False,
+        **kwargs
     ) -> tuple[str, RetrievalTrace]:
         if not messages:
             raise ValueError("messages cannot be empty")
@@ -114,9 +116,9 @@ class MemoryAugmentedChatAgent:
         prompt_messages = self._compose_prompt(messages, memories)
         prompt_messages[0] = messages[0] 
         if not json:
-            reply = self._llm.chat(prompt_messages)
+            reply = self._llm.chat(prompt_messages, **kwargs)
         else:
-            reply = self._llm.chat_json_ctx(prompt_messages)
+            reply = self._llm.chat_json_ctx(prompt_messages, **kwargs)
 
         self._write_memory(
             messages=messages,
