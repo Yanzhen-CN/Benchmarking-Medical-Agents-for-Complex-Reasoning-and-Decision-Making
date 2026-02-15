@@ -560,41 +560,10 @@ def main():
     }
     total_log = {}
     safe_mkdir(out_dir)
-    # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
-    #     futures = {
-    #         executor.submit(
-    #             run_one_visit_rag,
-    #             qf,
-    #             memory_type=args.memory_type,
-    #             temperature=args.temperature,
-    #             model=args.model,
-    #             top_k=args.top_k,
-    #             prefetch_k=args.prefetch_k,
-    #             include_cutoff=args.include_cutoff,
-    #             require_timestamp=args.require_timestamp,
-    #             debug=args.debug,
-    #         ): qf
-    #         for qf in qfiles
-    #     }
-    #     for future in as_completed(futures):
-    #         qf = futures[future]
-    #         try:
-    #             log = future.result()
-    #             logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
-    #             # accumulate usage
-    #             for k, v in log.get("usage", {}).get("chat", {}).items():
-    #                 total_usage["chat"][k] += v
-    #             for k, v in log.get("usage", {}).get("embedding", {}).items():
-    #                 total_usage["embedding"][k] += v
-    #             total_log[qf.name] = log
-    #             with open(out_dir / log_name, "w", encoding="utf-8") as f:
-    #                 json.dump(total_log, f, ensure_ascii=False, indent=2)
-    #         except Exception as e:
-    #             logger.error(f"Error processing {qf}: {e}")
-                
-    for qf in qfiles:
-        try:
-            log = run_one_visit_rag(
+    with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
+        futures = {
+            executor.submit(
+                run_one_visit_rag,
                 qf,
                 memory_type=args.memory_type,
                 temperature=args.temperature,
@@ -604,18 +573,49 @@ def main():
                 include_cutoff=args.include_cutoff,
                 require_timestamp=args.require_timestamp,
                 debug=args.debug,
-            )
-            logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
-            # accumulate usage
-            for k, v in log.get("usage", {}).get("chat", {}).items():
-                total_usage["chat"][k] += v
-            for k, v in log.get("usage", {}).get("embedding", {}).items():
-                total_usage["embedding"][k] += v
-            total_log[qf.name] = log
-            with open(out_dir / log_name, "w", encoding="utf-8") as f:
-                json.dump(total_log, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Error processing {qf}: {e}")
+            ): qf
+            for qf in qfiles
+        }
+        for future in as_completed(futures):
+            qf = futures[future]
+            try:
+                log = future.result()
+                logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+                # accumulate usage
+                for k, v in log.get("usage", {}).get("chat", {}).items():
+                    total_usage["chat"][k] += v
+                for k, v in log.get("usage", {}).get("embedding", {}).items():
+                    total_usage["embedding"][k] += v
+                total_log[qf.name] = log
+                with open(out_dir / log_name, "w", encoding="utf-8") as f:
+                    json.dump(total_log, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Error processing {qf}: {e}")
+                
+    # for qf in qfiles:
+    #     try:
+    #         log = run_one_visit_rag(
+    #             qf,
+    #             memory_type=args.memory_type,
+    #             temperature=args.temperature,
+    #             model=args.model,
+    #             top_k=args.top_k,
+    #             prefetch_k=args.prefetch_k,
+    #             include_cutoff=args.include_cutoff,
+    #             require_timestamp=args.require_timestamp,
+    #             debug=args.debug,
+    #         )
+    #         logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+    #         # accumulate usage
+    #         for k, v in log.get("usage", {}).get("chat", {}).items():
+    #             total_usage["chat"][k] += v
+    #         for k, v in log.get("usage", {}).get("embedding", {}).items():
+    #             total_usage["embedding"][k] += v
+    #         total_log[qf.name] = log
+    #         with open(out_dir / log_name, "w", encoding="utf-8") as f:
+    #             json.dump(total_log, f, ensure_ascii=False, indent=2)
+    #     except Exception as e:
+    #         logger.error(f"Error processing {qf}: {e}")
     logger.info(f"Total LLM Usage: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 
 
