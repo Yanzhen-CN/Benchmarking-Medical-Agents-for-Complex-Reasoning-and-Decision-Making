@@ -15,7 +15,7 @@ from openai import OpenAI
 ROOT_DIR = Path(__file__).resolve().parents[2]
 dotenv.load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+CONFIG_PATH = Path(__file__).resolve().parent / "run_config.yaml"
 
 def load_config(config_path):
     default = {
