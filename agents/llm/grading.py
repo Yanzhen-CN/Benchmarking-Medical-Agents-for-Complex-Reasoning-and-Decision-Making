@@ -82,27 +82,25 @@ def process_patient_file(filepath, task, model):
             pred_str = data.get('prediction')
             gt = data.get('ground_truth')
             if pred_str is None or gt is None:
-                # Missing data – record as invalid
                 with invalid_lock:
-                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
                 continue
 
             pred = parse_prediction(pred_str)
             if pred is None:
                 with invalid_lock:
-                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
                 continue
 
             if len(pred) != len(gt):
                 with invalid_lock:
-                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
                 continue
 
             tau = compute_tau(pred, gt)
             if tau is None:
-                # This could happen if elements are not comparable (e.g., non-integers)
                 with invalid_lock:
-                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
                 continue
 
             scores.append({
