@@ -63,4 +63,6 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         
     def get_token_usage(self) -> Dict[str, int]:
         return self._llm.get_token_usage()
-        
+    
+    def get_client(self) -> LLMUtil:
+        return self._llm
