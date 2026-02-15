@@ -463,7 +463,7 @@ def main():
             "total_tokens": 0
         },
     }
-    total_log = {}
+    total_log = existing_log
     safe_mkdir(out_dir)
     # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
     #     futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model, args.visible_visits, args.enable_thinking): qf for qf in qfiles}
