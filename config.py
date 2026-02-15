@@ -245,7 +245,7 @@ class AgentQaGenConfig:
         self.DISCHARGE_NO_MARGIN_H = 6.0        # No 采样在 (X, X+margin] 区间内（靠近但为 No）
         self.DISCHARGE_SAMPLE_K = 1             # 每个 visit 生成几个 T3-D
         
-        self.SAMPLE_QUESTIONS: bool = True
+        self.SAMPLE_QUESTIONS: bool = False
         self.SAMPLE_RATIO: float = 0.10         # 如果 SAMPLE_QUESTIONS
         self.SAMPLE_MODE: str = "global"        # global or per_file
         self.SAMPLE_OUTPUT_DIR: Path = Path("./tasks/agentic_decision/questions_sampled")
@@ -270,13 +270,24 @@ class AgentTaskConfig:
         
         self.CONTEXT_DIR: Path = Path("./tasks/agentic_decision/context")
         
+        self.CLIP_PAITENT: bool = True 
+        self.CLIP_PATIENT_IDS = set([i for i in range(1,51) if i != 8])
+        
+        
         self.DEMO_MODE: bool = False
         self.DEMO_N: int = 5
         
-        self.KEEP_LAST_N_TURNS: int = 8
+        self.KEEP_LAST_N_TURNS: int = 32
         
         self.VECTOR_STORE_DIR: Path = Path("./agents/rag_agent/agentic_decision/vector_store")
         self.EMBEDDING_MODEL: str = "text-embedding-v4"
         self.BATCH_SIZE: int = 10
         self.NORMALIZE_EMBEDDINGS: bool = True
         self.CACHE_INDEXES: bool = True
+        
+        self.RESULT_OUTPUT_DIR: Path = Path("./agents/llm_agent/agentic_decision/results")
+        
+        self.ITEM_CHARS: int = 64000  # 每个事件/指标的字符限制，过长会被截断
+        self.MEM_CHARS: int = 64000   # 从记忆中检索出来的内容总字符限制，过长会被截断
+        self.CTX_CHARS: int = 128000     # 最终拼接到 prompt 中的上下文总字符限制，过长会被截断
+        self.MAX_TOKENS: int = 4096           # LLM 生成的答案的最大 token 数，过长会被截断

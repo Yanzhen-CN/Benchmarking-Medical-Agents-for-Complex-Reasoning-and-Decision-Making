@@ -252,7 +252,8 @@ def _get_memory_and_context_for_question(
         },
     }
     
-
+from config import AgentTaskConfig 
+task_cfg = AgentTaskConfig()
 def get_memory_and_context_for_qid(qid: str, memory_type: str) -> Dict[str, Any]:
     """
     包装一层，方便外部调用。
@@ -262,11 +263,11 @@ def get_memory_and_context_for_qid(qid: str, memory_type: str) -> Dict[str, Any]
     patient_id = result["patient_id"]
     visit_id = result["visit_id"]
     cfg = MemoryContextConfig(
-        questions_jsonl=Path(f"tasks/agentic_decision/questions_generated/{patient_id}.jsonl"),
-        patient_json=Path(f"bench_data/patients/{patient_id}.json"),
-        sequenced_json=Path(f"bench_data/patients_sequence/{patient_id}_sequenced.json"),
-        context_root=Path("tasks/agentic_decision/context"),
-        keep_last_n_turns=8,
+        questions_jsonl= task_cfg.QUESTIONS_DIR/f"{patient_id}.jsonl",
+        patient_json=task_cfg.PATIENTS_DIR/f"{patient_id}.json",
+        sequenced_json=task_cfg.EVENT_SEQ_DIR/f"{patient_id}_sequenced.json",
+        context_root=task_cfg.CONTEXT_DIR,
+        keep_last_n_turns=task_cfg.KEEP_LAST_N_TURNS,
     )
     return _get_memory_and_context_for_question(cfg, qid=qid, memory_type=memory_type)
 

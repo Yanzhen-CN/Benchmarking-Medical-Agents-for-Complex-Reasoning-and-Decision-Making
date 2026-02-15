@@ -61,3 +61,6 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             temperature=temperature,
         )
         
+    def get_token_usage(self) -> Dict[str, int]:
+        return self._llm.get_token_usage()
+        

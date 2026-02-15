@@ -1,123 +1,65 @@
+# agents/rag_agent/agentic_decision/eval.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
-import datetime
-import uuid
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
-from collections import defaultdict
 import re
-
-import numpy as np
+import uuid
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from threading import Lock
 import matplotlib.pyplot as plt
+import numpy as np
 from tqdm import tqdm
 
 from util import logUtil
 logger = logUtil.setup_logger()
 
-from util.llmUtil import LLMUtil
-from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_for_qid
-from agents.rag_agent.agentic_decision.retriver import PatientRetriever, RetrievedDoc
+from config import AgentTaskConfig
+cfg = AgentTaskConfig()
 
-# ====== NEW: align with provided eval.py ======
+# ---- LLM Provider (OpenAI-compatible) ----
+from agents.mem0_agent import OpenAICompatibleLLMProvider  # same as llm_agent eval.py
+
+# ---- Context builder (your existing API) ----
+from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_for_qid
+
+# ---- Eval utils (same as llm_agent eval.py) ----
+from tasks.agentic_decision.eval_utils import *  # format_mcq_user_content, score_weighted_acc, etc.
 from tasks.agentic_decision.prompts import get_agent_qa_prompt, AGENT_ACTION_PROMPT
 
+# ---- RAG Retriever ----
+from agents.rag_agent.agentic_decision.retriver import PatientRetriever, RetrievedDoc
 
-# -----------------------------
-# IO helpers
-# -----------------------------
+out_dir = Path("./agents/rag_agent/agentic_decision/results")
+
+# ============================================================
+# IO
+# ============================================================
+
 def iter_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            s = line.strip()
+            if not s:
                 continue
-            yield json.loads(line)
+            yield json.loads(s)
 
 
-# -----------------------------
-# MCQ helpers
-# -----------------------------
-def _format_mcq_user_content(q: Dict[str, Any]) -> str:
-    question = q.get("question", "")
-    options = q.get("options") or []
-    if not isinstance(options, list):
-        options = []
-    lines = [str(question).strip(), "", "Options:"]
-    for i, opt in enumerate(options):
-        lines.append(f"{i+1}. {opt}")
-    lines.append("")
-    lines.append("Please answer with the best option string exactly as listed.")
-    return "\n".join(lines)
-
-
-def _extract_pred_option(reply: Any, options: List[str]) -> str:
-    r = reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)
-    r_low = r.lower().strip()
-
-    for opt in options:
-        if isinstance(opt, str) and opt.lower().strip() == r_low:
-            return opt
-    for opt in options:
-        if isinstance(opt, str) and opt.lower() in r_low:
-            return opt
-
-    return r.strip()
-
-
-def _score_weighted_acc(gt_answer: Any, pred: str) -> float:
-    if isinstance(gt_answer, dict):
-        return float(gt_answer.get(pred, 0.0) or 0.0)
-    if isinstance(gt_answer, str):
-        return 1.0 if pred == gt_answer else 0.0
-    return 0.0
-
-
-# -----------------------------
-# RAG prompt helpers
-# -----------------------------
-def _build_retrieved_system_block(hits: List[RetrievedDoc]) -> str:
-    if not hits:
-        return "Retrieved evidence (RAG top-k): <EMPTY>"
-
-    lines = ["Retrieved evidence (RAG top-k):"]
-    for i, h in enumerate(hits, 1):
-        t = h.text if isinstance(h.text, str) else str(h.text)
-        if len(t) > 1200:
-            t = t[:1200] + "..."
-        meta = h.meta or {}
-        tag = f"score={h.score:.4f}"
-        tag2 = f"visit={meta.get('visit_ref')} type={meta.get('event_type', meta.get('memory_type'))} id={meta.get('event_id', meta.get('note_type'))}"
-        lines.append(f"[{i}] ({tag}; {tag2}) {t}")
-    return "\n".join(lines)
-
-
-def _parse_patient_id_from_qid(qid: str) -> str:
-    return qid.split("-V")[0] if "-V" in qid else qid.split("-")[0]
-
-
-def _visible_until_visit_idx_from_visit_id(visit_id: str) -> int | None:
-    """
-    visit_id 形如: P000001-V12
-    返回 visible_until_visit_idx=11 (0-based)，表示只看 V12 之前（V1..V11）
-    """
-    if not isinstance(visit_id, str) or "-V" not in visit_id:
-        return None
-    try:
-        vnum = int(visit_id.split("-V")[1])
-        return max(0, vnum - 1)
-    except Exception:
-        return None
+def safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# NEW: Message normalization + longitudinal supplement (copy style)
+# Message normalization (fix: dict content -> str)
 # ============================================================
 
-_ALLOWED_ROLES = {"system", "user", "assistant"}
+_ALLOWED_ROLES = {"system", "user", "assistant"}  # safest for OpenAI-compatible wrappers
 
 
 def _to_str(x: Any) -> str:
@@ -132,6 +74,10 @@ def _to_str(x: Any) -> str:
 
 
 def normalize_messages(msgs: List[Dict[str, Any]], *, max_chars: int = 12000) -> List[Dict[str, str]]:
+    """
+    Ensure every message is {role: str, content: str}.
+    Unknown roles are mapped to 'assistant' (most compatible).
+    """
     out: List[Dict[str, str]] = []
     for m in msgs:
         if not isinstance(m, dict):
@@ -146,6 +92,11 @@ def normalize_messages(msgs: List[Dict[str, Any]], *, max_chars: int = 12000) ->
     return out
 
 
+# ============================================================
+# LLM-only "longitudinal supplement" (pack as much as possible)
+# (kept identical to llm_agent eval.py for consistency)
+# ============================================================
+
 _VISIT_PAT = re.compile(r"\bvisit\s*=\s*(V\d+)\b", re.IGNORECASE)
 
 
@@ -158,6 +109,10 @@ def bucket_memories_by_visit(
     memories: List[str],
     visit_order: Optional[Dict[str, int]] = None,
 ) -> Dict[int, List[str]]:
+    """
+    Return {visit_idx: [mem_text...]}.
+    If visit_order provided (V1->0...), use it; else parse V<number>.
+    """
     tmp: Dict[str, List[str]] = defaultdict(list)
     for m in memories:
         s = _to_str(m).strip()
@@ -193,6 +148,10 @@ def build_memory_supplement_block(
     max_item_chars: int = 900,
     prefer_notes_first: bool = True,
 ) -> Tuple[str, Dict[str, Any]]:
+    """
+    Greedily pack as many memories (previous visits events/notes) as possible
+    under a character budget.
+    """
     buckets = bucket_memories_by_visit(memories, visit_order=visit_order)
     visit_ids = sorted(buckets.keys(), reverse=True)  # recent -> old
 
@@ -247,47 +206,115 @@ def build_memory_supplement_block(
     return text, meta
 
 
-# -----------------------------
-# main
-# -----------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--questions_jsonl", type=str, required=True)
-    ap.add_argument("--memory_type", type=str, default="event", choices=["event", "note"])
-    ap.add_argument("--top_k", type=int, default=int(os.getenv("RAG_TOP_K", "16")))
-    ap.add_argument("--prefetch_k", type=int, default=int(os.getenv("RAG_PREFETCH_K", "200")))
-    ap.add_argument("--include_cutoff", action="store_true", default=True)
-    ap.add_argument("--require_timestamp", action="store_true", default=False)
-    ap.add_argument("--debug", action="store_true", default=True)
-    ap.add_argument("--out_dir", type=str, default="log/rag_eval")
-    ap.add_argument("--model", type=str, default=os.getenv("EVAL_LLM_MODEL", "gpt-4o-mini"))
-    ap.add_argument("--ctx_msg_chars", type=int, default=64000, help="Max chars per existing context message content")
-    ap.add_argument("--mem_chars", type=int, default=64000, help="Total char budget for longitudinal supplement block")
-    ap.add_argument("--item_chars", type=int, default=64000, help="Max chars per memory item")
- 
-    args = ap.parse_args()
+# ============================================================
+# RAG helpers
+# ============================================================
 
-    qpath = Path(args.questions_jsonl)
+def _parse_patient_id_from_qid(qid: str) -> str:
+    return qid.split("-V")[0] if isinstance(qid, str) and "-V" in qid else str(qid).split("-")[0]
+
+
+def _visible_until_visit_idx_from_visit_id(visit_id: Any) -> Optional[int]:
+    """
+    visit_id like: P000001-V12
+    return 11 (0-based), meaning only look at V1..V11 (before V12)
+    """
+    if not isinstance(visit_id, str) or "-V" not in visit_id:
+        return None
+    try:
+        vnum = int(visit_id.split("-V")[1])
+        return max(0, vnum - 1)
+    except Exception:
+        return None
+
+
+def _build_retrieved_system_block(hits: List[RetrievedDoc], *, max_chars_per_hit: int = 1200) -> str:
+    if not hits:
+        return "Retrieved evidence (RAG top-k): <EMPTY>"
+
+    lines = ["Retrieved evidence (RAG top-k):"]
+    for i, h in enumerate(hits, 1):
+        t = h.text if isinstance(h.text, str) else str(h.text)
+        if len(t) > max_chars_per_hit:
+            t = t[:max_chars_per_hit] + "..."
+        meta = h.meta or {}
+        tag = f"score={float(getattr(h, 'score', 0.0)):.4f}"
+        tag2 = (
+            f"visit={meta.get('visit_ref')} "
+            f"type={meta.get('event_type', meta.get('memory_type'))} "
+            f"id={meta.get('event_id', meta.get('note_type'))}"
+        )
+        lines.append(f"[{i}] ({tag}; {tag2}) {t}")
+    return "\n".join(lines)
+
+
+# ============================================================
+# LLM call (same wrapper as llm_agent eval.py)
+# ============================================================
+
+def llm_chat_once(
+    llm: OpenAICompatibleLLMProvider,
+    messages: List[Dict[str, str]],
+    *,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    kwargs = {}
+    if model:
+        kwargs["model"] = model
+    kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    return llm.chat_json_ctx(messages=messages, **kwargs)  # type: ignore
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def run_one_visit_rag(
+    questions_jsonl: Path,
+    *,
+    memory_type: str = "event",
+    temperature: float = 0.0,
+    model: Optional[str] = None,
+    top_k: int = 16,
+    prefetch_k: int = 200,
+    include_cutoff: bool = True,
+    require_timestamp: bool = False,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    qpath = questions_jsonl
     if not qpath.exists():
-        raise SystemExit(f"Missing questions file: {qpath}")
+        raise SystemExit(f"Missing: {qpath}")
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
+
+    # run id
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     rid = uuid.uuid4().hex[:8]
     run_id = f"{ts}-{rid}"
 
-    retriever = PatientRetriever()
-    llm = LLMUtil()
+    # infer patient id (fallback to filename)
+    first = None
+    for x in iter_jsonl(qpath):
+        first = x
+        break
+    patient_id = (
+        _parse_patient_id_from_qid(str(first.get("qid", "")))
+        if isinstance(first, dict) and first.get("qid")
+        else qpath.stem
+    )
 
-    first = next(iter_jsonl(qpath))
-    patient_id = _parse_patient_id_from_qid(str(first.get("qid", qpath.stem)))
+    llm = OpenAICompatibleLLMProvider()
+    retriever = PatientRetriever()
 
     scores_by_type: Dict[str, List[float]] = defaultdict(list)
     records: List[Dict[str, Any]] = []
 
-    for q in tqdm(list(iter_jsonl(qpath)), desc=f"RAG Eval {qpath.name} ({args.memory_type})"):
+    questions = list(iter_jsonl(qpath))
+    for q in tqdm(questions, desc=f"RAG Eval {qpath.name} ({memory_type})"):
         qid = q.get("qid")
         qtype = q.get("qtype", "UNKNOWN")
         options = q.get("options") or []
@@ -295,150 +322,303 @@ def main():
 
         if not isinstance(qid, str) or not qid:
             continue
+        if not isinstance(options, list):
+            options = []
 
-        # 1) get context pack (context + memories)
-        pack = get_memory_and_context_for_qid(qid=qid, memory_type=args.memory_type)
-
-        # provided-file style: pull memories separately
+        # 1) context + memories (same API)
+        pack = get_memory_and_context_for_qid(qid=qid, memory_type=memory_type)
         memories = pack.get("memories") or []
+        context_messages = pack.get("context_messages") or []
         if not isinstance(memories, list):
             memories = []
-
-        context_messages = pack.get("context_messages") or []
         if not isinstance(context_messages, list):
             context_messages = []
 
-        # normalize context (OpenAI-compatible)
-        ctx = normalize_messages(context_messages, max_chars=args.ctx_msg_chars)
+        # 2) normalize context
+        ctx = normalize_messages(context_messages, max_chars=cfg.CTX_CHARS)
 
+        # 3) cutoff info (event-level preferred)
         visit_id = pack.get("visit_id")
         cmeta = pack.get("context_meta") or {}
         cutoff_event_id = cmeta.get("cutoff_event_id")
 
-        visible_until_visit_idx = None
+        visible_until_visit_idx: Optional[int] = None
         if cutoff_event_id:
-            # 事件级截断（最精确）—— retriever 内部处理
-            pass
+            # retriever will handle event-level cutoff internally
+            visible_until_visit_idx = None
         else:
             visible_until_visit_idx = _visible_until_visit_idx_from_visit_id(visit_id)
 
-        # 2) build query text
-        query_text = str(q.get("question", "")).strip() or str(pack.get("question", "")).strip()
-
-        # 3) RAG retrieve
-        hits = retriever.search(
-            patient_id=patient_id,
-            query=query_text,
-            memory_type=args.memory_type,
-            k=args.top_k,
-            prefetch_k=args.prefetch_k,
-            visible_until_visit_idx=visible_until_visit_idx,
-            cutoff_event_id=cutoff_event_id,
-            include_cutoff=args.include_cutoff,
-            require_timestamp=args.require_timestamp,
-        )
-
-        # 4) build blocks: longitudinal supplement + rag evidence + user MCQ
+        # 4) build longitudinal supplement (same as llm_agent)
         supp_text, supp_meta = build_memory_supplement_block(
             memories,
             visit_order=None,
-            max_total_chars=args.mem_chars,
-            max_item_chars=args.item_chars,
+            max_total_chars=cfg.MEM_CHARS,
+            max_item_chars=cfg.ITEM_CHARS,
             prefer_notes_first=True,
         )
-        sys_rag = _build_retrieved_system_block(hits)
-        user_content = _format_mcq_user_content(q)
 
-        # 5) compose messages (ALIGN WITH PROVIDED FILE)
-        #    system(action rules) + system(longitudinal) + system(rag evidence) + ctx[1:] + qa prompt + user
-        messages = (
-            [{"role": "system", "content": AGENT_ACTION_PROMPT},
-             {"role": "system", "content": supp_text},
-             {"role": "system", "content": sys_rag}]
-            + (ctx[1:] if len(ctx) > 1 else [])
-            + [get_agent_qa_prompt(),
-               {"role": "user", "content": user_content}]
+        # 5) RAG retrieve (query = question text)
+        query_text = str(q.get("question", "")).strip() or str(pack.get("question", "")).strip()
+        pid_for_query = _parse_patient_id_from_qid(qid) or patient_id
+
+        hits = retriever.search(
+            patient_id=pid_for_query,
+            query=query_text,
+            memory_type=memory_type,
+            k=top_k,
+            prefetch_k=prefetch_k,
+            visible_until_visit_idx=visible_until_visit_idx,
+            cutoff_event_id=cutoff_event_id,
+            include_cutoff=include_cutoff,
+            require_timestamp=require_timestamp,
         )
-        messages = normalize_messages(messages, max_chars=args.ctx_msg_chars)
 
-        # 6) call llm
-        reply = llm.chat_json_ctx(messages=messages, model=args.model)
+        rag_block = _build_retrieved_system_block(hits)
 
-        pred = _extract_pred_option(reply, options)
-        score = _score_weighted_acc(gt, pred)
+        # 6) build user MCQ (use eval_utils implementation)
+        user_content = format_mcq_user_content(q)
+
+        # 7) compose messages (MATCH llm_agent style + add RAG block as a system msg)
+        messages = (
+            [
+                {"role": "system", "content": AGENT_ACTION_PROMPT},
+                {"role": "system", "content": supp_text},
+            ]
+            + (ctx[1:] if len(ctx) > 1 else [])
+            + [
+                get_agent_qa_prompt(),
+                {"role": "user", "content": user_content},
+                {"role": "system", "content": rag_block},
+            ]
+        )
+        messages = normalize_messages(messages, max_chars=cfg.CTX_CHARS)
+
+        # 8) call llm (OpenAICompatibleLLMProvider)
+        try:
+            reply = llm_chat_once(
+                llm,
+                messages,
+                model=(model.strip() if model else None),
+                temperature=temperature,
+                max_tokens=cfg.MAX_TOKENS,
+            )
+            pred = reply["answer"] if isinstance(reply, dict) and "answer" in reply else [str(reply)]
+            if isinstance(pred, str):
+                pred = [pred]
+            if not isinstance(pred, list):
+                pred = [str(pred)]
+        except Exception as e:
+            records.append(
+                {
+                    "qid": qid,
+                    "qtype": qtype,
+                    "memory_type": memory_type,
+                    "error": str(e),
+                    "patient_id": pid_for_query,
+                    "visit_id": visit_id,
+                    "cutoff_event_id": cutoff_event_id,
+                    "visible_until_visit_idx": visible_until_visit_idx,
+                    "supp_meta": supp_meta,
+                }
+            )
+            continue
+
+        # 9) scoring (use eval_utils; expects pred_list: List[str])
+        score = score_weighted_acc(gt, pred_list=pred)
 
         scores_by_type[qtype].append(score)
+        rec = {
+            "qid": qid,
+            "qtype": qtype,
+            "memory_type": memory_type,
+            "patient_id": pid_for_query,
+            "visit_id": visit_id,
+            "cutoff_event_id": cutoff_event_id,
+            "visible_until_visit_idx": visible_until_visit_idx,
+            "query_text": query_text,
+            "pred": pred,
+            "reply": reply,
+            "score": score,
+            "gt": gt,
+            "supp_meta": supp_meta,
+            "retrieved": [{"score": h.score, "text": h.text, "meta": h.meta} for h in hits],
+        }
+        records.append(rec)
 
-        records.append(
-            {
-                "qid": qid,
-                "qtype": qtype,
-                "memory_type": args.memory_type,
-                "patient_id": patient_id,
-                "visit_id": visit_id,
-                "cutoff_event_id": cutoff_event_id,
-                "visible_until_visit_idx": visible_until_visit_idx,
-                "query_text": query_text,
-                "pred": pred,
-                "score": score,
-                "gt": gt,
-                "supp_meta": supp_meta,
-                "retrieved": [{"score": h.score, "text": h.text, "meta": h.meta} for h in hits],
-            }
-        )
-
-        if args.debug:
+        if debug:
             logger.info(f"[{qid}] qtype={qtype} score={score} pred={pred} gt={gt}")
 
-    # --- summarize ---
-    summary = {}
-    all_scores = []
+    # summarize
+    summary: Dict[str, Any] = {}
+    all_scores: List[float] = []
     for qt, ss in scores_by_type.items():
         arr = np.asarray(ss, dtype=float) if ss else np.zeros((0,), dtype=float)
         summary[qt] = {"n": int(len(ss)), "acc": float(arr.mean()) if len(arr) else 0.0}
         all_scores.extend(ss)
-    overall = float(np.mean(all_scores)) if all_scores else 0.0
 
-    out_jsonl = out_dir / f"{patient_id}.{args.memory_type}.{run_id}.pred.jsonl"
-    with out_jsonl.open("w", encoding="utf-8") as f:
+    overall = float(np.mean(all_scores)) if all_scores else 0.0
+    summary_out = {
+        "patient_id": patient_id,
+        "memory_type": memory_type,
+        "overall_acc": overall,
+        "by_type": summary,
+        "run_id": run_id,
+        "rag": {
+            "top_k": top_k,
+            "prefetch_k": prefetch_k,
+            "include_cutoff": include_cutoff,
+            "require_timestamp": require_timestamp,
+        },
+        "usage": llm.get_token_usage(),
+    }
+
+    # write outputs
+    pred_path = out_dir / f"{patient_id}.{memory_type}.{run_id}.rag.pred.jsonl"
+    with pred_path.open("w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    out_summary = out_dir / f"{patient_id}.{args.memory_type}.{run_id}.summary.json"
-    out_summary.write_text(
-        json.dumps(
-            {
-                "patient_id": patient_id,
-                "memory_type": args.memory_type,
-                "overall_acc": overall,
-                "by_type": summary,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    sum_path = out_dir / f"{patient_id}.{memory_type}.{run_id}.rag.summary.json"
+    sum_path.write_text(json.dumps(summary_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # plot acc by type
     order = ["T3-N", "T3-A", "T3-M", "T3-D"]
     keys = sorted(summary.keys(), key=lambda k: (order.index(k) if k in order else 999, k))
     vals = [summary[k]["acc"] for k in keys]
 
+    fig_path = out_dir / f"{patient_id}.{memory_type}.{run_id}.rag.acc_by_type.png"
     plt.figure(figsize=(7, 4))
     plt.bar(keys, vals)
     plt.ylim(0, 1.0)
     plt.xlabel("Question Type")
     plt.ylabel("Weighted Accuracy")
-    plt.title(f"RAG Acc by Type ({patient_id}, {args.memory_type})")
+    plt.title(f"RAG Acc by Type ({patient_id}, {memory_type})")
     plt.tight_layout()
-    out_png = out_dir / f"{patient_id}.{args.memory_type}.{run_id}.acc_by_type.png"
-    plt.savefig(out_png)
+    plt.savefig(fig_path)
     plt.close()
 
-    logger.info(f"[DONE] patient={patient_id} memory_type={args.memory_type} overall_acc={overall:.4f}")
-    logger.info(f"predictions: {out_jsonl}")
-    logger.info(f"summary:     {out_summary}")
-    logger.info(f"figure:      {out_png}")
+    logger.info(f"[DONE] patient={patient_id} memory_type={memory_type} overall_acc={overall:.4f}")
+    logger.info(f"predictions: {pred_path}")
+    logger.info(f"summary:     {sum_path}")
+    logger.info(f"figure:      {fig_path}")
+
+    return summary_out
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RAG evaluation for agentic decision task (aligned with llm_agent eval.py)")
+    parser.add_argument("--memory_type", type=str, default="event", help="Type of memory to use (e.g., 'event' or 'note')")
+    parser.add_argument("--temperature", type=float, default=0.0, help="LLM temperature for response generation")
+    parser.add_argument("--model", type=str, default=None, help="LLM model name (if applicable)")
+    parser.add_argument("--top_k", type=int, default=int(os.getenv("RAG_TOP_K", "16")))
+    parser.add_argument("--prefetch_k", type=int, default=int(os.getenv("RAG_PREFETCH_K", "200")))
+    parser.add_argument("--include_cutoff", action="store_true", default=True)
+    parser.add_argument("--require_timestamp", action="store_true", default=False)
+    parser.add_argument("--debug", action="store_true", default=False)
+    args = parser.parse_args()
+
+    question_dir = cfg.QUESTIONS_DIR
+    if not cfg.CLIP_PAITENT:
+        qfiles = sorted(question_dir.glob("*.jsonl"))
+    else:
+        qfiles = sorted([question_dir / f"P{str(pid).zfill(6)}.jsonl" for pid in cfg.CLIP_PATIENT_IDS])
+
+    if not qfiles:
+        logger.error(f"No question files found in {question_dir}")
+        return
+
+    if cfg.DEMO_MODE:
+        qfiles = qfiles[:cfg.DEMO_N]
+        logger.info(f"DEMO MODE: Only processing {len(qfiles)} files")
+    else:
+        logger.info(f"Found {len(qfiles)} question files to process")
+        
+    log_name = (f"rag_eval_{args.memory_type}_{args.temperature}_{args.model}"
+                f"_{args.top_k}_{args.prefetch_k}{"_include_cutoff" if args.include_cutoff else ""}"
+                f"{"_require_timestamp" if args.require_timestamp else ""}{"_debug" if args.debug else ""}.json"
+    )
+    if os.path.exists(out_dir/log_name):
+        with open(out_dir/log_name, "r", encoding="utf-8") as f:
+            existing_log = json.load(f)
+            done_files = set(existing_log.keys())
+            qfiles = [qf for qf in qfiles if qf.name not in done_files]
+            logger.info(f"Resuming from existing log. {len(qfiles)} files left to process.")
+    else:
+        existing_log = {}
+        logger.info(f"No existing log found. Starting fresh.")
+        
+    total_usage = {
+        "chat": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        },
+        "embedding": {
+            "input_tokens": 0,
+            "total_tokens": 0
+        },
+    }
+    total_log = {}
+    safe_mkdir(out_dir)
+    # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
+    #     futures = {
+    #         executor.submit(
+    #             run_one_visit_rag,
+    #             qf,
+    #             memory_type=args.memory_type,
+    #             temperature=args.temperature,
+    #             model=args.model,
+    #             top_k=args.top_k,
+    #             prefetch_k=args.prefetch_k,
+    #             include_cutoff=args.include_cutoff,
+    #             require_timestamp=args.require_timestamp,
+    #             debug=args.debug,
+    #         ): qf
+    #         for qf in qfiles
+    #     }
+    #     for future in as_completed(futures):
+    #         qf = futures[future]
+    #         try:
+    #             log = future.result()
+    #             logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+    #             # accumulate usage
+    #             for k, v in log.get("usage", {}).get("chat", {}).items():
+    #                 total_usage["chat"][k] += v
+    #             for k, v in log.get("usage", {}).get("embedding", {}).items():
+    #                 total_usage["embedding"][k] += v
+    #             total_log[qf.name] = log
+    #             with open(out_dir / log_name, "w", encoding="utf-8") as f:
+    #                 json.dump(total_log, f, ensure_ascii=False, indent=2)
+    #         except Exception as e:
+    #             logger.error(f"Error processing {qf}: {e}")
+                
+    for qf in qfiles:
+        try:
+            log = run_one_visit_rag(
+                qf,
+                memory_type=args.memory_type,
+                temperature=args.temperature,
+                model=args.model,
+                top_k=args.top_k,
+                prefetch_k=args.prefetch_k,
+                include_cutoff=args.include_cutoff,
+                require_timestamp=args.require_timestamp,
+                debug=args.debug,
+            )
+            logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+            # accumulate usage
+            for k, v in log.get("usage", {}).get("chat", {}).items():
+                total_usage["chat"][k] += v
+            for k, v in log.get("usage", {}).get("embedding", {}).items():
+                total_usage["embedding"][k] += v
+            total_log[qf.name] = log
+            with open(out_dir / log_name, "w", encoding="utf-8") as f:
+                json.dump(total_log, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Error processing {qf}: {e}")
+    logger.info(f"Total LLM Usage: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
+
 
 
 if __name__ == "__main__":

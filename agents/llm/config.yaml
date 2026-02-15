@@ -1,6 +1,6 @@
 # 要测试的模型列表（与 .env 中的 API Key 名称对应）
 models:
-  - QWEN_TURBO
+  # - QWEN_TURBO
   # - GPT5_MINI        # 注释掉即可跳过
   # - DEEPSEEK_V3_2
   - DEEPSEEK_V3.2_THINKING
