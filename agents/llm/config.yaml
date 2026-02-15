@@ -11,8 +11,7 @@ tasks:
   - visit_cloze
 
 specific_patients:
-  - P000175
-  - P000123
+  - P000001
   
 # 每个任务最多处理的患者数量（设为 null 表示全部）
 demo_n: null
