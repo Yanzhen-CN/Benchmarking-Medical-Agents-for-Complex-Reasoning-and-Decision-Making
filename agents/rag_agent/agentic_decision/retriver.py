@@ -54,12 +54,12 @@ class PatientRetriever:
     全量索引检索 + 运行时过滤可视范围
     """
 
-    def __init__(self) -> None:
+    def __init__(self, llm: Optional[LLMUtil] = None) -> None:
         self.root = Path(cfg.VECTOR_STORE_DIR)
         self.emb_model = cfg.EMBEDDING_MODEL
         self.normalize = cfg.NORMALIZE_EMBEDDINGS
         self.cache_indexes = cfg.CACHE_INDEXES
-        self.llm = LLMUtil()
+        self.llm = llm if llm is not None else LLMUtil()
 
         # cache: (patient_id, memory_type) -> (index, docs)
         self._cache: Dict[Tuple[str, str], Tuple[faiss.Index, List[Dict[str, Any]]]] = {}

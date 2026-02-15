@@ -308,7 +308,7 @@ def run_one_visit_rag(
     )
 
     llm = OpenAICompatibleLLMProvider()
-    retriever = PatientRetriever()
+    retriever = PatientRetriever(llm=llm.get_client())
 
     scores_by_type: Dict[str, List[float]] = defaultdict(list)
     records: List[Dict[str, Any]] = []
@@ -358,8 +358,11 @@ def run_one_visit_rag(
             prefer_notes_first=True,
         )
 
-        # 5) RAG retrieve (query = question text)
-        query_text = str(q.get("question", "")).strip() or str(pack.get("question", "")).strip()
+        # 5) build user MCQ (use eval_utils implementation)
+        user_content = format_mcq_user_content(q)
+
+        # 6) RAG retrieve (query = question text)
+        query_text = user_content
         pid_for_query = _parse_patient_id_from_qid(qid) or patient_id
 
         hits = retriever.search(
@@ -375,10 +378,6 @@ def run_one_visit_rag(
         )
 
         rag_block = _build_retrieved_system_block(hits)
-
-        # 6) build user MCQ (use eval_utils implementation)
-        user_content = format_mcq_user_content(q)
-
         # 7) compose messages (MATCH llm_agent style + add RAG block as a system msg)
         messages = (
             [
