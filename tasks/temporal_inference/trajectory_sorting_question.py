@@ -44,57 +44,59 @@ def is_valid_text(text):
 
 def extract_split_items(visit_events, visit_ref):
     """
-    拆分 Admission/Discharge 并携带原始 event_id
+    从一次就诊事件中提取 Admission 和 Discharge 片段，并添加显式类型标签。
     """
-    sorted_events = sorted(
-        visit_events, 
-        key=lambda x: x.get('timestamp') or "9999-12-31"
-    )
-
+    sorted_events = sorted(visit_events, key=lambda x: x.get('timestamp') or "9999-12-31")
     items = []
-    
-    # --- 1. Admission ---
+
+    # --- 1. Admission 处理 ---
     adm_event = next((e for e in sorted_events if e.get('event_type') == 'ADMISSION'), None)
     if adm_event:
         start_time = parse_ts(adm_event.get('timestamp'))
         original_id = adm_event.get('event_id', f"{visit_ref}_ADM_UNK")
-        
         c = adm_event.get('content', {})
         if isinstance(c, dict):
             parts = []
-            if is_valid_text(c.get('chief_complaint')): 
+            if is_valid_text(c.get('chief_complaint')):
                 parts.append(f"Admission Chief Complaint: {c['chief_complaint']}")
-            if is_valid_text(c.get('history_of_present_illness')): 
+            if is_valid_text(c.get('history_of_present_illness')):
                 parts.append(f"Admission History of Present Illness: {c['history_of_present_illness']}")
-            
             if parts:
+                # 添加类型标题
+                content_with_tag = "[ADMISSION NOTE]\n" + "\n".join(parts)
                 items.append({
                     "ref": f"{visit_ref}_ADM",
                     "original_event_id": original_id,
-                    "content": "\n".join(parts),
+                    "content": content_with_tag,
                     "timestamp": start_time,
                     "type": "ADMISSION"
                 })
 
-    # --- 2. Discharge ---
+    # --- 2. Discharge 处理 ---
     dis_event = next((e for e in reversed(sorted_events) if e.get('event_type') == 'DISCHARGE'), None)
     if dis_event:
         end_time = parse_ts(dis_event.get('timestamp'))
         original_id = dis_event.get('event_id', f"{visit_ref}_DIS_UNK")
-
         c = dis_event.get('content', {})
         if isinstance(c, dict):
             parts = []
-            if is_valid_text(c.get('discharge_diagnosis')): 
-                parts.append(f"Discharge Diagnosis: {c['discharge_diagnosis']}")
-            if is_valid_text(c.get('discharge_instructions')): 
-                parts.append(f"Discharge Instructions: {c['discharge_instructions']}")
-            
+            # 从 discharge_note 嵌套对象中提取
+            note = c.get('discharge_note', {})
+            if isinstance(note, dict):
+                diag = note.get('discharge_diagnosis')
+                if is_valid_text(diag):
+                    parts.append(f"Discharge Diagnosis: {diag}")
+                instr = note.get('discharge_instructions')
+                if is_valid_text(instr):
+                    parts.append(f"Discharge Instructions: {instr}")
             if parts:
+                # 为 discharge 内容添加编号，使其结构更清晰
+                numbered_parts = [f"{i+1}. {part}" for i, part in enumerate(parts)]
+                content_with_tag = "[DISCHARGE SUMMARY]\n" + "\n".join(numbered_parts)
                 items.append({
                     "ref": f"{visit_ref}_DIS",
                     "original_event_id": original_id,
-                    "content": "\n".join(parts),
+                    "content": content_with_tag,
                     "timestamp": end_time,
                     "type": "DISCHARGE"
                 })
