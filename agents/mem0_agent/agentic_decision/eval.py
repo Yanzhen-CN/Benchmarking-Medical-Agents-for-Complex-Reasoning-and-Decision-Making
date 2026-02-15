@@ -351,7 +351,7 @@ def run_one_visit_mem0(
                 run_id=run_id,
                 max_workers=int(os.getenv("MEM0_WRITE_WORKERS", "10")),
                 chunk_size=int(os.getenv("MEM0_WRITE_CHUNK", "20")),
-                retry=int(os.getenv("MEM0_WRITE_RETRY", "2")),
+                retry=int(os.getenv("MEM0_WRITE_RETRY", "5")),
             )
             total_added += ok_n
 
@@ -520,7 +520,7 @@ def main():
     parser = argparse.ArgumentParser(description="Mem0 evaluation for agentic decision task (aligned with rag eval.py)")
     parser.add_argument("--model", type=str)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--enable_thinking", action="store_true", default=True)
+    parser.add_argument("--enable_thinking", action="store_true", default=False)
     parser.add_argument("--memory_type", type=str, default="event", choices=["event", "note"])
     parser.add_argument("--disable_store_memories", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
@@ -572,50 +572,10 @@ def main():
         return
 
     # 并行
-    # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
-    #     futures = {
-    #         executor.submit(
-    #             run_one_visit_mem0,
-    #             qf,
-    #             memory_type=args.memory_type,
-    #             enable_thinking=args.enable_thinking,
-    #             model=args.model,
-    #             temperature=args.temperature,
-    #             top_k=cfg.MAX_KNOWN_FACTS,
-    #             max_recent_turns=cfg.KEEP_LAST_N_TURNS,
-    #             retrieval_policy=cfg.MEM0_RETRIVAL_POLICY,
-    #             query_rewrite=cfg.QUERY_REWRITE,
-    #             index_wait_s=cfg.MEM0_INDEX_WAIT_S,
-    #             disable_store_memories=args.disable_store_memories,
-    #             debug=args.debug,
-    #         ): qf
-    #         for qf in qfiles
-    #     }
-    #     for future in as_completed(futures):
-    #         qf = futures[future]
-    #         try:
-    #             log = future.result()
-    #             logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
-
-    #             # accumulate usage (与 rag eval 同结构)
-    #             usage = log.get("usage", {}) or {}
-    #             for k, v in (usage.get("chat", {}) or {}).items():
-    #                 if k in total_usage["chat"]:
-    #                     total_usage["chat"][k] += int(v or 0)
-    #             for k, v in (usage.get("embedding", {}) or {}).items():
-    #                 if k in total_usage["embedding"]:
-    #                     total_usage["embedding"][k] += int(v or 0)
-
-    #             total_log[qf.name] = log
-    #             with log_path.open("w", encoding="utf-8") as f:
-    #                 json.dump(total_log, f, ensure_ascii=False, indent=2)
-
-    #         except Exception as e:
-    #             logger.error(f"Error processing {qf}: {e}")
-    
-    for qf in qfiles:
-        try:
-            log = run_one_visit_mem0(
+    with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
+        futures = {
+            executor.submit(
+                run_one_visit_mem0,
                 qf,
                 memory_type=args.memory_type,
                 enable_thinking=args.enable_thinking,
@@ -628,24 +588,64 @@ def main():
                 index_wait_s=cfg.MEM0_INDEX_WAIT_S,
                 disable_store_memories=args.disable_store_memories,
                 debug=args.debug,
-            )
-            logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+            ): qf
+            for qf in qfiles
+        }
+        for future in as_completed(futures):
+            qf = futures[future]
+            try:
+                log = future.result()
+                logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
 
-            # accumulate usage (与 rag eval 同结构)
-            usage = log.get("usage", {}) or {}
-            for k, v in (usage.get("chat", {}) or {}).items():
-                if k in total_usage["chat"]:
-                    total_usage["chat"][k] += int(v or 0)
-            for k, v in (usage.get("embedding", {}) or {}).items():
-                if k in total_usage["embedding"]:
-                    total_usage["embedding"][k] += int(v or 0)
+                # accumulate usage (与 rag eval 同结构)
+                usage = log.get("usage", {}) or {}
+                for k, v in (usage.get("chat", {}) or {}).items():
+                    if k in total_usage["chat"]:
+                        total_usage["chat"][k] += int(v or 0)
+                for k, v in (usage.get("embedding", {}) or {}).items():
+                    if k in total_usage["embedding"]:
+                        total_usage["embedding"][k] += int(v or 0)
 
-            total_log[qf.name] = log
-            with log_path.open("w", encoding="utf-8") as f:
-                json.dump(total_log, f, ensure_ascii=False, indent=2)
+                total_log[qf.name] = log
+                with log_path.open("w", encoding="utf-8") as f:
+                    json.dump(total_log, f, ensure_ascii=False, indent=2)
 
-        except Exception as e:
-            logger.error(f"Error processing {qf}: {e}")
+            except Exception as e:
+                logger.error(f"Error processing {qf}: {e}")
+    
+    # for qf in qfiles:
+    #     try:
+    #         log = run_one_visit_mem0(
+    #             qf,
+    #             memory_type=args.memory_type,
+    #             enable_thinking=args.enable_thinking,
+    #             model=args.model,
+    #             temperature=args.temperature,
+    #             top_k=cfg.MAX_KNOWN_FACTS,
+    #             max_recent_turns=cfg.KEEP_LAST_N_TURNS,
+    #             retrieval_policy=cfg.MEM0_RETRIVAL_POLICY,
+    #             query_rewrite=cfg.QUERY_REWRITE,
+    #             index_wait_s=cfg.MEM0_INDEX_WAIT_S,
+    #             disable_store_memories=args.disable_store_memories,
+    #             debug=args.debug,
+    #         )
+    #         logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+
+    #         # accumulate usage (与 rag eval 同结构)
+    #         usage = log.get("usage", {}) or {}
+    #         for k, v in (usage.get("chat", {}) or {}).items():
+    #             if k in total_usage["chat"]:
+    #                 total_usage["chat"][k] += int(v or 0)
+    #         for k, v in (usage.get("embedding", {}) or {}).items():
+    #             if k in total_usage["embedding"]:
+    #                 total_usage["embedding"][k] += int(v or 0)
+
+    #         total_log[qf.name] = log
+    #         with log_path.open("w", encoding="utf-8") as f:
+    #             json.dump(total_log, f, ensure_ascii=False, indent=2)
+
+    #     except Exception as e:
+    #         logger.error(f"Error processing {qf}: {e}")
 
     logger.info(f"Total LLM Usage: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 
