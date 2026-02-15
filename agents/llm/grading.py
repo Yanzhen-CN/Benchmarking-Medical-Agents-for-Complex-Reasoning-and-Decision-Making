@@ -14,7 +14,6 @@ RUN_DIR = ROOT_DIR / "run_llm"
 SCORE_DIR = ROOT_DIR / "score_data"
 CONFIG_PATH = Path(__file__).resolve().parent / "grading_config.yaml"
 
-# Global list to collect invalid samples (protected by lock)
 invalid_samples = []
 invalid_lock = threading.Lock()
 
@@ -34,23 +33,19 @@ def load_config():
     return default
 
 def parse_prediction(pred_str):
-    """Robust parsing of model prediction into list of ints."""
     if not isinstance(pred_str, str):
         return None
     pred_str = pred_str.strip()
-    # Try JSON
     try:
         return json.loads(pred_str)
     except json.JSONDecodeError:
         pass
-    # Try ast.literal_eval
     try:
         result = ast.literal_eval(pred_str)
         if isinstance(result, list):
             return result
     except (SyntaxError, ValueError):
         pass
-    # Try to extract first list-like pattern
     match = re.search(r'\[.*?\]', pred_str, re.DOTALL)
     if match:
         try:
@@ -60,19 +55,17 @@ def parse_prediction(pred_str):
     return None
 
 def compute_tau(pred, gt):
-    """Compute Kendall's tau, return None if invalid."""
     if not isinstance(pred, list) or not isinstance(gt, list):
         return None
     if len(pred) != len(gt):
         return None
     try:
         tau, _ = kendalltau(pred, gt)
-        return float(tau)
+        return float(tau) if not np.isnan(tau) else None  # 将 NaN 转为 None
     except:
         return None
 
 def process_patient_file(filepath, task, model):
-    """Process one patient JSONL file, return list of valid scores, and record invalid ones."""
     scores = []
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
@@ -83,24 +76,24 @@ def process_patient_file(filepath, task, model):
             gt = data.get('ground_truth')
             if pred_str is None or gt is None:
                 with invalid_lock:
-                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id} [MISSING_DATA]")
                 continue
 
             pred = parse_prediction(pred_str)
             if pred is None:
                 with invalid_lock:
-                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id} [PARSE_FAIL]")
                 continue
 
             if len(pred) != len(gt):
                 with invalid_lock:
-                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id} [LENGTH_MISMATCH] (gt={len(gt)}, pred={len(pred)})")
                 continue
 
             tau = compute_tau(pred, gt)
             if tau is None:
                 with invalid_lock:
-                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id}")
+                    invalid_samples.append(f"{task} ({model}): {pid}, {sample_id} [TAU_ERROR]")
                 continue
 
             scores.append({
@@ -122,9 +115,10 @@ def save_patient_scores(scores, task, model, pid):
             f.write('\n')
 
 def compute_model_summary(all_scores, task, model):
-    taus = [s['tau'] for s in all_scores if s['tau'] is not None]
+    # 再次确保 tau 是有效数值
+    taus = [s['tau'] for s in all_scores if s['tau'] is not None and not np.isnan(s['tau'])]
     n_valid = len(taus)
-    n_total = len(all_scores)
+    n_total = len(all_scores)  # 注意：all_scores 只包含有效样本，因此 n_total = n_valid
     mean_tau = float(np.mean(taus)) if n_valid > 0 else None
     std_tau = float(np.std(taus)) if n_valid > 0 else None
     summary = {
@@ -152,7 +146,6 @@ def save_task_summary(task, model_summaries):
         json.dump(global_summary, f, indent=2)
 
 def save_invalid_samples():
-    """Write all collected invalid samples to a file."""
     if not invalid_samples:
         return
     invalid_file = SCORE_DIR / "invalid_samples.txt"
@@ -190,7 +183,6 @@ def main():
                 if scores:
                     save_patient_scores(scores, task, model, pid)
                     all_scores.extend(scores)
-                # else: no valid scores for this patient (already recorded as invalid)
 
             if all_scores:
                 model_summary = compute_model_summary(all_scores, task, model)
