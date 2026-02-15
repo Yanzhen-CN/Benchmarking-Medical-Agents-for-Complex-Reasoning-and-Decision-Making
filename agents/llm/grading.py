@@ -1,14 +1,22 @@
 import os
 import json
 import yaml
+import ast
+import re
 import numpy as np
 from pathlib import Path
 from scipy.stats import kendalltau
+from collections import defaultdict
+import threading
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 RUN_DIR = ROOT_DIR / "run_llm"
 SCORE_DIR = ROOT_DIR / "score_data"
 CONFIG_PATH = Path(__file__).resolve().parent / "grading_config.yaml"
+
+# Global list to collect invalid samples (protected by lock)
+invalid_samples = []
+invalid_lock = threading.Lock()
 
 def load_config():
     default = {
@@ -26,18 +34,33 @@ def load_config():
     return default
 
 def parse_prediction(pred_str):
+    """Robust parsing of model prediction into list of ints."""
     if not isinstance(pred_str, str):
         return None
     pred_str = pred_str.strip()
+    # Try JSON
     try:
         return json.loads(pred_str)
     except json.JSONDecodeError:
+        pass
+    # Try ast.literal_eval
+    try:
+        result = ast.literal_eval(pred_str)
+        if isinstance(result, list):
+            return result
+    except (SyntaxError, ValueError):
+        pass
+    # Try to extract first list-like pattern
+    match = re.search(r'\[.*?\]', pred_str, re.DOTALL)
+    if match:
         try:
-            return eval(pred_str)
+            return ast.literal_eval(match.group())
         except:
-            return None
+            pass
+    return None
 
 def compute_tau(pred, gt):
+    """Compute Kendall's tau, return None if invalid."""
     if not isinstance(pred, list) or not isinstance(gt, list):
         return None
     if len(pred) != len(gt):
@@ -49,6 +72,7 @@ def compute_tau(pred, gt):
         return None
 
 def process_patient_file(filepath, task, model):
+    """Process one patient JSONL file, return list of valid scores, and record invalid ones."""
     scores = []
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
@@ -58,9 +82,29 @@ def process_patient_file(filepath, task, model):
             pred_str = data.get('prediction')
             gt = data.get('ground_truth')
             if pred_str is None or gt is None:
+                # Missing data – record as invalid
+                with invalid_lock:
+                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
                 continue
+
             pred = parse_prediction(pred_str)
+            if pred is None:
+                with invalid_lock:
+                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                continue
+
+            if len(pred) != len(gt):
+                with invalid_lock:
+                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                continue
+
             tau = compute_tau(pred, gt)
+            if tau is None:
+                # This could happen if elements are not comparable (e.g., non-integers)
+                with invalid_lock:
+                    invalid_samples.append(f"{task}: {pid}, {sample_id}")
+                continue
+
             scores.append({
                 "pid": pid,
                 "id": sample_id,
@@ -109,6 +153,16 @@ def save_task_summary(task, model_summaries):
     with open(out_dir / "summary.json", 'w', encoding='utf-8') as f:
         json.dump(global_summary, f, indent=2)
 
+def save_invalid_samples():
+    """Write all collected invalid samples to a file."""
+    if not invalid_samples:
+        return
+    invalid_file = SCORE_DIR / "invalid_samples.txt"
+    with open(invalid_file, 'w', encoding='utf-8') as f:
+        for line in invalid_samples:
+            f.write(line + '\n')
+    print(f"📄 Invalid samples saved to: {invalid_file} (total {len(invalid_samples)})")
+
 def main():
     config = load_config()
     tasks = config["tasks"]
@@ -138,8 +192,7 @@ def main():
                 if scores:
                     save_patient_scores(scores, task, model, pid)
                     all_scores.extend(scores)
-                else:
-                    print(f"  No valid scores for {pid}")
+                # else: no valid scores for this patient (already recorded as invalid)
 
             if all_scores:
                 model_summary = compute_model_summary(all_scores, task, model)
@@ -154,6 +207,7 @@ def main():
         else:
             print(f"No data for task {task}")
 
+    save_invalid_samples()
     print(f"Grading complete. Results in: {SCORE_DIR}")
 
 if __name__ == "__main__":
