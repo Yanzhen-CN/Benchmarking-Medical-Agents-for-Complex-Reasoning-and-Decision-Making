@@ -21,7 +21,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from util import logUtil
 logger = logUtil.setup_logger()
-
+from config import AgentTaskConfig  
+cfg = AgentTaskConfig()
 # ---- LLM Provider (OpenAI-compatible) ----
 from agents.mem0_agent import OpenAICompatibleLLMProvider  # reuse your provider
 # ---- Context builder (your existing API) ----
@@ -29,7 +30,7 @@ from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_
 from tasks.agentic_decision.eval_utils import *
 from tasks.agentic_decision.prompts import get_agent_qa_prompt, AGENT_ACTION_PROMPT
 
-from config import AgentTaskConfig  
+
 # ============================================================
 # IO
 # ============================================================
@@ -226,7 +227,7 @@ def llm_chat_once(
 # ============================================================
 # Main
 # ============================================================
-cfg = AgentTaskConfig()
+
 def run_one_visit(
     questions_jsonl: Path,
     memory_type: str = "event",
@@ -316,7 +317,7 @@ def run_one_visit(
                 temperature=temperature,
                 max_tokens=cfg.MAX_TOKENS,
             )
-            reply = reply["answer"] if isinstance(reply, dict) and "answer" in reply else [str(reply)]
+            pred = reply["answer"] if isinstance(reply, dict) and "answer" in reply else [str(reply)]
         except Exception as e:
             # record failure but continue
             rec = {
@@ -329,7 +330,7 @@ def run_one_visit(
             records.append(rec)
             continue
 
-        score = score_weighted_acc(gt, pred_list=reply)
+        score = score_weighted_acc(gt, pred_list=pred)
 
         scores_by_type[qtype].append(score)
         records.append(
@@ -337,7 +338,8 @@ def run_one_visit(
                 "qid": qid,
                 "qtype": qtype,
                 "memory_type": memory_type,
-                "pred": reply,
+                "pred": pred,
+                "reply": reply,
                 "score": score,
                 "gt": gt,
                 "supp_meta": supp_meta,
@@ -417,15 +419,6 @@ def main():
         logger.info(f"DEMO MODE: Only processing {len(qfiles)} files")
     else:
         logger.info(f"Found {len(qfiles)} question files to process")
-        
-    # with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
-    #     futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model): qf for qf in qfiles}
-    #     for future in as_completed(futures):
-    #         qf = futures[future]
-    #         try:
-    #             future.result()
-    #         except Exception as e:
-    #             logger.error(f"Error processing {qf}: {e}")
     
     total_usage = {
         "chat": {
@@ -438,17 +431,33 @@ def main():
             "total_tokens": 0
         },
     }
+    with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
+        futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model): qf for qf in qfiles}
+        for future in as_completed(futures):
+            qf = futures[future]
+            try:
+                log = future.result()
+                logger.info(f"Completed {qf}: {json.dumps(log, ensure_ascii=False, indent=2)}")
+                # Aggregate usage
+                for k, v in log.get("usage", {}).get("chat", {}).items():
+                    total_usage["chat"][k] += v
+                for k, v in log.get("usage", {}).get("embedding", {}).items():
+                    total_usage["embedding"][k] += v
+            except Exception as e:
+                logger.error(f"Error processing {qf}: {e}")
     
-    for qf in tqdm(qfiles):
-        try:
-            res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
-            logger.info(f"Result for {qf}: {res}")
-            for k, v in res.get("usage", {}).get("chat", {}).items():
-                total_usage["chat"][k] += v
-            for k, v in res.get("usage", {}).get("embedding", {}).items():
-                total_usage["embedding"][k] += v
-        except Exception as e:
-            logger.error(f"Error processing {qf}: {e}")
+
+    
+    # for qf in tqdm(qfiles):
+    #     try:
+    #         res = run_one_visit(qf, memory_type=args.memory_type, temperature=args.temperature, model=args.model)
+    #         logger.info(f"Result for {qf}: {res}")
+    #         for k, v in res.get("usage", {}).get("chat", {}).items():
+    #             total_usage["chat"][k] += v
+    #         for k, v in res.get("usage", {}).get("embedding", {}).items():
+    #             total_usage["embedding"][k] += v
+    #     except Exception as e:
+    #         logger.error(f"Error processing {qf}: {e}")
     
     logger.info(f"Total LLM token usage across all files: {json.dumps(total_usage, ensure_ascii=False, indent=2)}")
 
