@@ -31,7 +31,12 @@ from agents.mem0_agent.core import AgentConfig
 # 关键：你的“上下文+记忆”API（来自你上传的 get_messages_for_eval.py）
 # 确保脚本运行时 sys.path 里包含项目根目录
 from tasks.agentic_decision.get_messages_for_eval import get_memory_and_context_for_qid
-
+from tasks.agentic_decision.eval_utils import (
+    iter_jsonl,
+    score_weighted_acc,
+    format_mcq_user_content,
+    normalize_messages,
+)
 def build_agent(
     *,
     max_recent_turns: int,
@@ -60,45 +65,6 @@ def build_agent(
         config=cfg,
     )
     return agent, mem
-
-
-_ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
-
-def _to_str_content(x: Any) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x
-    # dict / list / 其它对象
-    try:
-        return json.dumps(x, ensure_ascii=False)
-    except Exception:
-        return str(x)
-
-def normalize_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role", "user")
-        if role not in _ALLOWED_ROLES:
-            # 兜底：未知 role 当成 assistant 或 tool 都行，这里当 tool
-            role = "tool"
-        out.append(
-            {
-                "role": role,
-                "content": _to_str_content(m.get("content")),
-            }
-        )
-    return out
-
-def iter_jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
 
 
 def store_fact(
@@ -134,76 +100,6 @@ def flush_memories(
     except Exception as exc:
         print(f"[warn] Memory cleanup failed: {exc}", file=sys.stderr)
 
-
-def _format_mcq_user_content(q: Dict[str, Any]) -> str:
-    """
-    把题目+候选项组织成最后一条 user 发言。
-    兼容你现有 jsonl：question/options/qtype/...
-    """
-    question = q.get("question", "")
-    options = q.get("options") or []
-    if not isinstance(options, list):
-        options = []
-
-    lines = [str(question).strip(), "", "Options:"]
-    for i, opt in enumerate(options):
-        lines.append(f"{i+1}. {opt}")
-    lines.append("")
-    lines.append("Please answer with the best option string exactly as listed.")
-    return "\n".join(lines)
-
-
-def _extract_pred_option(reply: Any, options: List[str]) -> str:
-    """
-    把模型输出归一到某个 option（尽量鲁棒）。
-    - 如果回复中包含某个 option 子串，取第一个匹配
-    - 否则回退为原始 reply 字符串（用于 debug）
-    """
-    r = reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)
-    r_low = r.lower()
-
-    # 精确匹配优先
-    for opt in options:
-        if isinstance(opt, str) and opt.lower().strip() == r_low.strip():
-            return opt
-
-    # 子串匹配
-    for opt in options:
-        if isinstance(opt, str) and opt.lower() in r_low:
-            return opt
-
-    # 最后：返回原文（可能导致 0 分）
-    return r.strip()
-
-
-def _score_weighted_acc(gt_answer: Any, pred: str) -> float:
-    """
-    加权 acc：
-    - 若 gt_answer 是 dict: {option: weight, ...}，score = gt.get(pred, 0)
-    - 若 gt_answer 是 str: score = 1 if pred==gt else 0
-    """
-    if isinstance(gt_answer, dict):
-        return float(gt_answer.get(pred, 0.0) or 0.0)
-    if isinstance(gt_answer, str):
-        return 1.0 if pred == gt_answer else 0.0
-    return 0.0
-
-
-def _build_memory_system_prompt(retrieved: List[str]) -> str:
-    """
-    按你的要求：在上下文末尾增加一条 system，包含检索返回信息。
-    """
-    if not retrieved:
-        return "Retrieved memory (top-k): <EMPTY>"
-
-    # 适度截断防爆 token
-    kept = []
-    for i, t in enumerate(retrieved[:50], 1):
-        tt = t if isinstance(t, str) else str(t)
-        if len(tt) > 1200:
-            tt = tt[:1200] + "..."
-        kept.append(f"[{i}] {tt}")
-    return "Retrieved memory (top-k):\n" + "\n".join(kept)
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -279,7 +175,7 @@ def main():
     ap.add_argument("--questions_jsonl", type=str, required=True, help="e.g., tasks/.../P000001.jsonl")
     ap.add_argument("--memory_type", type=str, default="event", choices=["event", "note"])
     ap.add_argument("--top_k", type=int, default=int(os.getenv("MEMORY_TOP_K", "5")))
-    ap.add_argument("--max_recent_turns", type=int, default=int(os.getenv("AGENT_MAX_RECENT_TURNS", "6")))
+    ap.add_argument("--max_recent_turns", type=int, default=int(os.getenv("AGENT_MAX_RECENT_TURNS", "16")))
     ap.add_argument("--retrieval_policy", type=str, default=os.getenv("AGENT_RETRIEVAL_POLICY", "question_only"))
     ap.add_argument("--query_rewrite", action="store_true", default=(os.getenv("AGENT_QUERY_REWRITE", "1") == "1"))
     ap.add_argument("--index_wait_s", type=float, default=float(os.getenv("MEM0_INDEX_WAIT_S", "0")))
@@ -324,8 +220,8 @@ def main():
 
     # ===== patient-level cache: 只在病人内递增 =====
     # 只在一个病人开始时 flush 一次
-    if not args.no_delete:
-        flush_memories(mem, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
+    # if not args.no_delete:
+    #     flush_memories(mem, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
 
     seen_fp = set()          # hash 去重
     last_mem_len = 0         # index diff（依赖 memories 单调增长）
@@ -364,25 +260,25 @@ def main():
             new_unique.append(m)
 
         # ---- 并发写入新增 ----
-        if new_unique:
-            ok_n = store_facts_concurrent(
-                mem,
-                new_unique,
-                user_id=user_id,
-                agent_id=agent_id,
-                app_id=app_id,
-                run_id=run_id,
-                max_workers=int(os.getenv("MEM0_WRITE_WORKERS", "10")),
-                chunk_size=int(os.getenv("MEM0_WRITE_CHUNK", "20")),
-                retry=int(os.getenv("MEM0_WRITE_RETRY", "2")),
-            )
-            total_added += ok_n
+        # if new_unique:
+        #     ok_n = store_facts_concurrent(
+        #         mem,
+        #         new_unique,
+        #         user_id=user_id,
+        #         agent_id=agent_id,
+        #         app_id=app_id,
+        #         run_id=run_id,
+        #         max_workers=int(os.getenv("MEM0_WRITE_WORKERS", "10")),
+        #         chunk_size=int(os.getenv("MEM0_WRITE_CHUNK", "20")),
+        #         retry=int(os.getenv("MEM0_WRITE_RETRY", "2")),
+        #     )
+        #     total_added += ok_n
 
-        if args.index_wait_s > 0:
-            time.sleep(args.index_wait_s)
+        # if args.index_wait_s > 0:
+        #     time.sleep(args.index_wait_s)
 
         # ---- 组织 messages ----
-        user_content = _format_mcq_user_content(q)
+        user_content = format_mcq_user_content(q)
 
         # ✅ 关键：context_messages 先 normalize（dict->str, role->assistant）
         ctx = normalize_messages(context_messages)
@@ -397,6 +293,8 @@ def main():
                 agent_id=agent_id,
                 app_id=app_id,
                 run_id=run_id,
+                json=True,
+                
             )
             retrieval_query = getattr(trace, "retrieval_query", None)
             retrieved_texts = [r.text for r in (trace.memories or [])] if hasattr(trace, "memories") else []
@@ -407,11 +305,12 @@ def main():
                 agent_id=agent_id,
                 app_id=app_id,
                 run_id=run_id,
+                json=True,
             )
             retrieval_query, retrieved_texts = None, []
 
-        pred = _extract_pred_option(reply, options)
-        score = _score_weighted_acc(gt, pred)
+        pred = extract_pred_option_json(reply, options)
+        score = score_weighted_acc(gt, pred)
 
         scores_by_type[qtype].append(score)
 
