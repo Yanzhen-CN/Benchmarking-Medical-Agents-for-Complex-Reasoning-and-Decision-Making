@@ -139,11 +139,21 @@ def build_memory_supplement_block(
     max_total_chars: int = 24000,
     max_item_chars: int = 900,
     prefer_notes_first: bool = True,
+    max_visible_visits: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Greedily pack as many memories (previous visits events/notes) as possible
     under a character budget.
     """
+    
+    if max_visible_visits is not None and max_visible_visits <= 0:
+        return "", {
+            "kept_count": 0,
+            "used_chars": 0,
+            "max_total_chars": max_total_chars,
+            "kept_visit_ids": [],
+            "num_bucket_visits": 0,
+        }
     buckets = bucket_memories_by_visit(memories, visit_order=visit_order)
     visit_ids = sorted(buckets.keys(), reverse=True)  # recent -> old
 
@@ -162,6 +172,9 @@ def build_memory_supplement_block(
             items = sorted(items, key=lambda x: (0 if is_note(x) else 1))
 
         any_added = False
+        if max_visible_visits is not None and len(kept_visits) >= max_visible_visits:
+            break
+        
         for it in items:
             t = it
             if len(t) > max_item_chars:
@@ -209,6 +222,7 @@ def llm_chat_once(
     model: Optional[str] = None,
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
+    enable_thinking: Optional[bool] = None
 ) -> Dict[str, Any]:
     """
     Wrapper for your OpenAICompatibleLLMProvider.
@@ -221,6 +235,8 @@ def llm_chat_once(
     kwargs["temperature"] = temperature
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking  # example flag for chain-of-thought; adjust as needed
     return llm.chat_json_ctx(messages=messages, **kwargs)  # type: ignore
 
 
@@ -233,6 +249,8 @@ def run_one_visit(
     memory_type: str = "event",
     temperature: float = 0.0,
     model: Optional[str] = None,
+    visible_visits: int = 10,
+    enable_thinking: bool = False,
     ) -> Dict[str, Any]:
 
     qpath = questions_jsonl
@@ -294,16 +312,16 @@ def run_one_visit(
             max_total_chars=cfg.MEM_CHARS,
             max_item_chars=cfg.ITEM_CHARS,
             prefer_notes_first=True,
+            max_visible_visits=visible_visits
         )
 
         # 4) build user MCQ
         user_content = format_mcq_user_content(q)
 
         # 5) final messages: context + system supplement + user question        
-        messages = [
-            {"role": "system", "content": AGENT_ACTION_PROMPT}, 
-            {"role": "system", "content": supp_text}
-        ] + ctx[1:] + [
+        messages = [{"role": "system", "content": AGENT_ACTION_PROMPT}] \
+        + [ {"role": "system", "content": supp_text}] if supp_text != "" else [] \
+        + ctx[1:] + [
             get_agent_qa_prompt(),
             {"role": "user", "content": user_content}
         ]
@@ -316,6 +334,7 @@ def run_one_visit(
                 model=(model.strip() if model else None),
                 temperature=temperature,
                 max_tokens=cfg.MAX_TOKENS,
+                enable_thinking=enable_thinking
             )
             pred = reply["answer"] if isinstance(reply, dict) and "answer" in reply else [str(reply)]
         except Exception as e:
@@ -402,6 +421,8 @@ def main():
     parser.add_argument("--memory_type", type=str, default="event", help="Type of memory to use (e.g., 'event' or 'note')")
     parser.add_argument("--temperature", type=float, default=0.0, help="LLM temperature for response generation")
     parser.add_argument("--model", type=str, default=None, help="LLM model name (if applicable)")
+    parser.add_argument("--visible_visits", type=int, default=9999, help="Number of most recent visits to include in context (if applicable)")
+    parser.add_argument("--enable_thinking", action="store_true", default=False ,help="Whether to enable 'thinking' (chain-of-thought) in the prompt")
     args = parser.parse_args()
 
     question_dir =cfg.QUESTIONS_DIR
@@ -420,7 +441,7 @@ def main():
     else:
         logger.info(f"Found {len(qfiles)} question files to process")
     
-    log_name = f"llm_eval_{args.memory_type}_{args.temperature}_{args.model}.log"
+    log_name = f"llm_eval_{args.memory_type}_{args.temperature}_{args.model}_{args.visible_visits}{'_thinking' if args.enable_thinking else ''}.log"
     if os.path.exists(out_dir/log_name):
         with open(out_dir/log_name, "r", encoding="utf-8") as f:
             existing_log = json.load(f)
@@ -445,7 +466,7 @@ def main():
     total_log = {}
     safe_mkdir(out_dir)
     with ProcessPoolExecutor(max_workers=min(cfg.MAXWORKERS, len(qfiles))) as executor:
-        futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model): qf for qf in qfiles}
+        futures = {executor.submit(run_one_visit, qf, args.memory_type, args.temperature, args.model, args.visible_visits, args.enable_thinking): qf for qf in qfiles}
         for future in as_completed(futures):
             qf = futures[future]
             try:
