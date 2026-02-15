@@ -41,7 +41,6 @@ def call_llm_task(task_item, model_config, max_retries=5):
                 api_key=model_config['api_key'],
                 base_url=model_config['base_url']
             )
-            # 环境变量名直接使用 env_prefix（可能包含点号）
             env_model_id_key = f"{model_config['env_prefix']}_MODEL_ID"
             model_id = os.getenv(env_model_id_key, model_config['default_model_id'])
 
@@ -113,11 +112,11 @@ def main():
     max_workers = config["max_workers"]
     specific_patients = config.get("specific_patients")
 
-    # 将原始模型名称转换为带参数的配置
+    # Process model names, add thinking param for _THINKING suffix
     model_list = []
     for m in raw_models:
         if m.endswith("_THINKING"):
-            base_name = m[:-9]  # 去掉 "_THINKING"
+            base_name = m[:-9]  # remove "_THINKING"
             model_list.append({
                 "name": m,
                 "env_name": base_name,
@@ -130,7 +129,7 @@ def main():
                 "params": {}
             })
 
-    # 构建有效模型配置
+    # Build valid model configs
     model_configs = {}
     valid_models = []
     for m in model_list:
@@ -138,16 +137,13 @@ def main():
         env_name = m["env_name"]
         params = m["params"]
 
-        # 直接使用 env_name 构造环境变量名，不替换点号
         api_key = os.getenv(f"{env_name}_API_KEY")
         base_url = os.getenv(f"{env_name}_BASE_URL")
         if not api_key:
             print(f"⚠️ Skipping {name} (env name: {env_name}): API key missing.")
             continue
 
-        # 输出目录使用的标签：将下划线替换为连字符，保留点号
         label = name.lower().replace("_", "-")
-        # 默认模型 ID：将 env_name 中的下划线替换为连字符，保留点号
         default_model_id = env_name.lower().replace("_", "-")
 
         model_configs[name] = {
@@ -157,7 +153,7 @@ def main():
             "api_key": api_key,
             "base_url": base_url,
             "params": params,
-            "env_prefix": env_name  # 用于读取 MODEL_ID 环境变量
+            "env_prefix": env_name
         }
         valid_models.append(name)
 
@@ -165,9 +161,9 @@ def main():
         print("❌ No valid models. Exiting.")
         return
 
-    # 构建任务列表
+    # Build task list
     all_tasks = []
-    expected_counts = defaultdict(int)  # key: (task, model_label, pid) -> 条目数
+    expected_counts = defaultdict(int)  # key: (task, model_label, pid) -> number of items
 
     for task in task_types:
         input_dir = os.path.join(ROOT_DIR, "context_data", task)
@@ -209,14 +205,14 @@ def main():
     print(f"🚀 Benchmarking {len(valid_models)} models on {len(task_types)} tasks.")
     print(f"📦 Total requests: {len(all_tasks)}")
 
-    # 共享数据结构和锁（用于实时保存）
+    # Shared data structures and lock for real-time saving
     results = {}
     token_usage = {}
     completed_counts = defaultdict(int)
     lock = threading.Lock()
     run_dir = os.path.join(ROOT_DIR, "run_llm")
 
-    # 按模型和任务分组记录失败任务
+    # Group failed tasks by (model, task)
     failed_by_model_task = defaultdict(list)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -282,7 +278,7 @@ def main():
                             "ground_truth": entry['ground_truth']
                         }, ensure_ascii=False) + "\n")
 
-    # 处理未完成的结果
+    # Handle any remaining results (should not happen normally)
     if results:
         print("\n📦 Writing remaining results (incomplete patients)...")
         for (task, model, pid), data in results.items():
@@ -298,12 +294,13 @@ def main():
                         "ground_truth": entry['ground_truth']
                     }, ensure_ascii=False) + "\n")
 
-    # 打印并保存 token 统计
+    # Print token usage summary
     print("\n🔢 Token Usage Summary:")
     for model, tasks in token_usage.items():
         for task, tokens in tasks.items():
             print(f"  {model} | {task}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
 
+    # Save token usage to files
     stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
     os.makedirs(stats_dir, exist_ok=True)
     for model, tasks in token_usage.items():
@@ -322,10 +319,10 @@ def main():
                 }, f, indent=2)
             print(f"📊 Token usage saved: {filepath}")
 
-    # 保存失败任务日志
+    # Save failed tasks logs (grouped by model and task)
+    failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
+    os.makedirs(failed_dir, exist_ok=True)  # Ensure directory exists even if no failures
     if failed_by_model_task:
-        failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
-        os.makedirs(failed_dir, exist_ok=True)
         for (model, task), failures in failed_by_model_task.items():
             safe_model = model.replace("/", "_")
             safe_task = task.replace("/", "_")
