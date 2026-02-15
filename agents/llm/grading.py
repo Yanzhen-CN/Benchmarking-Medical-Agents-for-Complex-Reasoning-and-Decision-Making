@@ -4,7 +4,6 @@ import yaml
 import numpy as np
 from pathlib import Path
 from scipy.stats import kendalltau
-from collections import defaultdict
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 RUN_DIR = ROOT_DIR / "run_llm"
@@ -14,7 +13,8 @@ CONFIG_PATH = Path(__file__).resolve().parent / "grading_config.yaml"
 def load_config():
     default = {
         "tasks": ["trajectory_sorting", "visit_cloze"],
-        "metric": "kendall_tau"  # reserved for future extension
+        "models": None,  # None means all models
+        "metric": "kendall_tau"
     }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -26,21 +26,18 @@ def load_config():
     return default
 
 def parse_prediction(pred_str):
-    """Convert prediction string to list of ints."""
     if not isinstance(pred_str, str):
         return None
     pred_str = pred_str.strip()
     try:
         return json.loads(pred_str)
     except json.JSONDecodeError:
-        # Fallback to eval (safe here as data is trusted)
         try:
             return eval(pred_str)
         except:
             return None
 
 def compute_tau(pred, gt):
-    """Compute Kendall's tau, return None if invalid."""
     if not isinstance(pred, list) or not isinstance(gt, list):
         return None
     if len(pred) != len(gt):
@@ -52,7 +49,6 @@ def compute_tau(pred, gt):
         return None
 
 def process_patient_file(filepath, task, model):
-    """Process one patient JSONL file, return list of score dicts per sample."""
     scores = []
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
@@ -75,7 +71,6 @@ def process_patient_file(filepath, task, model):
     return scores
 
 def save_patient_scores(scores, task, model, pid):
-    """Save individual sample scores for a patient as JSONL."""
     out_dir = SCORE_DIR / task / model
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{pid}.jsonl"
@@ -85,13 +80,11 @@ def save_patient_scores(scores, task, model, pid):
             f.write('\n')
 
 def compute_model_summary(all_scores, task, model):
-    """Aggregate scores for a model and save summary."""
     taus = [s['tau'] for s in all_scores if s['tau'] is not None]
     n_valid = len(taus)
     n_total = len(all_scores)
     mean_tau = float(np.mean(taus)) if n_valid > 0 else None
     std_tau = float(np.std(taus)) if n_valid > 0 else None
-
     summary = {
         "model": model,
         "task": task,
@@ -107,7 +100,6 @@ def compute_model_summary(all_scores, task, model):
     return summary
 
 def save_task_summary(task, model_summaries):
-    """Save global summary for a task (all models)."""
     global_summary = {
         "task": task,
         "models": model_summaries
@@ -120,6 +112,7 @@ def save_task_summary(task, model_summaries):
 def main():
     config = load_config()
     tasks = config["tasks"]
+    allowed_models = config["models"]
 
     print("Starting grading...")
     for task in tasks:
@@ -129,15 +122,16 @@ def main():
             continue
 
         model_summaries = []
-
         for model_dir in task_run_dir.iterdir():
             if not model_dir.is_dir():
                 continue
             model = model_dir.name
+            if allowed_models and model not in allowed_models:
+                print(f"Skipping model {model} (not in config)")
+                continue
             print(f"Processing model: {model}, task: {task}")
 
             all_scores = []
-
             for patient_file in model_dir.glob("P*.jsonl"):
                 pid = patient_file.stem
                 scores = process_patient_file(patient_file, task, model)
