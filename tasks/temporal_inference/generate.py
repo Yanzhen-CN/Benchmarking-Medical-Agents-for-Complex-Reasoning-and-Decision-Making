@@ -39,5 +39,8 @@ if __name__ == "__main__":
     # 2. Visit cloze task
     run_script("visit_cloze_question.py", description="Generate visit cloze questions")
     run_script("visit_cloze_context.py",   description="Generate visit cloze context")
+    
+    run_script("visit_sorting_question.py", description="Generate visit sorting questions")
+    run_script("visit_sorting_context.py",   description="Generate visit sorting context")
 
     print("All scripts completed successfully!")

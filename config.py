@@ -195,29 +195,31 @@ class FactQGenConfig:
         
 class TimelineGenConfig:
     def __init__(self):
-        # 继承基础配置 (如果有的话)
-        # build = BuildConfig() 
-    
-        base = Path(__file__).resolve().parent  # 假设config.py在项目根目录
+        base = Path(__file__).resolve().parent  # 项目根目录
+
+        # 输入目录
         self.PATIENTS_SEQ_DIR = base / "bench_data" / "patients_sequence"
 
         # --- 输出路径 ---
-        # 建议把两个子任务分开存放，方便评测脚本读取
         self.TASK_ROOT: Path = Path("./question_data")
         self.MICRO_CLOZE_DIR: Path = self.TASK_ROOT / "visit_cloze"
         self.TRAJECTORY_DIR: Path = self.TASK_ROOT / "trajectory_sorting"
+        # 新增 visit_sorting 目录
+        self.VISIT_SORTING_DIR: Path = self.TASK_ROOT / "visit_sorting"
 
         # --- 参数配置 ---
-        # 随机种子，保证每次生成的结果一致
         self.RANDOM_SEED: int = int(os.getenv("TIMELINE_SEED", "42"))
-        
-        # 排序任务：
-        # 窗口 (默认 5 个 Visit)
-        self.TRAJECTORY_WINDOW_SIZE: int = int(os.getenv("TIMELINE_WINDOW", "5"))
-        # 步长 (默认2)
-        self.TRAJECTORY_STRIDE: int = int(os.getenv("TIMELINE_STRIDE", "2"))
-        
-        # 填空任务：至少需要几个 targets 才能构成一个有效题目
+
+        # 排序任务通用窗口大小（用于 trajectory_sorting 和 visit_sorting）
+        self.SORTING_WINDOW_SIZE: int = int(os.getenv("SORTING_WINDOW", "5"))
+        # 步长
+        self.SORTING_STRIDE: int = int(os.getenv("SORTING_STRIDE", "1"))
+
+        # 如果希望为 visit_sorting 单独设置，可以添加：
+        # self.VISIT_SORTING_WINDOW_SIZE: int = int(os.getenv("VISIT_SORTING_WINDOW", "5"))
+        # self.VISIT_SORTING_STRIDE: int = int(os.getenv("VISIT_SORTING_STRIDE", "1"))
+
+        # 填空任务所需最少目标数
         self.MIN_TARGETS_FOR_CLOZE: int = 4
 
 class AgentQaGenConfig:
