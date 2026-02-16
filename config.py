@@ -264,7 +264,7 @@ class AgentTaskConfig:
         self.PATIENTS_DIR: Path = Path("./bench_data/patients")
         self.EVENT_SEQ_DIR: Path = Path("./bench_data/patients_sequence")
         
-        self.MAXWORKERS: int = 16
+        self.MAXWORKERS: int = 4
         self.MAX_VISIBALE_VISITS: int = 10
         self.MAX_KNOWN_FACTS: int = 10
         self.MEMORY_TYPE: str = "report" # report | event_stream
@@ -290,6 +290,10 @@ class AgentTaskConfig:
         self.RESULT_OUTPUT_DIR: Path = Path("./agents/llm_agent/agentic_decision/results")
         
         self.ITEM_CHARS: int = 64000  # 每个事件/指标的字符限制，过长会被截断
-        self.MEM_CHARS: int = 64000   # 从记忆中检索出来的内容总字符限制，过长会被截断
+        self.MEM_CHARS: int = 96000   # 从记忆中检索出来的内容总字符限制，过长会被截断
         self.CTX_CHARS: int = 128000     # 最终拼接到 prompt 中的上下文总字符限制，过长会被截断
         self.MAX_TOKENS: int = 4096           # LLM 生成的答案的最大 token 数，过长会被截断
+        
+        self.MEM0_RETRIVAL_POLICY: str = "question_only"  # always | question_only | never
+        self.QUERY_REWRITE: bool = True  # 是否在检索前改写
+        self.MEM0_INDEX_WAIT_S: float = 0
