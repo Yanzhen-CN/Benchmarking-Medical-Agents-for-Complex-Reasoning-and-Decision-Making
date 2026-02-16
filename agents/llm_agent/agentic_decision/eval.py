@@ -454,13 +454,13 @@ def main():
         
     total_usage = {
         "chat": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+            "prompt_tokens": existing_log.get("usage", {}).get("chat", {}).get("prompt_tokens", 0),
+            "completion_tokens": existing_log.get("usage", {}).get("chat", {}).get("completion_tokens", 0),
+            "total_tokens": existing_log.get("usage", {}).get("chat", {}).get("total_tokens", 0),
         },
         "embedding": {
-            "input_tokens": 0,
-            "total_tokens": 0
+            "input_tokens": existing_log.get("usage", {}).get("embedding", {}).get("input_tokens", 0),
+            "total_tokens": existing_log.get("usage", {}).get("embedding", {}).get("total_tokens", 0),
         },
     }
     total_log = existing_log
