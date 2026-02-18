@@ -112,7 +112,7 @@ class BuildConfig:
         
 
 class LLMConfig:
-    def __init__(self, provider: str = 'qwen', chat_model: str = "qwen-turbo", 
+    def __init__(self, provider: str = 'qwen', chat_model: str = "gpt-5-mini", 
                  embed_model: str = 'text-embedding-v3',
                  api_key: Optional[str] = None, base_url: Optional[str] = None):
         self.provider: str = provider  # qwen | openai | compatible
@@ -146,11 +146,11 @@ class ContextConfig:
         self.CONTEXT_OUT_DIR: Path = build.paths.BENCH_DATA_DIR / "context"
         
         self.USE_LLM_FOR_IMAGE_DESC: bool = True
-        self.IMAGE_DESC_MODEL: str = "qwen-turbo"
+        self.IMAGE_DESC_MODEL: str = "gpt-5-mini"
         self.IMAGE_DESC_THRESHOLD: float = 0.8
         
         self.USE_LLM_FOR_REASON: bool = True
-        self.REASON_MODEL: str = "qwen-turbo"
+        self.REASON_MODEL: str = "gpt-5-mini"
         
         self.llm_config: LLMConfig = LLMConfig()
 
@@ -265,8 +265,8 @@ class AgentTaskConfig:
         self.EVENT_SEQ_DIR: Path = Path("./bench_data/patients_sequence")
         
         self.MAXWORKERS: int = 4
-        self.MAX_VISIBALE_VISITS: int = 10
-        self.MAX_KNOWN_FACTS: int = 10
+        self.MAX_VISIBALE_VISITS: int = 9999
+        self.MAX_KNOWN_FACTS: int = 20
         self.MEMORY_TYPE: str = "report" # report | event_stream
         self.MAX_EVENTS_PER_VISIT = 9999
         
@@ -279,7 +279,7 @@ class AgentTaskConfig:
         self.DEMO_MODE: bool = False
         self.DEMO_N: int = 5
         
-        self.KEEP_LAST_N_TURNS: int = 32
+        self.KEEP_LAST_N_TURNS: int = 999999999999
         
         self.VECTOR_STORE_DIR: Path = Path("./agents/rag_agent/agentic_decision/vector_store")
         self.EMBEDDING_MODEL: str = "text-embedding-v4"
@@ -289,9 +289,9 @@ class AgentTaskConfig:
         
         self.RESULT_OUTPUT_DIR: Path = Path("./agents/llm_agent/agentic_decision/results")
         
-        self.ITEM_CHARS: int = 64000  # 每个事件/指标的字符限制，过长会被截断
-        self.MEM_CHARS: int = 96000   # 从记忆中检索出来的内容总字符限制，过长会被截断
-        self.CTX_CHARS: int = 128000     # 最终拼接到 prompt 中的上下文总字符限制，过长会被截断
+        self.ITEM_CHARS: int = 99999999999  # 每个事件/指标的字符限制，过长会被截断
+        self.MEM_CHARS: int = 999999999999   # 从记忆中检索出来的内容总字符限制，过长会被截断
+        self.CTX_CHARS: int = 999999999999     # 最终拼接到 prompt 中的上下文总字符限制，过长会被截断
         self.MAX_TOKENS: int = 4096           # LLM 生成的答案的最大 token 数，过长会被截断
         
         self.MEM0_RETRIVAL_POLICY: str = "question_only"  # always | question_only | never
