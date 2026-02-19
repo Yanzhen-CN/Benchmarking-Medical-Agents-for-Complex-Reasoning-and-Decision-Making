@@ -138,14 +138,23 @@ def compute_model_summary(all_scores, total_samples, task, model):
     return summary
 
 def save_task_summary(task, model_summaries):
-    global_summary = {
+    task_summary = {
         "task": task,
         "models": model_summaries
     }
     out_dir = SCORE_DIR / task
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "summary.json", 'w', encoding='utf-8') as f:
+        json.dump(task_summary, f, indent=2)
+    return task_summary
+
+def save_global_summary(all_task_summaries):
+    """保存所有任务的汇总文件"""
+    global_summary = {"tasks": all_task_summaries}
+    out_path = SCORE_DIR / "summary.json"
+    with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(global_summary, f, indent=2)
+    print(f"🌍 Global summary saved to: {out_path}")
 
 def save_invalid_samples():
     if not invalid_samples:
@@ -162,6 +171,8 @@ def main():
     allowed_models = config["models"]
 
     print("Starting grading...")
+    all_task_summaries = []  # 收集每个任务的摘要
+
     for task in tasks:
         task_run_dir = RUN_DIR / task
         if not task_run_dir.exists():
@@ -196,10 +207,15 @@ def main():
                 print(f"  No data for model {model}")
 
         if model_summaries:
-            save_task_summary(task, model_summaries)
+            task_summary = save_task_summary(task, model_summaries)
+            all_task_summaries.append(task_summary)
             print(f"Task {task} summary saved.")
         else:
             print(f"No data for task {task}")
+
+    # 保存全局汇总
+    if all_task_summaries:
+        save_global_summary(all_task_summaries)
 
     save_invalid_samples()
     print(f"Grading complete. Results in: {SCORE_DIR}")
