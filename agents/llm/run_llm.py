@@ -170,7 +170,7 @@ def run_resume_failed(config):
 
     model_configs = {}
     label_to_name = {}
-    name_to_label = {}                     # 新增反向映射
+    name_to_label = {}                     # 反向映射：原始名 -> 标签
     for m in model_list:
         name = m["name"]
         env_name = m["env_name"]
@@ -199,7 +199,7 @@ def run_resume_failed(config):
     file_cache_lock = threading.Lock()
 
     for model_label, task, pid, item_id in failed_items:
-        # 应用过滤器（修复后的版本）
+        # 应用过滤器（使用原始模型名转换后的标签）
         if model_filter:
             # 将 model_filter 中的原始模型名转换为标签
             filter_labels = [name_to_label.get(m, m) for m in model_filter]
@@ -345,17 +345,25 @@ def run_resume_failed(config):
 def main():
     config = load_config(CONFIG_PATH)
 
-    # 判断是否进入重跑模式
-    if config.get("resume_failed", False):
-        run_resume_failed(config)
-        return
+    # ---------- 模式选择 ----------
+    resume_cfg = config.get("resume_failed")
+    if resume_cfg:
+        if isinstance(resume_cfg, dict):
+            enabled = resume_cfg.get("enabled", True)
+        else:
+            enabled = bool(resume_cfg)
+        if enabled:
+            run_resume_failed(config)
+            return
+        # 否则 enabled == False，继续正常模式
 
-    # 以下是正常模式（支持精确到 ID 的配置）
+    # ---------- 正常模式（支持 specific_items 精确到 ID） ----------
     raw_models = config["models"]
     task_types = config["tasks"]
     demo_n = config["demo_n"]
     max_workers = config["max_workers"]
     specific_patients = config.get("specific_patients")
+    specific_items = config.get("specific_items")  # 新配置，精确到 ID
 
     # 处理模型，添加 thinking 参数
     model_list = []
@@ -406,14 +414,12 @@ def main():
         print("❌ No valid models. Exiting.")
         return
 
-    # ---------- 任务构建（支持精确到 ID 的配置） ----------
+    # ---------- 任务构建 ----------
     all_tasks = []
     expected_counts = defaultdict(int)  # key: (task, model_label, pid) -> number of items
 
-    # 检查是否配置了 specific_items
-    specific_items = config.get("specific_items")
+    # 如果配置了 specific_items，则以此为准（忽略 specific_patients 和 demo_n）
     if specific_items:
-        # 如果存在 specific_items，则忽略原有的 specific_patients 和 demo_n
         # 构建 patient -> allowed_ids 映射
         patient_id_whitelist = {}
         for item in specific_items:
@@ -421,9 +427,9 @@ def main():
             if not pid:
                 print(f"⚠️ specific_items 条目缺少 patient 字段，已跳过: {item}")
                 continue
-            ids = item.get("ids")  # 如果 ids 不存在，则为 None
+            ids = item.get("ids")
             if ids is None:
-                # 没有 ids 字段，表示处理该患者的所有条目
+                # 没有 ids 字段，视为处理该患者的所有条目
                 patient_id_whitelist[pid] = None
             elif isinstance(ids, list):
                 # 有 ids 列表，转换为 set
@@ -434,8 +440,8 @@ def main():
         target_patients = set(patient_id_whitelist.keys())
     else:
         # 未配置 specific_items，使用原有的筛选逻辑
+        patient_id_whitelist = None
         target_patients = None
-        # 注意：specific_patients 和 demo_n 会在文件循环中处理
 
     for task in task_types:
         input_dir = os.path.join(ROOT_DIR, "context_data", task)
@@ -450,7 +456,6 @@ def main():
             # 只保留在 target_patients 中的文件
             files = [f for f in files if os.path.basename(f).replace(".jsonl", "") in target_patients]
         else:
-            # 原有逻辑：specific_patients 或 demo_n
             if specific_patients:
                 target_files = []
                 for pid in specific_patients:
