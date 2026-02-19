@@ -23,7 +23,8 @@ def load_config(config_path):
         "tasks": ["trajectory_sorting", "visit_cloze"],
         "demo_n": None,
         "max_workers": 10,
-        "specific_patients": None
+        "specific_patients": None,
+        "resume_failed": False   # 新增默认值
     }
     if config_path.exists():
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -35,6 +36,7 @@ def load_config(config_path):
     return default
 
 def call_llm_task(task_item, model_config, max_retries=5):
+    # 此函数与原始代码完全相同
     for attempt in range(max_retries):
         try:
             client = OpenAI(
@@ -104,8 +106,255 @@ def call_llm_task(task_item, model_config, max_retries=5):
         "error": "Max retries exceeded due to rate limit."
     }
 
+def run_resume_failed(config):
+    """根据失败日志重新运行失败的任务"""
+    from collections import defaultdict
+    import threading
+    import os
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
+
+    # ---------- 1. 解析重跑配置 ----------
+    resume_cfg = config["resume_failed"]
+    if isinstance(resume_cfg, dict):
+        enabled = resume_cfg.get("enabled", True)
+        model_filter = resume_cfg.get("model_filter")
+        task_filter = resume_cfg.get("task_filter")
+    else:
+        enabled = bool(resume_cfg)
+        model_filter = None
+        task_filter = None
+
+    if not enabled:
+        print("⚠️ resume_failed is not enabled, but function called.")
+        return
+
+    # ---------- 2. 读取失败记录 ----------
+    failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
+    if not os.path.isdir(failed_dir):
+        print(f"❌ Failed directory not found: {failed_dir}")
+        return
+
+    failed_files = glob.glob(os.path.join(failed_dir, "*_failed_summary.json"))
+    if not failed_files:
+        print("❌ No failed summary files found.")
+        return
+
+    # 解析失败记录，按 (model_label, task, pid, id) 存储
+    failed_items = []  # 每个元素为 (model_label, task, pid, id)
+    for ff in failed_files:
+        with open(ff, 'r', encoding='utf-8') as f:
+            failures = json.load(f)
+        # 从文件名提取 model 和 task（例如 gpt-5-mini_visit_cloze_failed_summary.json）
+        basename = os.path.basename(ff).replace("_failed_summary.json", "")
+        parts = basename.split("_", 1)  # 第一个下划线前是 model_label，后面是 task
+        if len(parts) != 2:
+            print(f"⚠️ Skipping file with unexpected name: {ff}")
+            continue
+        model_label, task = parts
+        for fail in failures:
+            pid = fail.get("pid")
+            item_id = fail.get("id")
+            if pid and item_id:
+                failed_items.append((model_label, task, pid, item_id))
+
+    print(f"📦 Total failed items to retry: {len(failed_items)}")
+
+    # ---------- 3. 构建有效模型配置（复用原逻辑） ----------
+    raw_models = config["models"]
+    model_list = []
+    for m in raw_models:
+        if m.endswith("_THINKING"):
+            base_name = m[:-9]
+            model_list.append({"name": m, "env_name": base_name, "params": {"extra_body": {"enable_thinking": True}}})
+        else:
+            model_list.append({"name": m, "env_name": m, "params": {}})
+
+    model_configs = {}
+    label_to_name = {}
+    for m in model_list:
+        name = m["name"]
+        env_name = m["env_name"]
+        params = m["params"]
+        api_key = os.getenv(f"{env_name}_API_KEY")
+        base_url = os.getenv(f"{env_name}_BASE_URL")
+        if not api_key:
+            continue
+        label = name.lower().replace("_", "-")
+        default_model_id = env_name.lower().replace("_", "-")
+        model_configs[name] = {
+            "name": name,
+            "label": label,
+            "default_model_id": default_model_id,
+            "api_key": api_key,
+            "base_url": base_url,
+            "params": params,
+            "env_prefix": env_name
+        }
+        label_to_name[label] = name
+
+    # ---------- 4. 构建重跑任务列表 ----------
+    tasks_to_run = []
+    # 缓存每个 (task, pid) 的原始数据，避免重复读取
+    file_cache = {}          # key: (task, pid) -> list of items
+    file_cache_lock = threading.Lock()
+
+    for model_label, task, pid, item_id in failed_items:
+        # 应用过滤器
+        if model_filter and model_label not in [label_to_name.get(m, m) for m in model_filter]:
+            continue
+        if task_filter and task not in task_filter:
+            continue
+        model_name = label_to_name.get(model_label)
+        if not model_name:
+            print(f"⚠️ Unknown model label: {model_label}, skipping.")
+            continue
+
+        cache_key = (task, pid)
+        with file_cache_lock:
+            if cache_key not in file_cache:
+                input_path = os.path.join(ROOT_DIR, "context_data", task, f"{pid}.jsonl")
+                if not os.path.exists(input_path):
+                    print(f"⚠️ Original data file not found: {input_path}, skipping {pid} {item_id}")
+                    continue
+                items = []
+                with open(input_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip():
+                            items.append(json.loads(line))
+                file_cache[cache_key] = items
+            else:
+                items = file_cache[cache_key]
+
+        # 查找指定 id 的条目
+        target_item = next((it for it in items if it["id"] == item_id), None)
+        if not target_item:
+            print(f"⚠️ Item id {item_id} not found in {task}/{pid}.jsonl, skipping.")
+            continue
+
+        tasks_to_run.append({
+            "task_type": task,
+            "pid": pid,
+            "id": item_id,
+            "messages": target_item["messages"],
+            "ground_truth": target_item["ground_truth"],
+            "llm_name": model_name
+        })
+
+    print(f"🚀 Retrying {len(tasks_to_run)} tasks after filtering.")
+
+    if not tasks_to_run:
+        print("No tasks to run.")
+        return
+
+    # ---------- 5. 并发执行，实时更新输出文件 ----------
+    file_write_locks = defaultdict(threading.Lock)   # key: full output path
+    token_usage = defaultdict(lambda: defaultdict(lambda: {"prompt": 0, "completion": 0, "total": 0}))
+    new_failures = defaultdict(list)                  # key: (model_label, task)
+
+    run_dir = os.path.join(ROOT_DIR, "run_llm")
+
+    with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
+        future_map = {
+            executor.submit(call_llm_task, t, model_configs[t['llm_name']]): t
+            for t in tasks_to_run
+        }
+
+        for future in tqdm(as_completed(future_map), total=len(tasks_to_run), desc="Retrying Failed Tasks"):
+            res = future.result()
+            if res['status'] == 'success':
+                # 更新 token 统计
+                if res.get('usage'):
+                    model = res['llm_label']
+                    task = res['task_type']
+                    token_usage[model][task]["prompt"] += res['usage']['prompt_tokens']
+                    token_usage[model][task]["completion"] += res['usage']['completion_tokens']
+                    token_usage[model][task]["total"] += res['usage']['total_tokens']
+
+                # 更新输出文件
+                task = res['task_type']
+                model_label = res['llm_label']
+                pid = res['pid']
+                out_dir = os.path.join(run_dir, task, model_label)
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"{pid}.jsonl")
+
+                new_entry = {
+                    "id": res['id'],
+                    "prediction": res['prediction'],
+                    "ground_truth": res['ground_truth']
+                }
+
+                # 加锁，读取现有文件，更新对应 id，再写回
+                with file_write_locks[out_path]:
+                    existing = {}
+                    if os.path.exists(out_path):
+                        with open(out_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                if line.strip():
+                                    item = json.loads(line)
+                                    existing[item["id"]] = item
+                    existing[res['id']] = new_entry
+                    sorted_items = sorted(existing.values(), key=lambda x: x['id'])
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        for item in sorted_items:
+                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            else:
+                # 重跑仍然失败，记录到新失败列表
+                model_label = res['llm_label']
+                task = res['task_type']
+                new_failures[(model_label, task)].append({
+                    "pid": res['pid'],
+                    "id": res['id'],
+                    "error": res['error']
+                })
+
+    # ---------- 6. 保存重跑后的 token 使用情况 ----------
+    stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
+    os.makedirs(stats_dir, exist_ok=True)
+    for model, tasks in token_usage.items():
+        for task, tokens in tasks.items():
+            safe_model = model.replace("/", "_")
+            safe_task = task.replace("/", "_")
+            filename = f"{safe_model}_{safe_task}_usage_retry.json"
+            filepath = os.path.join(stats_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "model": model,
+                    "task": task,
+                    "prompt_tokens": tokens["prompt"],
+                    "completion_tokens": tokens["completion"],
+                    "total_tokens": tokens["total"]
+                }, f, indent=2)
+            print(f"📊 Token usage (retry) saved: {filepath}")
+
+    # ---------- 7. 保存新的失败记录 ----------
+    retry_failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed_retry")
+    os.makedirs(retry_failed_dir, exist_ok=True)
+    if new_failures:
+        for (model_label, task), failures in new_failures.items():
+            safe_model = model_label.replace("/", "_")
+            safe_task = task.replace("/", "_")
+            filename = f"{safe_model}_{safe_task}_failed_retry.json"
+            filepath = os.path.join(retry_failed_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(failures, f, indent=2, ensure_ascii=False)
+            print(f"❌ New failures during retry: {len(failures)} items saved to {filepath}")
+    else:
+        print("✅ All failed tasks retried successfully.")
+
+    print(f"\n✅ Retry done. Updated results in '{run_dir}', token stats in '{stats_dir}', new failures in '{retry_failed_dir}'.")
+
 def main():
     config = load_config(CONFIG_PATH)
+
+    # 判断是否进入重跑模式
+    if config.get("resume_failed", False):
+        run_resume_failed(config)
+        return
+
+    # 以下是正常模式（原代码保持不变）
     raw_models = config["models"]
     task_types = config["tasks"]
     demo_n = config["demo_n"]
@@ -116,7 +365,7 @@ def main():
     model_list = []
     for m in raw_models:
         if m.endswith("_THINKING"):
-            base_name = m[:-9]  # remove "_THINKING"
+            base_name = m[:-9]
             model_list.append({
                 "name": m,
                 "env_name": base_name,
@@ -278,7 +527,7 @@ def main():
                             "ground_truth": entry['ground_truth']
                         }, ensure_ascii=False) + "\n")
 
-    # Handle any remaining results (should not happen normally)
+    # Handle any remaining results
     if results:
         print("\n📦 Writing remaining results (incomplete patients)...")
         for (task, model, pid), data in results.items():
@@ -319,9 +568,9 @@ def main():
                 }, f, indent=2)
             print(f"📊 Token usage saved: {filepath}")
 
-    # Save failed tasks logs (grouped by model and task)
+    # Save failed tasks logs
     failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
-    os.makedirs(failed_dir, exist_ok=True)  # Ensure directory exists even if no failures
+    os.makedirs(failed_dir, exist_ok=True)
     if failed_by_model_task:
         for (model, task), failures in failed_by_model_task.items():
             safe_model = model.replace("/", "_")
