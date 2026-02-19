@@ -382,7 +382,7 @@ def run_one_visit_rag(
         messages = (
             [
                 {"role": "system", "content": AGENT_ACTION_PROMPT},
-                {"role": "system", "content": supp_text},
+                # {"role": "system", "content": supp_text},
             ]
             + (ctx[1:] if len(ctx) > 1 else [])
             + [
@@ -535,7 +535,7 @@ def main():
         
     log_name = (f"rag_eval_{args.memory_type}_{args.temperature}_{args.model}"
                 f"_{args.top_k}_{args.prefetch_k}{"_include_cutoff" if args.include_cutoff else ""}"
-                f"{"_require_timestamp" if args.require_timestamp else ""}{"_debug" if args.debug else ""}.json"
+                f"{"_require_timestamp" if args.require_timestamp else ""}{"_debug" if args.debug else ""}_nolimit.json"
     )
     if os.path.exists(out_dir/log_name):
         with open(out_dir/log_name, "r", encoding="utf-8") as f:

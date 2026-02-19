@@ -547,7 +547,7 @@ def main():
     log_name = (
         f"mem0_eval_{args.model}_{args.temperature}{ '_thinking' if args.enable_thinking else ''}_{args.memory_type}"
         f"{'_no_store' if args.disable_store_memories else ''}"
-        f"{'_debug' if args.debug else ''}.json"
+        f"{'_debug' if args.debug else ''}_nolimit.json"
     )
 
     log_path = out_dir / log_name
