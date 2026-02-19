@@ -61,19 +61,23 @@ def compute_tau(pred, gt):
         return None
     try:
         tau, _ = kendalltau(pred, gt)
-        return float(tau) if not np.isnan(tau) else None  # 将 NaN 转为 None
+        return float(tau) if not np.isnan(tau) else None
     except:
         return None
 
 def process_patient_file(filepath, task, model):
+    """处理单个患者文件，返回有效分数列表和文件总行数"""
     scores = []
+    total_count = 0
+    pid = filepath.stem
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
+            total_count += 1
             data = json.loads(line)
-            pid = filepath.stem
             sample_id = data.get('id')
             pred_str = data.get('prediction')
             gt = data.get('ground_truth')
+
             if pred_str is None or gt is None:
                 with invalid_lock:
                     invalid_samples.append(f"{task} ({model}): {pid}, {sample_id} [MISSING_DATA]")
@@ -103,7 +107,7 @@ def process_patient_file(filepath, task, model):
                 "prediction": pred,
                 "ground_truth": gt
             })
-    return scores
+    return scores, total_count
 
 def save_patient_scores(scores, task, model, pid):
     out_dir = SCORE_DIR / task / model
@@ -114,18 +118,16 @@ def save_patient_scores(scores, task, model, pid):
             json.dump(s, f, ensure_ascii=False)
             f.write('\n')
 
-def compute_model_summary(all_scores, task, model):
-    # 再次确保 tau 是有效数值
-    taus = [s['tau'] for s in all_scores if s['tau'] is not None and not np.isnan(s['tau'])]
-    n_valid = len(taus)
-    n_total = len(all_scores)  # 注意：all_scores 只包含有效样本，因此 n_total = n_valid
-    mean_tau = float(np.mean(taus)) if n_valid > 0 else None
-    std_tau = float(np.std(taus)) if n_valid > 0 else None
+def compute_model_summary(all_scores, total_samples, task, model):
+    valid_samples = len(all_scores)
+    taus = [s['tau'] for s in all_scores]
+    mean_tau = float(np.mean(taus)) if taus else None
+    std_tau = float(np.std(taus)) if taus else None
     summary = {
         "model": model,
         "task": task,
-        "total_samples": n_total,
-        "valid_samples": n_valid,
+        "total_samples": total_samples,
+        "valid_samples": valid_samples,
         "mean_tau": mean_tau,
         "std_tau": std_tau
     }
@@ -177,19 +179,21 @@ def main():
             print(f"Processing model: {model}, task: {task}")
 
             all_scores = []
+            total_samples_model = 0
             for patient_file in model_dir.glob("P*.jsonl"):
                 pid = patient_file.stem
-                scores = process_patient_file(patient_file, task, model)
+                scores, file_total = process_patient_file(patient_file, task, model)
+                total_samples_model += file_total
                 if scores:
                     save_patient_scores(scores, task, model, pid)
                     all_scores.extend(scores)
 
-            if all_scores:
-                model_summary = compute_model_summary(all_scores, task, model)
+            if all_scores or total_samples_model > 0:
+                model_summary = compute_model_summary(all_scores, total_samples_model, task, model)
                 model_summaries.append(model_summary)
                 print(f"  {model}: {model_summary['valid_samples']}/{model_summary['total_samples']} valid, mean tau = {model_summary['mean_tau']:.4f}")
             else:
-                print(f"  No scores for model {model}")
+                print(f"  No data for model {model}")
 
         if model_summaries:
             save_task_summary(task, model_summaries)
