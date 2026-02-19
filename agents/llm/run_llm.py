@@ -24,7 +24,7 @@ def load_config(config_path):
         "demo_n": None,
         "max_workers": 10,
         "specific_patients": None,
-        "resume_failed": False   # 新增默认值
+        "resume_failed": False
     }
     if config_path.exists():
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -36,7 +36,6 @@ def load_config(config_path):
     return default
 
 def call_llm_task(task_item, model_config, max_retries=5):
-    # 此函数与原始代码完全相同
     for attempt in range(max_retries):
         try:
             client = OpenAI(
@@ -107,7 +106,7 @@ def call_llm_task(task_item, model_config, max_retries=5):
     }
 
 def run_resume_failed(config):
-    """根据失败日志重新运行失败的任务"""
+    """根据失败日志重新运行失败的任务（修复了模型过滤的 bug）"""
     from collections import defaultdict
     import threading
     import os
@@ -141,14 +140,12 @@ def run_resume_failed(config):
         print("❌ No failed summary files found.")
         return
 
-    # 解析失败记录，按 (model_label, task, pid, id) 存储
-    failed_items = []  # 每个元素为 (model_label, task, pid, id)
+    failed_items = []  # (model_label, task, pid, id)
     for ff in failed_files:
         with open(ff, 'r', encoding='utf-8') as f:
             failures = json.load(f)
-        # 从文件名提取 model 和 task（例如 gpt-5-mini_visit_cloze_failed_summary.json）
         basename = os.path.basename(ff).replace("_failed_summary.json", "")
-        parts = basename.split("_", 1)  # 第一个下划线前是 model_label，后面是 task
+        parts = basename.split("_", 1)
         if len(parts) != 2:
             print(f"⚠️ Skipping file with unexpected name: {ff}")
             continue
@@ -161,7 +158,7 @@ def run_resume_failed(config):
 
     print(f"📦 Total failed items to retry: {len(failed_items)}")
 
-    # ---------- 3. 构建有效模型配置（复用原逻辑） ----------
+    # ---------- 3. 构建有效模型配置 ----------
     raw_models = config["models"]
     model_list = []
     for m in raw_models:
@@ -173,6 +170,7 @@ def run_resume_failed(config):
 
     model_configs = {}
     label_to_name = {}
+    name_to_label = {}                     # 新增反向映射
     for m in model_list:
         name = m["name"]
         env_name = m["env_name"]
@@ -193,17 +191,20 @@ def run_resume_failed(config):
             "env_prefix": env_name
         }
         label_to_name[label] = name
+        name_to_label[name] = label
 
     # ---------- 4. 构建重跑任务列表 ----------
     tasks_to_run = []
-    # 缓存每个 (task, pid) 的原始数据，避免重复读取
     file_cache = {}          # key: (task, pid) -> list of items
     file_cache_lock = threading.Lock()
 
     for model_label, task, pid, item_id in failed_items:
-        # 应用过滤器
-        if model_filter and model_label not in [label_to_name.get(m, m) for m in model_filter]:
-            continue
+        # 应用过滤器（修复后的版本）
+        if model_filter:
+            # 将 model_filter 中的原始模型名转换为标签
+            filter_labels = [name_to_label.get(m, m) for m in model_filter]
+            if model_label not in filter_labels:
+                continue
         if task_filter and task not in task_filter:
             continue
         model_name = label_to_name.get(model_label)
@@ -227,7 +228,6 @@ def run_resume_failed(config):
             else:
                 items = file_cache[cache_key]
 
-        # 查找指定 id 的条目
         target_item = next((it for it in items if it["id"] == item_id), None)
         if not target_item:
             print(f"⚠️ Item id {item_id} not found in {task}/{pid}.jsonl, skipping.")
@@ -249,9 +249,9 @@ def run_resume_failed(config):
         return
 
     # ---------- 5. 并发执行，实时更新输出文件 ----------
-    file_write_locks = defaultdict(threading.Lock)   # key: full output path
+    file_write_locks = defaultdict(threading.Lock)
     token_usage = defaultdict(lambda: defaultdict(lambda: {"prompt": 0, "completion": 0, "total": 0}))
-    new_failures = defaultdict(list)                  # key: (model_label, task)
+    new_failures = defaultdict(list)
 
     run_dir = os.path.join(ROOT_DIR, "run_llm")
 
@@ -264,7 +264,6 @@ def run_resume_failed(config):
         for future in tqdm(as_completed(future_map), total=len(tasks_to_run), desc="Retrying Failed Tasks"):
             res = future.result()
             if res['status'] == 'success':
-                # 更新 token 统计
                 if res.get('usage'):
                     model = res['llm_label']
                     task = res['task_type']
@@ -272,7 +271,6 @@ def run_resume_failed(config):
                     token_usage[model][task]["completion"] += res['usage']['completion_tokens']
                     token_usage[model][task]["total"] += res['usage']['total_tokens']
 
-                # 更新输出文件
                 task = res['task_type']
                 model_label = res['llm_label']
                 pid = res['pid']
@@ -286,7 +284,6 @@ def run_resume_failed(config):
                     "ground_truth": res['ground_truth']
                 }
 
-                # 加锁，读取现有文件，更新对应 id，再写回
                 with file_write_locks[out_path]:
                     existing = {}
                     if os.path.exists(out_path):
@@ -301,7 +298,6 @@ def run_resume_failed(config):
                         for item in sorted_items:
                             f.write(json.dumps(item, ensure_ascii=False) + "\n")
             else:
-                # 重跑仍然失败，记录到新失败列表
                 model_label = res['llm_label']
                 task = res['task_type']
                 new_failures[(model_label, task)].append({
@@ -310,7 +306,7 @@ def run_resume_failed(config):
                     "error": res['error']
                 })
 
-    # ---------- 6. 保存重跑后的 token 使用情况 ----------
+    # ---------- 6. 保存 token 使用情况 ----------
     stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
     os.makedirs(stats_dir, exist_ok=True)
     for model, tasks in token_usage.items():
@@ -354,14 +350,14 @@ def main():
         run_resume_failed(config)
         return
 
-    # 以下是正常模式（原代码保持不变）
+    # 以下是正常模式（支持精确到 ID 的配置）
     raw_models = config["models"]
     task_types = config["tasks"]
     demo_n = config["demo_n"]
     max_workers = config["max_workers"]
     specific_patients = config.get("specific_patients")
 
-    # Process model names, add thinking param for _THINKING suffix
+    # 处理模型，添加 thinking 参数
     model_list = []
     for m in raw_models:
         if m.endswith("_THINKING"):
@@ -378,7 +374,7 @@ def main():
                 "params": {}
             })
 
-    # Build valid model configs
+    # 构建有效模型配置
     model_configs = {}
     valid_models = []
     for m in model_list:
@@ -410,9 +406,36 @@ def main():
         print("❌ No valid models. Exiting.")
         return
 
-    # Build task list
+    # ---------- 任务构建（支持精确到 ID 的配置） ----------
     all_tasks = []
     expected_counts = defaultdict(int)  # key: (task, model_label, pid) -> number of items
+
+    # 检查是否配置了 specific_items
+    specific_items = config.get("specific_items")
+    if specific_items:
+        # 如果存在 specific_items，则忽略原有的 specific_patients 和 demo_n
+        # 构建 patient -> allowed_ids 映射
+        patient_id_whitelist = {}
+        for item in specific_items:
+            pid = item.get("patient")
+            if not pid:
+                print(f"⚠️ specific_items 条目缺少 patient 字段，已跳过: {item}")
+                continue
+            ids = item.get("ids")  # 如果 ids 不存在，则为 None
+            if ids is None:
+                # 没有 ids 字段，表示处理该患者的所有条目
+                patient_id_whitelist[pid] = None
+            elif isinstance(ids, list):
+                # 有 ids 列表，转换为 set
+                patient_id_whitelist[pid] = set(ids)
+            else:
+                print(f"⚠️ patient {pid} 的 ids 格式不正确，应为列表，将忽略 ids 限制")
+                patient_id_whitelist[pid] = None
+        target_patients = set(patient_id_whitelist.keys())
+    else:
+        # 未配置 specific_items，使用原有的筛选逻辑
+        target_patients = None
+        # 注意：specific_patients 和 demo_n 会在文件循环中处理
 
     for task in task_types:
         input_dir = os.path.join(ROOT_DIR, "context_data", task)
@@ -421,22 +444,37 @@ def main():
             continue
 
         files = sorted(glob.glob(os.path.join(input_dir, "P*.jsonl")))
-        if specific_patients:
-            target_files = []
-            for pid in specific_patients:
-                fpath = os.path.join(input_dir, f"{pid}.jsonl")
-                if fpath in files:
-                    target_files.append(fpath)
-                else:
-                    print(f"⚠️ Patient file not found: {fpath}")
-            files = target_files
-        elif demo_n is not None:
-            files = files[:demo_n]
+
+        # 根据配置筛选患者文件
+        if specific_items:
+            # 只保留在 target_patients 中的文件
+            files = [f for f in files if os.path.basename(f).replace(".jsonl", "") in target_patients]
+        else:
+            # 原有逻辑：specific_patients 或 demo_n
+            if specific_patients:
+                target_files = []
+                for pid in specific_patients:
+                    fpath = os.path.join(input_dir, f"{pid}.jsonl")
+                    if fpath in files:
+                        target_files.append(fpath)
+                    else:
+                        print(f"⚠️ Patient file not found: {fpath}")
+                files = target_files
+            elif demo_n is not None:
+                files = files[:demo_n]
 
         for fpath in files:
             pid = os.path.basename(fpath).replace(".jsonl", "")
             with open(fpath, 'r', encoding='utf-8') as f:
                 items = [json.loads(line) for line in f if line.strip()]
+
+            # 如果启用了 specific_items，进一步过滤 items
+            if specific_items:
+                allowed_ids = patient_id_whitelist.get(pid)
+                if allowed_ids is not None:  # 有明确的 ID 限制
+                    items = [it for it in items if it["id"] in allowed_ids]
+                # 如果 allowed_ids 为 None，表示该患者所有 ID 都保留
+
             num_items = len(items)
             for model in valid_models:
                 key = (task, model_configs[model]['label'], pid)
@@ -454,14 +492,12 @@ def main():
     print(f"🚀 Benchmarking {len(valid_models)} models on {len(task_types)} tasks.")
     print(f"📦 Total requests: {len(all_tasks)}")
 
-    # Shared data structures and lock for real-time saving
+    # ---------- 并发执行与结果保存 ----------
     results = {}
     token_usage = {}
     completed_counts = defaultdict(int)
     lock = threading.Lock()
     run_dir = os.path.join(ROOT_DIR, "run_llm")
-
-    # Group failed tasks by (model, task)
     failed_by_model_task = defaultdict(list)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -527,7 +563,7 @@ def main():
                             "ground_truth": entry['ground_truth']
                         }, ensure_ascii=False) + "\n")
 
-    # Handle any remaining results
+    # 处理剩余结果（一般不会发生）
     if results:
         print("\n📦 Writing remaining results (incomplete patients)...")
         for (task, model, pid), data in results.items():
@@ -543,13 +579,13 @@ def main():
                         "ground_truth": entry['ground_truth']
                     }, ensure_ascii=False) + "\n")
 
-    # Print token usage summary
+    # 打印 token 使用摘要
     print("\n🔢 Token Usage Summary:")
     for model, tasks in token_usage.items():
         for task, tokens in tasks.items():
             print(f"  {model} | {task}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
 
-    # Save token usage to files
+    # 保存 token 使用统计
     stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
     os.makedirs(stats_dir, exist_ok=True)
     for model, tasks in token_usage.items():
@@ -568,7 +604,7 @@ def main():
                 }, f, indent=2)
             print(f"📊 Token usage saved: {filepath}")
 
-    # Save failed tasks logs
+    # 保存失败日志
     failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
     os.makedirs(failed_dir, exist_ok=True)
     if failed_by_model_task:
