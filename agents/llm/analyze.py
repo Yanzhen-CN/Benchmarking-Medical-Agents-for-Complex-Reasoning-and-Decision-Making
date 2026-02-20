@@ -20,7 +20,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
-PROJECT_ROOT = Path(__file__).resolve().parent.parents[2]  # 确保指向项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 确保指向项目根目录
 SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
 QUESTION_DIR = PROJECT_ROOT / "question_data"
 CONTEXT_DIR = PROJECT_ROOT / "context_data"
