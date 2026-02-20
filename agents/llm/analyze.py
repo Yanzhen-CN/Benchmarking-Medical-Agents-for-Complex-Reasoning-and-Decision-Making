@@ -3,9 +3,9 @@
 
 """
 LongMedBench 数据分析脚本
-- 支持按患者子集分析（如前50个病人）
-- 与 grading summary 结果对比验证
-- 生成更多统计图表
+- 直接从 summary.json 读取模型性能数据，确保与评分结果一致
+- 支持前50个患者子集分析
+- 生成其他统计图表
 """
 
 import json
@@ -20,7 +20,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 确保指向项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
 QUESTION_DIR = PROJECT_ROOT / "question_data"
 CONTEXT_DIR = PROJECT_ROOT / "context_data"
@@ -213,7 +213,6 @@ def process_task(task, patient_list=None):
     return pd.DataFrame(all_rows)
 
 def collect_patient_metadata(patient_list=None):
-    """收集患者元数据，可指定患者列表"""
     patient_files = list(SEQ_DIR.glob("P*_sequenced.json"))
     rows = []
     for pf in tqdm(patient_files, desc="Collecting patient metadata"):
@@ -225,12 +224,36 @@ def collect_patient_metadata(patient_list=None):
             rows.append(meta)
     return pd.DataFrame(rows)
 
+# ========== 从 summary.json 加载模型性能 ==========
+def load_summaries():
+    """读取所有模型的任务 summary，返回 DataFrame"""
+    rows = []
+    for task in TASKS:
+        for model in MODELS:
+            summary_file = SCORE_DIR / task / model / "summary.json"
+            if summary_file.exists():
+                with open(summary_file) as f:
+                    data = json.load(f)
+                rows.append({
+                    'task': task,
+                    'model': model,
+                    'mean_tau': data['mean_tau'],
+                    'std_tau': data['std_tau'],
+                    'total_samples': data['total_samples'],
+                    'valid_samples': data['valid_samples']
+                })
+    return pd.DataFrame(rows)
+
 # ========== 绘图函数 ==========
-def plot_model_performance(df, output_suffix=""):
-    grouped = df.groupby(['task', 'model'])['tau'].agg(['mean', 'std', 'count']).reset_index()
+def plot_model_performance_from_summary(summary_df, output_suffix=""):
+    """使用 summary 数据绘制模型性能点图（带误差线）"""
+    if summary_df.empty:
+        print("No summary data to plot.")
+        return
     plt.figure(figsize=(12, 6))
-    sns.barplot(x='task', y='mean', hue='model', data=grouped, capsize=0.1,
-                errwidth=1.5, errcolor='black')
+    # 使用 pointplot 显示均值和误差线
+    sns.pointplot(x='task', y='mean_tau', hue='model', data=summary_df,
+                  capsize=0.1, errwidth=1.5, linestyles='', dodge=0.3, join=False)
     plt.title('Model Performance on LongMedBench Tasks' + (" (First 50 Patients)" if output_suffix else ""))
     plt.ylabel("Kendall's τ")
     plt.ylim(0, 1)
@@ -239,8 +262,6 @@ def plot_model_performance(df, output_suffix=""):
     plt.savefig(ANALYSIS_DIR / f'model_performance{output_suffix}.pdf')
     plt.savefig(ANALYSIS_DIR / f'model_performance{output_suffix}.png', dpi=300)
     plt.close()
-    # 返回分组统计，便于与 summary 对比
-    return grouped
 
 def plot_option_complexity(df_cloze, output_suffix=""):
     if df_cloze.empty:
@@ -304,26 +325,27 @@ def plot_sorting_difficulty_reduction(df, output_suffix=""):
     plt.savefig(ANALYSIS_DIR / f'sorting_reduction{output_suffix}.png', dpi=300)
     plt.close()
 
-# ========== 与 grading summary 对比 ==========
-def validate_with_summary(df):
-    """将分组统计与已保存的 summary.json 对比，输出差异"""
+# ========== 与 summary 对比验证样本级数据 ==========
+def validate_with_summary(df, summary_df):
+    """将样本级计算的均值和标准差与 summary 对比，输出差异"""
     print("\n=== Validation with grading summary ===")
     for task in TASKS:
         for model in MODELS:
-            summary_file = SCORE_DIR / task / model / "summary.json"
-            if not summary_file.exists():
+            # 从 summary 中获取对应行
+            srow = summary_df[(summary_df['task'] == task) & (summary_df['model'] == model)]
+            if srow.empty:
                 continue
-            with open(summary_file) as f:
-                summary = json.load(f)
-            # 从 df 中提取对应模型任务的样本
+            s_mean = srow.iloc[0]['mean_tau']
+            s_std = srow.iloc[0]['std_tau']
+            # 从 df 中计算
             subset = df[(df['task'] == task) & (df['model'] == model)]
             if subset.empty:
-                print(f"  {task} - {model}: no samples in df")
+                print(f"  {task} - {model}: no samples in df (expected from summary)")
                 continue
             calc_mean = subset['tau'].mean()
             calc_std = subset['tau'].std()
-            diff_mean = abs(calc_mean - summary['mean_tau'])
-            diff_std = abs(calc_std - summary['std_tau'])
+            diff_mean = abs(calc_mean - s_mean)
+            diff_std = abs(calc_std - s_std)
             if diff_mean > 1e-6 or diff_std > 1e-6:
                 print(f"  {task} - {model}: mean diff={diff_mean:.2e}, std diff={diff_std:.2e}")
             else:
@@ -338,7 +360,7 @@ def main():
     first_50 = all_patients[:50]
     print(f"Total patients: {len(all_patients)}, first 50: {first_50[:5]}...")
 
-    # 定义要分析的患者集合（None 表示全部）
+    # 定义要分析的患者集合
     patient_sets = {
         "all": None,
         "first50": first_50
@@ -352,9 +374,7 @@ def main():
         patient_meta.to_csv(ANALYSIS_DIR / f'patient_metadata_{set_name}.csv', index=False)
         print(f"Patient metadata saved, {len(patient_meta)} patients.")
 
-        # 统计问题数据中的 fact-question 对个数（仅针对该患者集，但 count_fact_question_pairs 未过滤，需要手动过滤？）
-        # 这里简单输出全部，因为生成总数与患者集无关，但若需精确，可修改 count_fact_question_pairs 加入过滤
-        # 为简化，我们保留原样，但可以输出说明
+        # 统计问题数据中的 fact-question 对个数（仅对全部患者有意义）
         if set_name == "all":
             print("\nCounting fact-question pairs in question data (all patients):")
             pair_counts = {}
@@ -365,8 +385,7 @@ def main():
             with open(ANALYSIS_DIR / 'fact_question_counts.json', 'w') as f:
                 json.dump(pair_counts, f, indent=2)
 
-        # 统计测试数据样本量（同样未过滤，但 context_data 可能已按需生成）
-        if set_name == "all":
+            # 统计测试数据样本量
             context_counts = count_context_samples()
             print("\nContext data sample counts:")
             for task, cnt in context_counts.items():
@@ -384,23 +403,50 @@ def main():
                 df.to_csv(ANALYSIS_DIR / f'{task}_samples_{set_name}.csv', index=False)
                 print(f"Saved {len(df)} samples for {task}")
 
-        if not all_dfs:
-            print("No performance data collected. Skipping plots.")
-            continue
-
-        combined_df = pd.concat(all_dfs, ignore_index=True)
-
-        # 绘制图表，文件名加上后缀
-        suffix = f"_{set_name}" if set_name != "all" else ""
-        plot_model_performance(combined_df, suffix)
-        cloze_df = combined_df[combined_df['task'] == 'visit_cloze']
-        plot_option_complexity(cloze_df, suffix)
-        plot_patient_visits_distribution(patient_meta, suffix)
-        plot_sorting_difficulty_reduction(combined_df, suffix)
-
-        # 与 summary 对比（仅对全部患者有意义，因为 summary 是基于全部计算的）
+        # 加载 summary 数据（用于模型性能图）
+        summary_df = load_summaries()
+        # 如果指定了患者子集，summary 不会改变，但我们可以通过样本级数据过滤，但 summary 本身是全局的。
+        # 对于前50患者，模型性能应基于该子集重新计算，但我们目前没有 summary 子集版本。
+        # 因此，对于子集，我们暂时仍使用样本级数据绘图，但需注意可能不准确。
+        # 为简化，我们仍使用 summary 绘制全量性能图，而子集性能图可使用样本级数据绘制（如果有足够样本）。
         if set_name == "all":
-            validate_with_summary(combined_df)
+            plot_model_performance_from_summary(summary_df, "")
+        else:
+            # 对于子集，使用样本级数据绘制（如果数据充足）
+            if all_dfs:
+                combined_df = pd.concat(all_dfs, ignore_index=True)
+                # 从样本级数据分组计算均值和标准差
+                grouped = combined_df.groupby(['task', 'model'])['tau'].agg(['mean', 'std', 'count']).reset_index()
+                grouped = grouped.rename(columns={'mean': 'mean_tau', 'std': 'std_tau'})
+                # 绘制点图（使用分组数据）
+                plt.figure(figsize=(12, 6))
+                sns.pointplot(x='task', y='mean_tau', hue='model', data=grouped,
+                              capsize=0.1, errwidth=1.5, linestyles='', dodge=0.3, join=False)
+                plt.title(f'Model Performance (First 50 Patients)')
+                plt.ylabel("Kendall's τ")
+                plt.ylim(0, 1)
+                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                plt.tight_layout()
+                plt.savefig(ANALYSIS_DIR / 'model_performance_first50.pdf')
+                plt.savefig(ANALYSIS_DIR / 'model_performance_first50.png', dpi=300)
+                plt.close()
+            else:
+                print("No sample-level data for first50, skipping performance plot.")
+
+        # 其他图表（选项复杂度、患者分布、难度对比）使用样本级数据
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            cloze_df = combined_df[combined_df['task'] == 'visit_cloze']
+            plot_option_complexity(cloze_df, f"_{set_name}" if set_name != "all" else "")
+            plot_patient_visits_distribution(patient_meta, f"_{set_name}" if set_name != "all" else "")
+            plot_sorting_difficulty_reduction(combined_df, f"_{set_name}" if set_name != "all" else "")
+        else:
+            print("No sample-level data, skipping other plots.")
+
+        # 对全部患者验证样本级数据与 summary 的一致性
+        if set_name == "all" and all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            validate_with_summary(combined_df, summary_df)
 
     print(f"\nAll analysis results saved to {ANALYSIS_DIR}")
 
