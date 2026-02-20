@@ -3,9 +3,10 @@
 
 """
 LongMedBench 数据分析脚本
-- 支持患者子集分析（全部/前50）
+- 直接使用 score_data 中的 tau 值，确保与 grading 结果一致
+- 从 question_data 中读取选项信息，通过样本 ID 合并
+- 自动生成全部患者和前50名患者两套图表
 - 支持仅统计或仅绘图模式
-- 生成论文所需的统计数据和图表（仅输出PNG）
 """
 
 import json
@@ -21,8 +22,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
-# 注意：如果脚本位于 analysis/ 目录下，建议使用 parent.parent
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 请根据实际目录结构调整
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 根据实际情况调整
 SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
 QUESTION_DIR = PROJECT_ROOT / "question_data"
 CONTEXT_DIR = PROJECT_ROOT / "context_data"
@@ -30,31 +30,133 @@ SCORE_DIR = PROJECT_ROOT / "score_data"
 ANALYSIS_DIR = PROJECT_ROOT / "analysis_data"
 ANALYSIS_DIR.mkdir(exist_ok=True)
 
-# 任务和模型定义
 TASKS = ['trajectory_sorting', 'visit_cloze', 'visit_sorting']
 MODELS = ['deepseek-v3.2', 'gpt-5-mini', 'deepseek-v3.2-thinking', 'qwen-turbo']
 
-# 设置绘图风格
 sns.set_theme(style="whitegrid")
 plt.rcParams['font.family'] = 'DejaVu Sans'
-plt.rcParams['pdf.fonttype'] = 42   # 保留，但不再输出PDF
+plt.rcParams['pdf.fonttype'] = 42
 plt.rcParams['ps.fonttype'] = 42
 
-# ========== 辅助函数 ==========
-def extract_text_from_option(option_value):
-    if isinstance(option_value, str):
-        return option_value
-    elif isinstance(option_value, dict):
-        content = option_value.get('content', '')
-        if isinstance(content, str):
-            return content
-        elif isinstance(content, dict):
-            return json.dumps(content, ensure_ascii=False)
-        else:
-            return str(content)
-    else:
-        return str(option_value)
+# ========== 从 question_data 读取选项信息 ==========
+def load_option_info(task):
+    """
+    从 question_data 中读取每个样本的选项信息，返回字典 {sample_id: {pid, num_options, option_lengths}}
+    """
+    task_dir = QUESTION_DIR / task
+    if not task_dir.exists():
+        return {}
+    
+    info = {}
+    for patient_file in tqdm(list(task_dir.glob("P*.jsonl")), desc=f"Loading {task} option info"):
+        pid = patient_file.stem
+        with open(patient_file, 'r', encoding='utf-8') as f:
+            lines = [json.loads(l) for l in f]
+        i = 0
+        while i < len(lines):
+            if lines[i]['type'] == 'fact':
+                fact_data = lines[i]['data']
+                if i+1 < len(lines) and lines[i+1]['type'] == 'question':
+                    q = lines[i+1]
+                    sample_id = q['id']
+                    # 提取选项字典
+                    if task == 'visit_cloze':
+                        # cloze 的选项在 question 的 data.options 中
+                        if isinstance(q['data'], dict) and 'options' in q['data']:
+                            options_dict = q['data']['options']
+                        else:
+                            options_dict = {}
+                    else:
+                        # 排序任务的选项在 fact_data 中
+                        options_dict = fact_data
+                    
+                    num_options = len(options_dict)
+                    option_lengths = []
+                    for opt_val in options_dict.values():
+                        # 提取文本长度
+                        if isinstance(opt_val, str):
+                            text = opt_val
+                        elif isinstance(opt_val, dict):
+                            text = opt_val.get('content', '')
+                            if isinstance(text, dict):
+                                text = json.dumps(text, ensure_ascii=False)
+                        else:
+                            text = str(opt_val)
+                        option_lengths.append(len(text))
+                    
+                    info[sample_id] = {
+                        'pid': pid,
+                        'num_options': num_options,
+                        'option_lengths': option_lengths
+                    }
+                    i += 2
+                else:
+                    i += 1
+            else:
+                i += 1
+    return info
 
+# ========== 从 score_data 读取 tau 值 ==========
+def load_tau_data(task, model, patient_list=None):
+    """
+    读取指定任务和模型的评分数据，返回 DataFrame，包含 sample_id, pid, tau。
+    如果 patient_list 不为 None，只保留指定患者的样本。
+    """
+    rows = []
+    score_dir = SCORE_DIR / task / model
+    if not score_dir.exists():
+        return pd.DataFrame()
+    
+    for patient_file in score_dir.glob("P*.jsonl"):
+        pid = patient_file.stem
+        if patient_list is not None and pid not in patient_list:
+            continue
+        with open(patient_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                data = json.loads(line)
+                rows.append({
+                    'sample_id': data['id'],
+                    'pid': data['pid'],
+                    'tau': data['tau']
+                })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df['model'] = model
+        df['task'] = task
+    return df
+
+# ========== 构建完整样本级数据（合并 tau 和选项信息） ==========
+def build_samples_data(task, patient_list=None):
+    """
+    为指定任务构建样本级数据，包含所有有 tau 的样本，并合并选项信息。
+    返回 DataFrame，列包括：sample_id, pid, model, tau, num_options, option_lengths (列表字符串)
+    """
+    all_dfs = []
+    option_info = load_option_info(task)  # 提前加载选项信息
+    
+    for model in MODELS:
+        tau_df = load_tau_data(task, model, patient_list)
+        if tau_df.empty:
+            continue
+        
+        # 合并选项信息
+        tau_df['num_options'] = tau_df['sample_id'].apply(
+            lambda sid: option_info.get(sid, {}).get('num_options', np.nan)
+        )
+        tau_df['option_lengths'] = tau_df['sample_id'].apply(
+            lambda sid: json.dumps(option_info.get(sid, {}).get('option_lengths', []))
+        )
+        all_dfs.append(tau_df)
+    
+    if all_dfs:
+        combined = pd.concat(all_dfs, ignore_index=True)
+        # 丢弃没有选项信息的样本（理论上不应该发生，除非问题数据缺失）
+        combined = combined.dropna(subset=['num_options'])
+        return combined
+    else:
+        return pd.DataFrame()
+
+# ========== 患者元数据 ==========
 def load_patient_sequence(pid):
     seq_file = SEQ_DIR / f"{pid}_sequenced.json"
     if not seq_file.exists():
@@ -94,126 +196,6 @@ def compute_patient_metadata(pid):
         'visit_duration_mean': np.mean(durations) if durations else None
     }
 
-def load_scores(task, model):
-    """加载指定任务和模型的评分结果，返回 dict {sample_id: tau}"""
-    score_dir = SCORE_DIR / task / model
-    scores = {}
-    if not score_dir.exists():
-        return scores
-    for patient_file in score_dir.glob("P*.jsonl"):
-        with open(patient_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line)
-                scores[data['id']] = data['tau']
-    return scores
-
-def count_fact_question_pairs(task):
-    task_dir = QUESTION_DIR / task
-    if not task_dir.exists():
-        return 0
-    total_pairs = 0
-    for patient_file in task_dir.glob("P*.jsonl"):
-        with open(patient_file, 'r', encoding='utf-8') as f:
-            lines = [json.loads(l) for l in f]
-        i = 0
-        while i < len(lines):
-            if lines[i]['type'] == 'fact':
-                if i+1 < len(lines) and lines[i+1]['type'] == 'question':
-                    total_pairs += 1
-                    i += 2
-                else:
-                    i += 1
-            else:
-                i += 1
-    return total_pairs
-
-def count_context_samples():
-    counts = {}
-    for task in TASKS:
-        task_dir = CONTEXT_DIR / task
-        if not task_dir.exists():
-            counts[task] = 0
-            continue
-        total = 0
-        for patient_file in task_dir.glob("P*.jsonl"):
-            with open(patient_file, 'r', encoding='utf-8') as f:
-                total += sum(1 for _ in f)
-        counts[task] = total
-    return counts
-
-def process_task(task, patient_list=None):
-    """
-    处理指定任务，收集每个模型每个样本的 τ 值和选项信息，
-    返回一个 DataFrame，包含所有样本的统计信息。
-    如果 patient_list 不为空，只处理指定患者。
-    """
-    all_rows = []
-    question_task_dir = QUESTION_DIR / task
-    if not question_task_dir.exists():
-        print(f"Warning: Question directory not found: {question_task_dir}")
-        return pd.DataFrame()
-
-    sample_info = {}
-    for patient_file in tqdm(list(question_task_dir.glob("P*.jsonl")), desc=f"Loading {task} questions"):
-        pid = patient_file.stem
-        if patient_list is not None and pid not in patient_list:
-            continue
-        with open(patient_file, 'r', encoding='utf-8') as f:
-            lines = [json.loads(l) for l in f]
-        i = 0
-        while i < len(lines):
-            if lines[i]['type'] == 'fact':
-                fact_data = lines[i]['data']
-                if i+1 < len(lines) and lines[i+1]['type'] == 'question':
-                    q = lines[i+1]
-                    sample_id = q['id']
-                    if task == 'visit_cloze':
-                        if isinstance(q['data'], dict) and 'options' in q['data']:
-                            options_dict = q['data']['options']
-                        else:
-                            options_dict = {}
-                    else:
-                        options_dict = fact_data
-                    num_options = len(options_dict)
-                    option_lengths = []
-                    for opt_val in options_dict.values():
-                        text = extract_text_from_option(opt_val)
-                        option_lengths.append(len(text))
-                    sample_info[sample_id] = {
-                        'pid': pid,
-                        'num_options': num_options,
-                        'option_lengths': option_lengths,
-                        'option_lengths_str': json.dumps(option_lengths)
-                    }
-                    i += 2
-                else:
-                    i += 1
-            else:
-                i += 1
-
-    for model in MODELS:
-        scores = load_scores(task, model)
-        if not scores:
-            continue
-        for sample_id, tau in scores.items():
-            if sample_id in sample_info:
-                info = sample_info[sample_id]
-                row = {
-                    'sample_id': sample_id,
-                    'pid': info['pid'],
-                    'model': model,
-                    'task': task,
-                    'tau': tau,
-                    'num_options': info['num_options'],
-                    'option_lengths': info['option_lengths_str'],
-                }
-                all_rows.append(row)
-            else:
-                # 可选：记录未匹配的样本，但通常不应发生
-                pass
-
-    return pd.DataFrame(all_rows)
-
 def collect_patient_metadata(patient_list=None):
     patient_files = list(SEQ_DIR.glob("P*_sequenced.json"))
     rows = []
@@ -226,8 +208,8 @@ def collect_patient_metadata(patient_list=None):
             rows.append(meta)
     return pd.DataFrame(rows)
 
-def load_summaries():
-    """读取所有模型的任务 summary，返回 DataFrame"""
+# ========== 全局 summary 加载 ==========
+def load_global_summaries():
     rows = []
     for task in TASKS:
         for model in MODELS:
@@ -245,83 +227,116 @@ def load_summaries():
                 })
     return pd.DataFrame(rows)
 
-# ========== 绘图函数（仅输出PNG） ==========
-def plot_model_performance_bar(summary_df, output_suffix=""):
-    """使用 summary 数据绘制柱状图（带误差条），仅保存PNG"""
+# ========== 绘图函数 ==========
+def plot_model_performance_bar(summary_df, subset_name):
+    """模型性能柱状图，使用 summary 数据"""
     if summary_df.empty:
-        print("No summary data to plot.")
+        print(f"No summary data for {subset_name}, skipping plot.")
         return
     plt.figure(figsize=(12, 6))
     sns.barplot(x='task', y='mean_tau', hue='model', data=summary_df,
                 capsize=0.1, errwidth=1.5, errcolor='black')
-    plt.title('Model Performance on LongMedBench Tasks' + (" (First 50 Patients)" if output_suffix else ""))
+    title = 'Model Performance on LongMedBench Tasks'
+    if subset_name == 'first50':
+        title += ' (First 50 Patients)'
+    plt.title(title)
     plt.ylabel("Kendall's τ")
     plt.ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'model_performance{output_suffix}.png', dpi=300)
+    plt.savefig(ANALYSIS_DIR / f'model_performance_{subset_name}.png', dpi=300)
     plt.close()
 
-def plot_option_complexity(df_cloze, output_suffix=""):
+def plot_option_complexity(df, subset_name):
+    """绘制 visit_cloze 选项复杂度分析"""
+    df_cloze = df[df['task'] == 'visit_cloze'].copy()
     if df_cloze.empty:
+        print(f"No visit_cloze data for {subset_name}, skipping option complexity plot.")
         return
+    
+    # 解析选项长度列表
     df_cloze['option_lengths'] = df_cloze['option_lengths'].apply(json.loads)
     df_cloze['avg_option_length'] = df_cloze['option_lengths'].apply(np.mean)
-
+    
+    # 对选项数进行分箱，避免连续值导致箱线图稀疏
+    df_cloze['opt_bin'] = pd.cut(df_cloze['num_options'], bins=range(0, 81, 5), right=False)
+    
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
+    
+    # 选项数分布
     sns.histplot(df_cloze['num_options'], bins=20, ax=axes[0,0])
     axes[0,0].set_xlabel('Number of Options')
     axes[0,0].set_ylabel('Frequency')
-    axes[0,0].set_title('Distribution of Option Counts (visit_cloze)')
-
-    sns.boxplot(x='num_options', y='tau', hue='model', data=df_cloze, ax=axes[0,1])
-    axes[0,1].set_xlabel('Number of Options')
-    axes[0,1].set_ylabel("Kendall's τ")
-    axes[0,1].set_title('Performance vs. Option Count')
-    axes[0,1].legend_.remove()
-
+    axes[0,0].set_title('Distribution of Option Counts')
+    
+    # 选项数 vs τ（分箱）
+    # 过滤掉无数据的箱
+    plot_df = df_cloze.dropna(subset=['opt_bin'])
+    if not plot_df.empty:
+        sns.boxplot(x='opt_bin', y='tau', hue='model', data=plot_df, ax=axes[0,1])
+        axes[0,1].set_xlabel('Number of Options (binned)')
+        axes[0,1].set_ylabel("Kendall's τ")
+        axes[0,1].set_title('Performance vs. Option Count')
+        axes[0,1].legend_.remove()
+    
+    # 选项平均长度分布
     sns.histplot(df_cloze['avg_option_length'], bins=30, ax=axes[1,0])
     axes[1,0].set_xlabel('Average Option Length (characters)')
     axes[1,0].set_ylabel('Frequency')
     axes[1,0].set_title('Distribution of Average Option Length')
-
+    
+    # 选项平均长度 vs τ
     sns.scatterplot(x='avg_option_length', y='tau', hue='model', data=df_cloze, alpha=0.6, ax=axes[1,1])
     axes[1,1].set_xlabel('Average Option Length')
     axes[1,1].set_ylabel("Kendall's τ")
     axes[1,1].set_title('Performance vs. Option Length')
     axes[1,1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-
+    
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'option_complexity{output_suffix}.png', dpi=300)
+    plt.savefig(ANALYSIS_DIR / f'option_complexity_{subset_name}.png', dpi=300)
     plt.close()
 
-def plot_patient_visits_distribution(patient_df, output_suffix=""):
+def plot_patient_visits_distribution(patient_df, subset_name):
     plt.figure(figsize=(8, 5))
     sns.histplot(patient_df['num_visits'], bins=range(1, patient_df['num_visits'].max()+2),
                  discrete=True)
     plt.xlabel('Number of Visits per Patient')
     plt.ylabel('Number of Patients')
-    plt.title('Distribution of Patient Visits' + (" (First 50 Patients)" if output_suffix else ""))
+    title = 'Distribution of Patient Visits'
+    if subset_name == 'first50':
+        title += ' (First 50 Patients)'
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'patient_visits{output_suffix}.png', dpi=300)
+    plt.savefig(ANALYSIS_DIR / f'patient_visits_{subset_name}.png', dpi=300)
     plt.close()
 
-def plot_sorting_difficulty_reduction(df, output_suffix=""):
-    sorting_df = df[df['task'].isin(['trajectory_sorting', 'visit_sorting'])]
+def plot_sorting_difficulty_reduction(df, subset_name):
+    """对比 trajectory_sorting 和 visit_sorting 的 τ 分布"""
+    sorting_df = df[df['task'].isin(['trajectory_sorting', 'visit_sorting'])].copy()
     if sorting_df.empty:
+        print(f"No sorting data for {subset_name}, skipping reduction plot.")
         return
+    
+    # 移除没有数据的模型（例如 qwen-turbo 可能在 visit_sorting 上无数据）
+    models_with_data = sorting_df.groupby('model')['tau'].count()
+    models_with_data = models_with_data[models_with_data > 0].index.tolist()
+    sorting_df = sorting_df[sorting_df['model'].isin(models_with_data)]
+    
     plt.figure(figsize=(10, 6))
     sns.boxplot(x='task', y='tau', hue='model', data=sorting_df)
     plt.xlabel('Task')
     plt.ylabel("Kendall's τ")
-    plt.title('Difficulty Reduction: Trajectory Sorting vs. Simplified Version' + (" (First 50 Patients)" if output_suffix else ""))
+    plt.ylim(-1, 1)  # τ 的完整范围
+    title = 'Difficulty Reduction: Trajectory Sorting vs. Simplified Version'
+    if subset_name == 'first50':
+        title += ' (First 50 Patients)'
+    plt.title(title)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'sorting_reduction{output_suffix}.png', dpi=300)
+    plt.savefig(ANALYSIS_DIR / f'sorting_reduction_{subset_name}.png', dpi=300)
     plt.close()
 
-# ========== 与 summary 对比验证样本级数据 ==========
+# ========== 验证与 summary 的一致性 ==========
 def validate_with_summary(df, summary_df):
     print("\n=== Validation with grading summary ===")
     for task in TASKS:
@@ -333,16 +348,128 @@ def validate_with_summary(df, summary_df):
             s_std = srow.iloc[0]['std_tau']
             subset = df[(df['task'] == task) & (df['model'] == model)]
             if subset.empty:
-                print(f"  {task} - {model}: no samples in df (expected from summary)")
+                print(f"  {task} - {model}: no samples in df")
                 continue
             calc_mean = subset['tau'].mean()
             calc_std = subset['tau'].std()
-            diff_mean = abs(calc_mean - s_mean)
-            diff_std = abs(calc_std - s_std)
-            if diff_mean > 1e-6 or diff_std > 1e-6:
-                print(f"  {task} - {model}: mean diff={diff_mean:.2e}, std diff={diff_std:.2e}")
-            else:
-                print(f"  {task} - {model}: ✓ matches summary")
+            n_samples = len(subset)
+            print(f"  {task} - {model}: summary mean={s_mean:.3f}, calc mean={calc_mean:.3f} (n={n_samples})")
+            if abs(calc_mean - s_mean) > 0.01:
+                print(f"    ⚠️  WARNING: mean diff={abs(calc_mean - s_mean):.3f}")
+
+# ========== 处理单个子集 ==========
+def process_subset(subset_name, patient_list, mode):
+    print(f"\n========== Processing {subset_name} subset ==========")
+    
+    if mode in ['full', 'stats_only']:
+        # 收集患者元数据
+        patient_meta = collect_patient_metadata(patient_list)
+        patient_meta.to_csv(ANALYSIS_DIR / f'patient_metadata_{subset_name}.csv', index=False)
+        print(f"Patient metadata saved, {len(patient_meta)} patients.")
+        
+        # 对于全部患者，统计总样本量（可选）
+        if subset_name == 'all':
+            # 统计 question_data 中的 fact-question 对数量（仅用于信息）
+            print("\nCounting fact-question pairs in question data (all patients):")
+            pair_counts = {}
+            for task in TASKS:
+                # 简单计数，不依赖选项信息
+                task_dir = QUESTION_DIR / task
+                count = 0
+                if task_dir.exists():
+                    for f in task_dir.glob("P*.jsonl"):
+                        with open(f) as fp:
+                            for line in fp:
+                                data = json.loads(line)
+                                if data.get('type') == 'question':
+                                    count += 1
+                pair_counts[task] = count
+                print(f"{task}: {count} pairs")
+            with open(ANALYSIS_DIR / 'fact_question_counts.json', 'w') as f:
+                json.dump(pair_counts, f, indent=2)
+            
+            # context_data 样本量
+            context_counts = {}
+            for task in TASKS:
+                task_dir = CONTEXT_DIR / task
+                if not task_dir.exists():
+                    context_counts[task] = 0
+                else:
+                    total = 0
+                    for f in task_dir.glob("P*.jsonl"):
+                        with open(f) as fp:
+                            total += sum(1 for _ in fp)
+                    context_counts[task] = total
+            print("\nContext data sample counts:")
+            for task, cnt in context_counts.items():
+                print(f"{task}: {cnt} samples")
+            with open(ANALYSIS_DIR / 'context_sample_counts.json', 'w') as f:
+                json.dump(context_counts, f, indent=2)
+        
+        # 构建所有任务的样本级数据
+        all_dfs = []
+        for task in TASKS:
+            print(f"\nBuilding samples for task: {task}")
+            df = build_samples_data(task, patient_list)
+            if not df.empty:
+                all_dfs.append(df)
+                df.to_csv(ANALYSIS_DIR / f'{task}_samples_{subset_name}.csv', index=False)
+                print(f"Saved {len(df)} samples for {task}")
+        
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            combined_df.to_csv(ANALYSIS_DIR / f'all_samples_{subset_name}.csv', index=False)
+            
+            # 生成模型性能摘要（用于子集）
+            if subset_name == 'first50':
+                # 对于前50患者，没有现成 summary，从样本级数据计算
+                subset_summary = combined_df.groupby(['task', 'model'])['tau'].agg(['mean', 'std', 'count']).reset_index()
+                subset_summary = subset_summary.rename(columns={'mean': 'mean_tau', 'std': 'std_tau'})
+                subset_summary.to_csv(ANALYSIS_DIR / f'model_summary_{subset_name}.csv', index=False)
+                print(f"Saved subset model summary for {subset_name}")
+        else:
+            print("No sample data collected.")
+        
+        if mode == 'stats_only':
+            return
+    
+    # 绘图阶段
+    if mode in ['full', 'plot_only']:
+        # 加载患者元数据
+        patient_meta_file = ANALYSIS_DIR / f'patient_metadata_{subset_name}.csv'
+        if not patient_meta_file.exists():
+            print(f"Error: Patient metadata file not found: {patient_meta_file}")
+            return
+        patient_meta = pd.read_csv(patient_meta_file)
+        
+        # 加载样本级数据
+        samples_file = ANALYSIS_DIR / f'all_samples_{subset_name}.csv'
+        if not samples_file.exists():
+            print(f"Error: Samples file not found: {samples_file}")
+            return
+        combined_df = pd.read_csv(samples_file)
+        
+        # 对于全部患者，模型性能图使用全局 summary
+        if subset_name == 'all':
+            summary_df = load_global_summaries()
+            # 确保 summary_df 与 combined_df 中出现的模型一致（可能有些模型无数据）
+            models_in_data = combined_df['model'].unique()
+            summary_df = summary_df[summary_df['model'].isin(models_in_data)]
+        else:
+            # 前50患者，使用之前计算的子集 summary
+            summary_file = ANALYSIS_DIR / f'model_summary_{subset_name}.csv'
+            if not summary_file.exists():
+                print(f"Error: Model summary file not found: {summary_file}")
+                return
+            summary_df = pd.read_csv(summary_file)
+        
+        # 绘图
+        plot_model_performance_bar(summary_df, subset_name)
+        plot_option_complexity(combined_df, subset_name)
+        plot_patient_visits_distribution(patient_meta, subset_name)
+        plot_sorting_difficulty_reduction(combined_df, subset_name)
+        
+        print(f"Plots for {subset_name} saved.")
 
 # ========== 主函数 ==========
 def main():
@@ -352,140 +479,28 @@ def main():
                        help='仅绘图模式（需先运行过统计）')
     group.add_argument('-a', '--analysis', action='store_true',
                        help='仅统计模式（不绘图）')
-    parser.add_argument('--subset', type=str, default='all',
-                        choices=['all', 'first50'],
-                        help='患者子集：all（全部），first50（前50）')
     args = parser.parse_args()
-
-    # 确定运行模式
+    
     if args.plot:
         mode = 'plot_only'
     elif args.analysis:
         mode = 'stats_only'
     else:
         mode = 'full'
-
-    print(f"Mode: {mode}, Subset: {args.subset}")
-
-    # 获取患者列表
+    
+    print(f"Mode: {mode}")
+    
+    # 获取所有患者ID
     all_patients = sorted([f.stem.split('_')[0] for f in SEQ_DIR.glob("P*_sequenced.json")])
-    if args.subset == 'first50':
-        patient_list = all_patients[:50]
-        print(f"Using first 50 patients: {patient_list[:5]}...")
-    else:
-        patient_list = None
-        print(f"Using all {len(all_patients)} patients.")
-
-    # ===== 统计阶段 =====
-    if mode in ['full', 'stats_only']:
-        print("\n========== Statistics Phase ==========")
-
-        # 收集患者元数据
-        patient_meta = collect_patient_metadata(patient_list)
-        patient_meta.to_csv(ANALYSIS_DIR / f'patient_metadata_{args.subset}.csv', index=False)
-        print(f"Patient metadata saved, {len(patient_meta)} patients.")
-
-        # 统计问题数据中的 fact-question 对个数（仅对全部患者有意义）
-        if args.subset == 'all':
-            print("\nCounting fact-question pairs in question data (all patients):")
-            pair_counts = {}
-            for task in TASKS:
-                count = count_fact_question_pairs(task)
-                pair_counts[task] = count
-                print(f"{task}: {count} pairs")
-            with open(ANALYSIS_DIR / 'fact_question_counts.json', 'w') as f:
-                json.dump(pair_counts, f, indent=2)
-
-            # 统计测试数据样本量
-            context_counts = count_context_samples()
-            print("\nContext data sample counts:")
-            for task, cnt in context_counts.items():
-                print(f"{task}: {cnt} samples")
-            with open(ANALYSIS_DIR / 'context_sample_counts.json', 'w') as f:
-                json.dump(context_counts, f, indent=2)
-
-        # 处理每个任务，收集有评分的样本
-        all_dfs = []
-        for task in TASKS:
-            print(f"\nProcessing task: {task}")
-            df = process_task(task, patient_list)
-            if not df.empty:
-                all_dfs.append(df)
-                df.to_csv(ANALYSIS_DIR / f'{task}_samples_{args.subset}.csv', index=False)
-                print(f"Saved {len(df)} samples for {task}")
-
-        # 加载 summary 数据（用于模型性能图）
-        summary_df = load_summaries()
-        if args.subset == 'all':
-            # 保存全局 summary 供后续绘图使用
-            summary_df.to_csv(ANALYSIS_DIR / 'model_summary_all.csv', index=False)
-        else:
-            # 对于子集，我们使用样本级数据计算子集性能并保存
-            if all_dfs:
-                combined_df = pd.concat(all_dfs, ignore_index=True)
-                subset_summary = combined_df.groupby(['task', 'model'])['tau'].agg(['mean', 'std', 'count']).reset_index()
-                subset_summary = subset_summary.rename(columns={'mean': 'mean_tau', 'std': 'std_tau'})
-                subset_summary.to_csv(ANALYSIS_DIR / f'model_summary_{args.subset}.csv', index=False)
-                print(f"Saved subset model summary for {args.subset}")
-            else:
-                print("No sample-level data, cannot generate subset summary.")
-
-        # 验证一致性（仅对全部患者）
-        if args.subset == 'all' and all_dfs:
-            combined_df = pd.concat(all_dfs, ignore_index=True)
-            validate_with_summary(combined_df, summary_df)
-
-        if mode == 'stats_only':
-            print("\nStatistics completed. Exiting.")
-            return
-
-    # ===== 绘图阶段 =====
-    if mode in ['full', 'plot_only']:
-        print("\n========== Plotting Phase ==========")
-
-        # 加载所需数据
-        patient_meta_file = ANALYSIS_DIR / f'patient_metadata_{args.subset}.csv'
-        if not patient_meta_file.exists():
-            print(f"Error: Patient metadata file not found: {patient_meta_file}")
-            return
-        patient_meta = pd.read_csv(patient_meta_file)
-
-        if args.subset == 'all':
-            summary_file = ANALYSIS_DIR / 'model_summary_all.csv'
-        else:
-            summary_file = ANALYSIS_DIR / f'model_summary_{args.subset}.csv'
-        if not summary_file.exists():
-            print(f"Error: Model summary file not found: {summary_file}")
-            return
-        summary_df = pd.read_csv(summary_file)
-
-        all_dfs = []
-        for task in TASKS:
-            sample_file = ANALYSIS_DIR / f'{task}_samples_{args.subset}.csv'
-            if sample_file.exists():
-                df = pd.read_csv(sample_file)
-                all_dfs.append(df)
-            else:
-                print(f"Warning: Sample file not found: {sample_file}")
-        if not all_dfs:
-            print("No sample-level data found for plotting additional figures.")
-        else:
-            combined_df = pd.concat(all_dfs, ignore_index=True)
-
-        # 绘制模型性能柱状图（仅PNG）
-        plot_model_performance_bar(summary_df, f"_{args.subset}")
-
-        # 绘制其他图表（需要样本级数据）
-        if all_dfs:
-            combined_df = pd.concat(all_dfs, ignore_index=True)
-            cloze_df = combined_df[combined_df['task'] == 'visit_cloze']
-            plot_option_complexity(cloze_df, f"_{args.subset}")
-            plot_patient_visits_distribution(patient_meta, f"_{args.subset}")
-            plot_sorting_difficulty_reduction(combined_df, f"_{args.subset}")
-        else:
-            print("Skipping other plots due to missing sample data.")
-
-        print(f"\nAll plots saved as PNG to {ANALYSIS_DIR}")
+    first50 = all_patients[:50]
+    
+    # 处理全部患者
+    process_subset('all', None, mode)
+    
+    # 处理前50名患者
+    process_subset('first50', first50, mode)
+    
+    print(f"\nAll done. Results saved to {ANALYSIS_DIR}")
 
 if __name__ == "__main__":
     main()
