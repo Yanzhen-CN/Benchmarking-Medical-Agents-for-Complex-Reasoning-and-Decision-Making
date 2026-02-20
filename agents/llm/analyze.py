@@ -5,7 +5,7 @@
 LongMedBench 数据分析脚本
 - 支持患者子集分析（全部/前50）
 - 支持仅统计或仅绘图模式
-- 生成论文所需的统计数据和图表
+- 生成论文所需的统计数据和图表（仅输出PNG）
 """
 
 import json
@@ -21,7 +21,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 注意：如果脚本位于 analysis/ 目录下，建议使用 parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 请根据实际目录结构调整
 SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
 QUESTION_DIR = PROJECT_ROOT / "question_data"
 CONTEXT_DIR = PROJECT_ROOT / "context_data"
@@ -36,7 +37,7 @@ MODELS = ['deepseek-v3.2', 'gpt-5-mini', 'deepseek-v3.2-thinking', 'qwen-turbo']
 # 设置绘图风格
 sns.set_theme(style="whitegrid")
 plt.rcParams['font.family'] = 'DejaVu Sans'
-plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['pdf.fonttype'] = 42   # 保留，但不再输出PDF
 plt.rcParams['ps.fonttype'] = 42
 
 # ========== 辅助函数 ==========
@@ -244,9 +245,9 @@ def load_summaries():
                 })
     return pd.DataFrame(rows)
 
-# ========== 绘图函数（全部使用柱状图） ==========
+# ========== 绘图函数（仅输出PNG） ==========
 def plot_model_performance_bar(summary_df, output_suffix=""):
-    """使用 summary 数据绘制柱状图（带误差条）"""
+    """使用 summary 数据绘制柱状图（带误差条），仅保存PNG"""
     if summary_df.empty:
         print("No summary data to plot.")
         return
@@ -258,7 +259,6 @@ def plot_model_performance_bar(summary_df, output_suffix=""):
     plt.ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'model_performance{output_suffix}.pdf')
     plt.savefig(ANALYSIS_DIR / f'model_performance{output_suffix}.png', dpi=300)
     plt.close()
 
@@ -293,7 +293,6 @@ def plot_option_complexity(df_cloze, output_suffix=""):
     axes[1,1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'option_complexity{output_suffix}.pdf')
     plt.savefig(ANALYSIS_DIR / f'option_complexity{output_suffix}.png', dpi=300)
     plt.close()
 
@@ -305,7 +304,6 @@ def plot_patient_visits_distribution(patient_df, output_suffix=""):
     plt.ylabel('Number of Patients')
     plt.title('Distribution of Patient Visits' + (" (First 50 Patients)" if output_suffix else ""))
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'patient_visits{output_suffix}.pdf')
     plt.savefig(ANALYSIS_DIR / f'patient_visits{output_suffix}.png', dpi=300)
     plt.close()
 
@@ -320,7 +318,6 @@ def plot_sorting_difficulty_reduction(df, output_suffix=""):
     plt.title('Difficulty Reduction: Trajectory Sorting vs. Simplified Version' + (" (First 50 Patients)" if output_suffix else ""))
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'sorting_reduction{output_suffix}.pdf')
     plt.savefig(ANALYSIS_DIR / f'sorting_reduction{output_suffix}.png', dpi=300)
     plt.close()
 
@@ -350,7 +347,6 @@ def validate_with_summary(df, summary_df):
 # ========== 主函数 ==========
 def main():
     parser = argparse.ArgumentParser(description='LongMedBench数据分析')
-    # 互斥参数：-p/--plot 和 -a/--analysis 不能同时使用
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-p', '--plot', action='store_true',
                        help='仅绘图模式（需先运行过统计）')
@@ -420,7 +416,6 @@ def main():
 
         # 加载 summary 数据（用于模型性能图）
         summary_df = load_summaries()
-        # 保存 summary 子集？summary 本身是全局的，但我们可以从样本级数据计算子集的性能
         if args.subset == 'all':
             # 保存全局 summary 供后续绘图使用
             summary_df.to_csv(ANALYSIS_DIR / 'model_summary_all.csv', index=False)
@@ -449,14 +444,12 @@ def main():
         print("\n========== Plotting Phase ==========")
 
         # 加载所需数据
-        # 患者元数据
         patient_meta_file = ANALYSIS_DIR / f'patient_metadata_{args.subset}.csv'
         if not patient_meta_file.exists():
             print(f"Error: Patient metadata file not found: {patient_meta_file}")
             return
         patient_meta = pd.read_csv(patient_meta_file)
 
-        # 模型性能数据
         if args.subset == 'all':
             summary_file = ANALYSIS_DIR / 'model_summary_all.csv'
         else:
@@ -466,7 +459,6 @@ def main():
             return
         summary_df = pd.read_csv(summary_file)
 
-        # 样本级数据（用于选项复杂度和难度对比）
         all_dfs = []
         for task in TASKS:
             sample_file = ANALYSIS_DIR / f'{task}_samples_{args.subset}.csv'
@@ -477,11 +469,10 @@ def main():
                 print(f"Warning: Sample file not found: {sample_file}")
         if not all_dfs:
             print("No sample-level data found for plotting additional figures.")
-            # 但模型性能图仍然可以绘制
         else:
             combined_df = pd.concat(all_dfs, ignore_index=True)
 
-        # 绘制模型性能柱状图
+        # 绘制模型性能柱状图（仅PNG）
         plot_model_performance_bar(summary_df, f"_{args.subset}")
 
         # 绘制其他图表（需要样本级数据）
@@ -494,7 +485,7 @@ def main():
         else:
             print("Skipping other plots due to missing sample data.")
 
-        print(f"\nAll plots saved to {ANALYSIS_DIR}")
+        print(f"\nAll plots saved as PNG to {ANALYSIS_DIR}")
 
 if __name__ == "__main__":
     main()
