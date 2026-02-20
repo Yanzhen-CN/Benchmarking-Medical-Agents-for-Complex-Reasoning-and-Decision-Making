@@ -21,7 +21,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
 QUESTION_DIR = PROJECT_ROOT / "question_data"
 CONTEXT_DIR = PROJECT_ROOT / "context_data"
@@ -350,15 +350,26 @@ def validate_with_summary(df, summary_df):
 # ========== 主函数 ==========
 def main():
     parser = argparse.ArgumentParser(description='LongMedBench数据分析')
-    parser.add_argument('--mode', type=str, default='full',
-                        choices=['full', 'stats_only', 'plot_only'],
-                        help='运行模式：full（完整运行），stats_only（仅统计），plot_only（仅绘图）')
+    # 互斥参数：-p/--plot 和 -a/--analysis 不能同时使用
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-p', '--plot', action='store_true',
+                       help='仅绘图模式（需先运行过统计）')
+    group.add_argument('-a', '--analysis', action='store_true',
+                       help='仅统计模式（不绘图）')
     parser.add_argument('--subset', type=str, default='all',
                         choices=['all', 'first50'],
                         help='患者子集：all（全部），first50（前50）')
     args = parser.parse_args()
 
-    print(f"Mode: {args.mode}, Subset: {args.subset}")
+    # 确定运行模式
+    if args.plot:
+        mode = 'plot_only'
+    elif args.analysis:
+        mode = 'stats_only'
+    else:
+        mode = 'full'
+
+    print(f"Mode: {mode}, Subset: {args.subset}")
 
     # 获取患者列表
     all_patients = sorted([f.stem.split('_')[0] for f in SEQ_DIR.glob("P*_sequenced.json")])
@@ -370,7 +381,7 @@ def main():
         print(f"Using all {len(all_patients)} patients.")
 
     # ===== 统计阶段 =====
-    if args.mode in ['full', 'stats_only']:
+    if mode in ['full', 'stats_only']:
         print("\n========== Statistics Phase ==========")
 
         # 收集患者元数据
@@ -429,12 +440,12 @@ def main():
             combined_df = pd.concat(all_dfs, ignore_index=True)
             validate_with_summary(combined_df, summary_df)
 
-        if args.mode == 'stats_only':
+        if mode == 'stats_only':
             print("\nStatistics completed. Exiting.")
             return
 
     # ===== 绘图阶段 =====
-    if args.mode in ['full', 'plot_only']:
+    if mode in ['full', 'plot_only']:
         print("\n========== Plotting Phase ==========")
 
         # 加载所需数据
