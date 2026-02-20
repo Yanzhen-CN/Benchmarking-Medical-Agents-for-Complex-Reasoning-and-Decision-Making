@@ -21,7 +21,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
-PROJECT_ROOT = Path(__file__).resolve().parent[2]  # 假设脚本在 analysis/ 目录下
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 假设脚本在 analysis/ 目录下
 SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"          # 原始序列数据
 QUESTION_DIR = PROJECT_ROOT / "question_data"                        # 问题数据
 CONTEXT_DIR = PROJECT_ROOT / "context_data"                          # 测试数据（用于LLM的上下文）
