@@ -25,6 +25,9 @@ from dataclasses import dataclass
 import threading
 from collections import deque
 
+if config.USE_TF:
+    from util.hulu import TransformersLLMUtil
+    
 @dataclass
 class ChatTokenUsage:
     prompt_tokens: int = 0
@@ -191,49 +194,74 @@ class LLMUtil:
         """
         Simple chat completion. Returns the assistant message content (string).
         """
-        logger.debug(f"Chat request to model {model} with {len(messages)} messages.")
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature, 
-            "extra_body":{"enable_thinking": enable_thinking}
-        }
-        if top_p is not None:
-            payload["top_p"] = top_p
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if extra:
-            payload.update(extra)
+        if not model == "hulu":
+            logger.debug(f"Chat request to model {model} with {len(messages)} messages.")
+            payload: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature, 
+                "extra_body":{"enable_thinking": enable_thinking}
+            } 
+            if model.startswith("gpt-") and not enable_thinking:
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                }
+            elif enable_thinking:
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "extra_body": {"enable_thinking": True}
+                }
+            if top_p is not None:
+                payload["top_p"] = top_p
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            if extra:
+                payload.update(extra)
 
-        last_err: Optional[str] = None
+            last_err: Optional[str] = None
 
-        for attempt in range(1, self.max_retries + 1):
-            self._limiter.acquire()
-            try:
-                resp = self.client.chat.completions.create(**payload)
+            for attempt in range(1, self.max_retries + 1):
+                self._limiter.acquire()
+                try:
+                    resp = self.client.chat.completions.create(**payload)
 
-                # ---- token accounting (prefer API usage, fallback to local estimate) ----
-                fallback_pt = _count_tokens_locally(messages, model)
-                self._accumulate_chat_usage(getattr(resp, "usage", None), fallback_prompt_tokens=fallback_pt)
+                    # ---- token accounting (prefer API usage, fallback to local estimate) ----
+                    fallback_pt = _count_tokens_locally(messages, model)
+                    self._accumulate_chat_usage(getattr(resp, "usage", None), fallback_prompt_tokens=fallback_pt)
 
-                answer = (resp.choices[0].message.content or "").strip()
-                logger.debug(f"Chat response received (length {len(answer)}).")
-                return answer
-            except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
-                logger.warning(f"chat error (attempt {attempt}/{self.max_retries}): {last_err}")
-                _retry_sleep(attempt)
-            finally:
-                self._limiter.release()
+                    answer = (resp.choices[0].message.content or "").strip()
+                    logger.debug(f"Chat response received (length {len(answer)}).")
+                    return answer
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    logger.warning(f"chat error (attempt {attempt}/{self.max_retries}): {last_err}")
+                    _retry_sleep(attempt)
+                finally:
+                    self._limiter.release()
 
-        raise RuntimeError(f"chat failed after {self.max_retries} retries. Last error: {last_err}")
+            raise RuntimeError(f"chat failed after {self.max_retries} retries. Last error: {last_err}")
+        else:
+            assert self.tf_util
+            logger.debug("Using TF mode.")
+            result = self.tf_util.chat(
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                extra=extra,
+                enable_thinking=enable_thinking,
+            )
+            self._accumulate_chat_usage(self.tf_util.get_token_usage(), fallback_prompt_tokens=0)
+            return result
 
     def chat_json(self,
         *,
         system_prompt: str,
         user_text: str,
         model: str = config.chat_model,
-        temperature: float = 0.0,
+        temperature: float = 1.0,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         strict_only_json: bool = True,
@@ -311,7 +339,7 @@ Do not include markdown, code fences, or explanations.
         messages: List[Dict[str, str]],
         *,
         model: str = config.chat_model,
-        temperature: float = 0.0,
+        temperature: float = 1.0,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         strict_only_json: bool = True,
@@ -387,7 +415,7 @@ Do not include markdown, code fences, or explanations.
             for attempt in range(1, self.max_retries + 1):
                 self._limiter.acquire()
                 try:
-                    resp = self.client.embeddings.create(model=model, input=buf)
+                    resp = self.embedding_client.embeddings.create(model=model, input=buf)
 
                     fallback_it = _count_tokens_locally_texts(buf, model)
                     self._accumulate_embed_usage(getattr(resp, "usage", None), fallback_input_tokens=fallback_it)
@@ -488,6 +516,9 @@ Do not include markdown, code fences, or explanations.
         }
     
     def reset_token_usage(self) -> None:
+        if self.config.USE_TF:
+            self.tf_util.reset_token_usage()
+            
         self.token_usage = {
             "chat": ChatTokenUsage(),
             "embeddings": EmbeddingTokenUsage(),
@@ -496,6 +527,7 @@ Do not include markdown, code fences, or explanations.
     def __init__(self) -> None:
         self.config = LLMConfig()
         self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
+        self.embedding_client = OpenAI(api_key=os.getenv("QWEN_API_KEY", self.config.api_key), base_url=os.getenv("QWEN_BASE_URL", self.config.base_url))
         self.token_usage = {
             "chat": ChatTokenUsage(),
             "embeddings": EmbeddingTokenUsage(),
@@ -504,6 +536,8 @@ Do not include markdown, code fences, or explanations.
         qps = getattr(self.config, "qps", 5)  # e.g., 5 or 10
         self._limiter = _RateLimiter(max_inflight=max_inflight, qps=qps)
         self.max_retries = self.config.max_retries
+        if config.USE_TF:
+            self.tf_util = TransformersLLMUtil(model_name_or_path="/data/xzh/Hulu-Med-7B")
 
 
 
@@ -511,72 +545,82 @@ Do not include markdown, code fences, or explanations.
 # -----------------------------
 # Minimal self-test (optional)
 # -----------------------------
-# if __name__ == "__main__":
-#     # Quick smoke test:
-#     #   export DASHSCOPE_API_KEY=...
-#     #   python util/llmUtil.py
-#     llm = LLMUtil()
-#     logger.info("Running LLMUtil self-test...")
-#     test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="gpt-5.2", temperature=1.0)
-#     obj = llm.chat_json(
-#         system_prompt="You are a JSON generator.",
-#         user_text='Return {"ok": true, "x": "___", "y": "____"}',
-#     )
-#     print("chat_json:", obj)
-
-#     vecs = llm.embed_texts(["hello", "world"])
-#     print("embeddings:", len(vecs), len(vecs[0]) if vecs else 0)
-
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-import json
-import os
-    
-    
-llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
-def _one_job(i: int) -> dict:
-
-    t0 = time.time()
-    obj = llm.chat_json(
-        system_prompt="You are a JSON generator. Output JSON only.",
-        user_text=f'{{"job": {i}, "ok": true, "ts": "{time.time()}"}}',
-        model=getattr(config, "model", "gpt-5.2"),
-        temperature=0.0,
-    )
-    dt = time.time() - t0
-    return {"i": i, "dt": dt, "obj": obj}
-
-def limiter_smoke_test():
-    # 你可以用环境变量临时调参（如果你在 LLMConfig 里接了 env）
-    # os.environ["LLM_MAX_INFLIGHT"] = "4"
-    # os.environ["LLM_QPS"] = "2"
-
-    total_jobs = 1000          # 总请求数
-    thread_workers = 20      # 启很多线程，看看 limiter 是否能“压住”
-
-    t_all = time.time()
-    results = []
-    fails = 0
-
-    with ThreadPoolExecutor(max_workers=thread_workers) as ex:
-        futs = [ex.submit(_one_job, i) for i in range(total_jobs)]
-        for fu in as_completed(futs):
-            try:
-                r = fu.result()
-                results.append(r)
-                print(f"job {r['i']:02d} done in {r['dt']:.2f}s -> keys={list(r['obj'].keys())}")
-            except Exception as e:
-                fails += 1
-                print("FAILED:", repr(e))
-
-    total_dt = time.time() - t_all
-    results.sort(key=lambda x: x["dt"])
-    print("\n========== SUMMARY ==========")
-    print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
-    if results:
-        print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
-    print(f"Token usage:{llm.get_token_usage()}")
-
 if __name__ == "__main__":
-    limiter_smoke_test()
+    # Quick smoke test:
+    #   export DASHSCOPE_API_KEY=...
+    #   python util/llmUtil.py
+    llm = LLMUtil()
+    logger.info("Running LLMUtil self-test...")
+    test1 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="hulu", temperature=1.0)
+    logger.info(f"Chat test output: {test1}")
+    test2 = llm.chat(messages=[{"role":"user", "content":"我家到洗车店只有50米，是走路去还是开车去？"}], model="qwen-turbo", temperature=1.0)
+    logger.info(f"Chat test output: {test2}")
+    obj = llm.chat_json(
+        model="hulu",
+        system_prompt="You are a JSON generator.",
+        user_text='Return {"ok": true, "x": "___", "y": "____"}',
+    )
+    print("chat_json:", obj)
+    obj2 = llm.chat_json(
+        model="qwen-turbo",
+        system_prompt="You are a JSON generator.",
+        user_text='Return {"ok": true, "x": "___", "y": "____"}',
+    )
+    print("chat_json:", obj2)
+
+    vecs = llm.embed_texts(["hello", "world"])
+    print("embeddings:", len(vecs), len(vecs[0]) if vecs else 0)
+
+
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+# import time
+# import json
+# import os
+    
+    
+# llm = LLMUtil()  # 同进程多线程共享 limiter（因为 limiter 在实例里；想更严格可改成模块级全局 limiter）
+# def _one_job(i: int) -> dict:
+
+#     t0 = time.time()
+#     obj = llm.chat_json(
+#         system_prompt="You are a JSON generator. Output JSON only.",
+#         user_text=f'{{"job": {i}, "ok": true, "ts": "{time.time()}"}}',
+#         model=getattr(config, "model", "gpt-5.2"),
+#         temperature=0.0,
+#     )
+#     dt = time.time() - t0
+#     return {"i": i, "dt": dt, "obj": obj}
+
+# def limiter_smoke_test():
+#     # 你可以用环境变量临时调参（如果你在 LLMConfig 里接了 env）
+#     # os.environ["LLM_MAX_INFLIGHT"] = "4"
+#     # os.environ["LLM_QPS"] = "2"
+
+#     total_jobs = 1000          # 总请求数
+#     thread_workers = 20      # 启很多线程，看看 limiter 是否能“压住”
+
+#     t_all = time.time()
+#     results = []
+#     fails = 0
+
+#     with ThreadPoolExecutor(max_workers=thread_workers) as ex:
+#         futs = [ex.submit(_one_job, i) for i in range(total_jobs)]
+#         for fu in as_completed(futs):
+#             try:
+#                 r = fu.result()
+#                 results.append(r)
+#                 print(f"job {r['i']:02d} done in {r['dt']:.2f}s -> keys={list(r['obj'].keys())}")
+#             except Exception as e:
+#                 fails += 1
+#                 print("FAILED:", repr(e))
+
+#     total_dt = time.time() - t_all
+#     results.sort(key=lambda x: x["dt"])
+#     print("\n========== SUMMARY ==========")
+#     print(f"jobs={total_jobs}, fails={fails}, total_time={total_dt:.2f}s")
+#     if results:
+#         print(f"min={results[0]['dt']:.2f}s, median={results[len(results)//2]['dt']:.2f}s, max={results[-1]['dt']:.2f}s")
+#     print(f"Token usage:{llm.get_token_usage()}")
+
+# if __name__ == "__main__":
+#     limiter_smoke_test()

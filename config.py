@@ -138,6 +138,8 @@ class LLMConfig:
         self.top_p: Optional[float] = None
         self.max_tokens: Optional[int] = None
         
+        self.USE_TF: bool = True
+        
 class ContextConfig:
     def __init__(self):
         build = BuildConfig()
@@ -290,7 +292,7 @@ class AgentTaskConfig:
         self.RESULT_OUTPUT_DIR: Path = Path("./agents/llm_agent/agentic_decision/results")
         
         self.ITEM_CHARS: int = 99999999999  # 每个事件/指标的字符限制，过长会被截断
-        self.MEM_CHARS: int = 999999999999   # 从记忆中检索出来的内容总字符限制，过长会被截断
+        self.MEM_CHARS: int = 240000   # 从记忆中检索出来的内容总字符限制，过长会被截断
         self.CTX_CHARS: int = 999999999999     # 最终拼接到 prompt 中的上下文总字符限制，过长会被截断
         self.MAX_TOKENS: int = 4096           # LLM 生成的答案的最大 token 数，过长会被截断
         
