@@ -4,9 +4,9 @@
 """
 LongMedBench 数据分析脚本（最终版）
 - 直接从 score_data 读取 tau，确保与 grading 一致
-- 左连接保留所有 tau 样本，仅对需要选项信息的图进行过滤
-- 自动生成全部患者和前50名患者两套图表
-- 输出验证信息，对比样本级均值与 summary
+- 模型性能、选项复杂度、难度对比图均基于全量样本
+- 患者住院次数分布图分别基于全量和前50患者绘制
+- 输出验证信息，确保样本数与 summary 一致
 """
 
 import json
@@ -18,6 +18,8 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 import warnings
+from matplotlib.ticker import MultipleLocator
+
 warnings.filterwarnings('ignore')
 
 # ========== 路径配置 ==========
@@ -110,7 +112,6 @@ def load_option_info_from_question(task):
 # ========== 构建完整的样本级数据（左连接保留所有 tau）==========
 def build_full_samples(patient_list=None):
     all_dfs = []
-    # 预先加载所有任务的选项信息
     option_info_all = {task: load_option_info_from_question(task) for task in TASKS}
     for task in TASKS:
         print(f"\nLoading tau for task: {task}")
@@ -119,7 +120,6 @@ def build_full_samples(patient_list=None):
             tau_df = load_tau_from_score(task, model, patient_list)
             if tau_df.empty:
                 continue
-            # 左连接：保留所有 tau 样本，选项信息缺失则设为 NaN
             tau_df['num_options'] = tau_df['sample_id'].map(
                 lambda sid: option_info.get(sid, {}).get('num_options', np.nan)
             )
@@ -211,107 +211,83 @@ def validate_with_summary(samples_df):
             if srow.empty:
                 continue
             s_mean = srow.iloc[0]['mean_tau']
-            s_std = srow.iloc[0]['std_tau']
             s_total = srow.iloc[0]['total_samples']
             subset = samples_df[(samples_df['task'] == task) & (samples_df['model'] == model)]
             if subset.empty:
                 print(f"  {task} - {model}: no samples in samples_df (expected {s_total})")
                 continue
             calc_mean = subset['tau'].mean()
-            calc_std = subset['tau'].std()
             n_samples = len(subset)
             print(f"  {task} - {model}: summary mean={s_mean:.3f} (n={s_total}), calc mean={calc_mean:.3f} (n={n_samples})")
             if abs(calc_mean - s_mean) > 0.01 or n_samples != s_total:
                 print(f"    ⚠️  WARNING: diff mean={abs(calc_mean - s_mean):.3f}, sample count diff={s_total - n_samples}")
 
-# ========== 绘图函数 ==========
-def plot_model_performance_bar(samples_df, subset_name):
+# ========== 绘图函数（全量样本） ==========
+def plot_model_performance_bar(samples_df):
+    """基于全量样本绘制模型性能柱状图"""
     grouped = samples_df.groupby(['task', 'model'])['tau'].agg(['mean', 'std', 'count']).reset_index()
     grouped = grouped.rename(columns={'mean': 'mean_tau', 'std': 'std_tau'})
     if grouped.empty:
-        print(f"No data for {subset_name} model performance plot.")
+        print("No data for model performance plot.")
         return
     plt.figure(figsize=(12, 6))
     sns.barplot(x='task', y='mean_tau', hue='model', data=grouped,
                 capsize=0.1, errwidth=1.5, errcolor='black')
-    title = 'Model Performance on LongMedBench Tasks'
-    if subset_name == 'first50':
-        title += ' (First 50 Patients)'
-    plt.title(title)
+    plt.title('Model Performance on LongMedBench Tasks')
     plt.ylabel("Kendall's τ")
     plt.ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'model_performance_{subset_name}.png', dpi=300)
+    plt.savefig(ANALYSIS_DIR / 'model_performance_all.png', dpi=300)
     plt.close()
 
-def plot_option_complexity(samples_df, subset_name):
+def plot_option_complexity(samples_df):
+    """绘制选项数对性能的影响：分箱折线图"""
     df = samples_df[samples_df['task'] == 'visit_cloze'].copy()
     if df.empty:
-        print(f"No visit_cloze data for {subset_name}, skipping option complexity plot.")
+        print("No visit_cloze data, skipping option complexity plot.")
         return
-    # 过滤掉没有选项信息的样本（理论上应该都有，但以防万一）
+    
     df = df.dropna(subset=['num_options'])
-    df['option_lengths'] = df['option_lengths'].apply(lambda x: json.loads(x) if pd.notna(x) else [])
-    df['avg_option_length'] = df['option_lengths'].apply(lambda x: np.mean(x) if x else np.nan)
-    df = df.dropna(subset=['avg_option_length'])
     
-    df['opt_bin'] = pd.cut(df['num_options'], bins=range(0, 81, 5), right=False)
+    # 对选项数进行分箱（每5个一组）
+    bins = range(0, 81, 5)  # 0-5,5-10,...,75-80
+    labels = [f"{i}-{i+4}" for i in bins[:-1]]
+    df['opt_group'] = pd.cut(df['num_options'], bins=bins, labels=labels, right=False)
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    sns.histplot(df['num_options'], bins=20, ax=axes[0,0])
-    axes[0,0].set_xlabel('Number of Options')
-    axes[0,0].set_ylabel('Frequency')
-    axes[0,0].set_title('Distribution of Option Counts')
-    
-    if not df['opt_bin'].isna().all():
-        sns.boxplot(x='opt_bin', y='tau', hue='model', data=df, ax=axes[0,1])
-        axes[0,1].set_xlabel('Number of Options (binned)')
-        axes[0,1].set_ylabel("Kendall's τ")
-        axes[0,1].set_title('Performance vs. Option Count')
-        axes[0,1].legend_.remove()
-    
-    sns.histplot(df['avg_option_length'], bins=30, ax=axes[1,0])
-    axes[1,0].set_xlabel('Average Option Length (characters)')
-    axes[1,0].set_ylabel('Frequency')
-    axes[1,0].set_title('Distribution of Average Option Length')
-    
-    sns.scatterplot(x='avg_option_length', y='tau', hue='model', data=df, alpha=0.6, ax=axes[1,1])
-    axes[1,1].set_xlabel('Average Option Length')
-    axes[1,1].set_ylabel("Kendall's τ")
-    axes[1,1].set_title('Performance vs. Option Length')
-    axes[1,1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'option_complexity_{subset_name}.png', dpi=300)
-    plt.close()
-
-def plot_patient_visits_distribution(patient_df, subset_name):
-    plt.figure(figsize=(8, 5))
-    sns.histplot(patient_df['num_visits'], bins=range(1, patient_df['num_visits'].max()+2),
-                 discrete=True)
-    plt.xlabel('Number of Visits per Patient')
-    plt.ylabel('Number of Patients')
-    title = 'Distribution of Patient Visits'
-    if subset_name == 'first50':
-        title += ' (First 50 Patients)'
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'patient_visits_{subset_name}.png', dpi=300)
-    plt.close()
-
-def plot_sorting_difficulty_reduction(samples_df, subset_name):
-    df = samples_df[samples_df['task'].isin(['trajectory_sorting', 'visit_sorting'])].copy()
-    if df.empty:
-        print(f"No sorting data for {subset_name}, skipping reduction plot.")
-        return
-    # 移除没有数据的模型（比如 qwen-turbo 可能没有 visit_sorting 样本）
-    models_present = df['model'].unique()
-    df = df[df['model'].isin(models_present)]
+    # 计算每个选项组内各模型的平均τ
+    grouped = df.groupby(['opt_group', 'model'])['tau'].mean().reset_index()
     
     plt.figure(figsize=(10, 6))
-    sns.boxplot(x='task', y='tau', hue='model', data=df)
+    sns.lineplot(x='opt_group', y='tau', hue='model', data=grouped, marker='o')
+    plt.xlabel('Number of Options')
+    plt.ylabel("Mean Kendall's τ")
+    plt.title('Model Performance vs. Number of Options (visit_cloze)')
+    plt.xticks(rotation=45)
+    plt.ylim(0, 1)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(ANALYSIS_DIR / 'option_complexity_all.png', dpi=300)
+    plt.close()
+
+def plot_sorting_difficulty_reduction(samples_df, subset_name=None):
+    df = samples_df[samples_df['task'].isin(['trajectory_sorting', 'visit_sorting'])].copy()
+    if df.empty:
+        return
+    
+    plt.figure(figsize=(10, 6))
+    # 小提琴图（半透明）
+    sns.violinplot(x='task', y='tau', hue='model', data=df,
+                   inner=None, linewidth=1, palette='Set2', alpha=0.5)
+    # 散点（使用 stripplot 避免 swarmplot 的避让计算，适合较多数据）
+    sns.stripplot(x='task', y='tau', hue='model', data=df,
+                  dodge=True, size=2, palette='Set2', alpha=0.7, jitter=0.2)
+    
+    # 去重图例
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.05, 1))
+    
     plt.xlabel('Task')
     plt.ylabel("Kendall's τ")
     plt.ylim(-1, 1)
@@ -319,56 +295,24 @@ def plot_sorting_difficulty_reduction(samples_df, subset_name):
     if subset_name == 'first50':
         title += ' (First 50 Patients)'
     plt.title(title)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'sorting_reduction_{subset_name}.png', dpi=300)
+    plt.savefig(ANALYSIS_DIR / f'sorting_reduction_{subset_name or "all"}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-# ========== 处理单个子集 ==========
-def process_subset(subset_name, patient_list, mode):
-    print(f"\n========== Processing {subset_name} subset ==========")
-    
-    if mode in ['full', 'stats_only']:
-        # 患者元数据
-        patient_meta = collect_patient_metadata(patient_list)
-        patient_meta.to_csv(ANALYSIS_DIR / f'patient_metadata_{subset_name}.csv', index=False)
-        print(f"Patient metadata saved, {len(patient_meta)} patients.")
-        
-        # 构建样本级数据（包含所有 tau）
-        samples_df = build_full_samples(patient_list)
-        if not samples_df.empty:
-            samples_df.to_csv(ANALYSIS_DIR / f'all_samples_{subset_name}.csv', index=False)
-            print(f"Total samples: {len(samples_df)}")
-            
-            # 验证与 summary 的一致性（仅对全部患者有意义，因为 summary 是全局的）
-            if subset_name == 'all':
-                validate_with_summary(samples_df)
-        else:
-            print("No samples collected.")
-        
-        if mode == 'stats_only':
-            return
-    
-    if mode in ['full', 'plot_only']:
-        # 加载数据
-        samples_file = ANALYSIS_DIR / f'all_samples_{subset_name}.csv'
-        if not samples_file.exists():
-            print(f"Error: Samples file not found: {samples_file}")
-            return
-        samples_df = pd.read_csv(samples_file)
-        
-        patient_meta_file = ANALYSIS_DIR / f'patient_metadata_{subset_name}.csv'
-        if not patient_meta_file.exists():
-            print(f"Error: Patient metadata file not found: {patient_meta_file}")
-            return
-        patient_meta = pd.read_csv(patient_meta_file)
-        
-        # 绘图
-        plot_model_performance_bar(samples_df, subset_name)
-        plot_option_complexity(samples_df, subset_name)
-        plot_patient_visits_distribution(patient_meta, subset_name)
-        plot_sorting_difficulty_reduction(samples_df, subset_name)
-        print(f"Plots for {subset_name} saved.")
+def plot_patient_visits_distribution(patient_df, suffix):
+    """根据患者数据绘制住院次数分布图，suffix 为 '_all' 或 '_first50'"""
+    plt.figure(figsize=(8, 5))
+    sns.histplot(patient_df['num_visits'], bins=range(1, patient_df['num_visits'].max()+2),
+                 discrete=True)
+    plt.xlabel('Number of Visits per Patient')
+    plt.ylabel('Number of Patients')
+    title = 'Distribution of Patient Visits'
+    if suffix == '_first50':
+        title += ' (First 50 Patients)'
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(ANALYSIS_DIR / f'patient_visits{suffix}.png', dpi=300)
+    plt.close()
 
 # ========== 主函数 ==========
 def main():
@@ -390,12 +334,66 @@ def main():
     all_patients = sorted([f.stem.split('_')[0] for f in SEQ_DIR.glob("P*_sequenced.json")])
     first50 = all_patients[:50]
     
-    # 处理全部患者
-    process_subset('all', None, mode)
-    # 处理前50患者
-    process_subset('first50', first50, mode)
+    # ===== 统计阶段（生成两个子集的样本数据）=====
+    if mode in ['full', 'stats_only']:
+        # 全量患者
+        print("\n--- Processing all patients (for metadata) ---")
+        patient_meta_all = collect_patient_metadata(None)
+        patient_meta_all.to_csv(ANALYSIS_DIR / 'patient_metadata_all.csv', index=False)
+        print(f"All patients metadata saved, {len(patient_meta_all)} patients.")
+        
+        # 前50患者
+        print("\n--- Processing first 50 patients (for metadata) ---")
+        patient_meta_50 = collect_patient_metadata(first50)
+        patient_meta_50.to_csv(ANALYSIS_DIR / 'patient_metadata_first50.csv', index=False)
+        print(f"First 50 patients metadata saved, {len(patient_meta_50)} patients.")
+        
+        # 构建全量样本数据（用于所有分析图）
+        print("\n--- Building full samples (all patients) ---")
+        samples_all = build_full_samples(None)
+        if not samples_all.empty:
+            samples_all.to_csv(ANALYSIS_DIR / 'all_samples_all.csv', index=False)
+            print(f"Total full samples: {len(samples_all)}")
+            validate_with_summary(samples_all)
+        else:
+            print("No full samples collected.")
+        
+        # 前50患者样本数据（仅用于验证，不用于主要绘图）
+        print("\n--- Building first50 samples (for verification) ---")
+        samples_50 = build_full_samples(first50)
+        if not samples_50.empty:
+            samples_50.to_csv(ANALYSIS_DIR / 'all_samples_first50.csv', index=False)
+            print(f"Total first50 samples: {len(samples_50)}")
+        else:
+            print("No first50 samples collected.")
+        
+        if mode == 'stats_only':
+            print("\nStatistics completed. Exiting.")
+            return
     
-    print(f"\nAll done. Results saved to {ANALYSIS_DIR}")
+    # ===== 绘图阶段 =====
+    if mode in ['full', 'plot_only']:
+        samples_all_file = ANALYSIS_DIR / 'all_samples_all.csv'
+        if not samples_all_file.exists():
+            print(f"Error: Full samples file not found: {samples_all_file}")
+            return
+        samples_all = pd.read_csv(samples_all_file)
+        
+        plot_model_performance_bar(samples_all)
+        plot_option_complexity(samples_all)
+        plot_sorting_difficulty_reduction(samples_all)
+        
+        # 绘制患者住院次数分布图
+        patient_meta_all_file = ANALYSIS_DIR / 'patient_metadata_all.csv'
+        patient_meta_50_file = ANALYSIS_DIR / 'patient_metadata_first50.csv'
+        if patient_meta_all_file.exists():
+            patient_all = pd.read_csv(patient_meta_all_file)
+            plot_patient_visits_distribution(patient_all, '_all')
+        if patient_meta_50_file.exists():
+            patient_50 = pd.read_csv(patient_meta_50_file)
+            plot_patient_visits_distribution(patient_50, '_first50')
+        
+        print(f"\nAll plots saved to {ANALYSIS_DIR}")
 
 if __name__ == "__main__":
     main()
