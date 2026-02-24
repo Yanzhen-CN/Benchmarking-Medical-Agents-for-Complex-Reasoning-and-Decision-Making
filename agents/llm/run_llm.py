@@ -21,8 +21,8 @@ from util.hulu import TransformersLLMUtil                 # teammate's class
 # User configuration – modify these as needed
 # ------------------------------------------------------------
 MODEL_PATH = "/data/xzh/Hulu-Med-7B"          # path to your Hulu-Med model
-TASKS = ["trajectory_sorting", "visit_cloze"] # tasks to run
-DEMO_N = 10                                   # number of patients per task (None for all)
+TASKS = ["trajectory_sorting", "visit_cloze", "visit_sorting"] # tasks to run
+DEMO_N = 50                                   # number of patients per task (None for all)
 SPECIFIC_PATIENTS = None                       # list of patient IDs, e.g. ["P001", "P002"], None for all
 SPECIFIC_ITEMS = None                          # fine‑grained item control, see example below
 ENABLE_THINKING = False                        # whether to enable thinking mode
