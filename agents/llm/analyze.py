@@ -236,7 +236,7 @@ def plot_model_performance_bar(samples_df):
     plt.title('Model Performance on LongMedBench Tasks')
     plt.ylabel("Kendall's τ")
     plt.ylim(0, 1)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='best')
     plt.tight_layout()
     plt.savefig(ANALYSIS_DIR / 'model_performance_all.png', dpi=300)
     plt.close()
@@ -265,7 +265,7 @@ def plot_option_complexity(samples_df):
     plt.title('Model Performance vs. Number of Options (visit_cloze)')
     plt.xticks(rotation=45)
     plt.ylim(0, 1)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.legend(loc='upper right', frameon=True)  # 放在右上角内侧，带边框
     plt.tight_layout()
     plt.savefig(ANALYSIS_DIR / 'option_complexity_all.png', dpi=300)
     plt.close()
@@ -286,7 +286,7 @@ def plot_sorting_difficulty_reduction(samples_df, subset_name=None):
     # 去重图例
     handles, labels = plt.gca().get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.05, 1))
+    plt.legend(by_label.values(), by_label.keys(), loc='best', framealpha=0.5, frameon=True)
     
     plt.xlabel('Task')
     plt.ylabel("Kendall's τ")
@@ -379,8 +379,8 @@ def main():
             return
         samples_all = pd.read_csv(samples_all_file)
         
-        plot_model_performance_bar(samples_all)
-        plot_option_complexity(samples_all)
+        # plot_model_performance_bar(samples_all)
+        # plot_option_complexity(samples_all)
         plot_sorting_difficulty_reduction(samples_all)
         
         # 绘制患者住院次数分布图
