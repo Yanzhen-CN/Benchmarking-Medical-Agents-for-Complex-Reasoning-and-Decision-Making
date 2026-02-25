@@ -1,175 +1,371 @@
 import os
 import json
 import glob
+import yaml
+import dotenv
 import time
 import random
 import threading
-import sys
 from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from openai import OpenAI
 
-# ------------------------------------------------------------
-# Add root directory to path to import util.hulu
-# ------------------------------------------------------------
-ROOT_DIR = Path(__file__).resolve().parents[2]          # script in agents/llm/, up two levels to project root
-sys.path.insert(0, str(ROOT_DIR))
-from util.hulu import TransformersLLMUtil                 # teammate's class
+ROOT_DIR = Path(__file__).resolve().parents[2]
+dotenv.load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-# ------------------------------------------------------------
-# User configuration – modify these as needed
-# ------------------------------------------------------------
-MODEL_PATH = "/data/xzh/Hulu-Med-7B"          # path to your Hulu-Med model
-TASKS = ["trajectory_sorting", "visit_cloze", "visit_sorting"] # tasks to run
-DEMO_N = 50                                   # number of patients per task (None for all)
-SPECIFIC_PATIENTS = None                       # list of patient IDs, e.g. ["P001", "P002"], None for all
-SPECIFIC_ITEMS = None                          # fine‑grained item control, see example below
-ENABLE_THINKING = False                        # whether to enable thinking mode
-TEMPERATURE = 0.1                              # generation temperature
-MAX_TOKENS = 512                               # max new tokens
-MAX_WORKERS = 1                                 # threads (local model should use 1)
-RESUME_FAILED = False                           # whether to retry previously failed items
-
-# Example of SPECIFIC_ITEMS:
-# [
-#     {"patient": "P001", "ids": ["id1", "id2"]},   # only these two items for P001
-#     {"patient": "P002"}                            # all items for P002
-# ]
-
-# ------------------------------------------------------------
-# Global model instance (singleton)
-# ------------------------------------------------------------
-_model_instance = None
-_model_lock = threading.Lock()
-
-def get_model():
-    """Thread‑safe singleton model loader."""
-    global _model_instance
-    if _model_instance is None:
-        with _model_lock:
-            if _model_instance is None:
-                print(f"🚀 Loading Hulu-Med model from {MODEL_PATH}...")
-                _model_instance = TransformersLLMUtil(
-                    model_name_or_path=MODEL_PATH,
-                    dtype="bfloat16",                # adjust if needed
-                    attn_implementation="eager",      # use "flash_attention_2" if installed
-                    trust_remote_code=True,
-                    add_system_prompt=True,
-                )
-                print("✅ Model loaded.")
-    return _model_instance
-
-# ------------------------------------------------------------
-# Configuration (kept for structural similarity with run_llm.py)
-# ------------------------------------------------------------
-CONFIG_PATH = Path(__file__).resolve().parent / "run_config.yaml"   # not actually used
+CONFIG_PATH = Path(__file__).resolve().parent / "run_config.yaml"
 
 def load_config(config_path):
-    """Return a hard‑coded configuration instead of reading from file."""
-    # These values override the ones defined above; they are kept for compatibility
-    return {
-        "models": ["HULU_THINKING" if ENABLE_THINKING else "HULU"],
-        "tasks": TASKS,
-        "demo_n": DEMO_N,
-        "max_workers": MAX_WORKERS,
-        "specific_patients": SPECIFIC_PATIENTS,
-        "specific_items": SPECIFIC_ITEMS,
-        "resume_failed": RESUME_FAILED,
+    default = {
+        "models": ["QWEN_TURBO"],
+        "tasks": ["trajectory_sorting", "visit_cloze"],
+        "demo_n": None,
+        "max_workers": 10,
+        "specific_patients": None,
+        "resume_failed": False
     }
+    if config_path.exists():
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f)
+        for k in default:
+            cfg.setdefault(k, default[k])
+        return cfg
+    print(f"⚠️ Config file not found: {config_path}. Using default settings.")
+    return default
 
-# ------------------------------------------------------------
-# Task execution function (local model version)
-# ------------------------------------------------------------
-def call_hulu_task(task_item, enable_thinking, max_retries=5):
-    """
-    Call the local Hulu-Med model.
-    Returns a result dict with the same structure as in run_llm.py.
-    """
-    model = get_model()   # get the singleton instance
-
+def call_llm_task(task_item, model_config, max_retries=5):
     for attempt in range(max_retries):
         try:
-            # Record token usage before call (cumulative)
-            usage_before = model.get_token_usage()
-            prompt_before = usage_before["prompt_tokens"]
-            completion_before = usage_before["completion_tokens"]
-
-            # Invoke the model
-            response = model.chat(
-                messages=task_item['messages'],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-                enable_thinking=enable_thinking,
+            client = OpenAI(
+                api_key=model_config['api_key'],
+                base_url=model_config['base_url']
             )
+            env_model_id_key = f"{model_config['env_prefix']}_MODEL_ID"
+            model_id = os.getenv(env_model_id_key, model_config['default_model_id'])
 
-            # Record after call
-            usage_after = model.get_token_usage()
-            delta_usage = {
-                "prompt_tokens": usage_after["prompt_tokens"] - prompt_before,
-                "completion_tokens": usage_after["completion_tokens"] - completion_before,
-                "total_tokens": (usage_after["prompt_tokens"] + usage_after["completion_tokens"]) -
-                                (prompt_before + completion_before)
-            }
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=task_item['messages'],
+                temperature=0.1,
+                **model_config.get('params', {})
+            )
+            response = completion.choices[0].message.content
+            usage = completion.usage
 
             result = {
                 "status": "success",
-                "llm_label": "hulu-med",                     # fixed label for output directory
+                "llm_label": model_config['label'],
                 "task_type": task_item['task_type'],
                 "pid": task_item['pid'],
                 "id": task_item['id'],
                 "prediction": response,
-                "ground_truth": task_item['ground_truth'],
-                "usage": delta_usage,
+                "ground_truth": task_item['ground_truth']
             }
+            if usage:
+                result["usage"] = {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens
+                }
+            else:
+                result["usage"] = None
             return result
-
         except Exception as e:
-            # Simple exponential backoff
-            wait_time = (2 ** attempt) + random.uniform(0, 1)
-            print(f"⚠️ Error on attempt {attempt+1}/{max_retries}: {e}. Retrying in {wait_time:.2f}s")
-            time.sleep(wait_time)
+            status_code = None
+            if hasattr(e, 'status_code'):
+                status_code = e.status_code
+            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                status_code = e.response.status_code
+            elif hasattr(e, 'http_status'):
+                status_code = e.http_status
 
-    # All retries exhausted
+            if status_code == 429:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"⚠️ Rate limit hit for {model_config['label']}, retrying in {wait_time:.2f}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                return {
+                    "status": "error",
+                    "llm_label": model_config['label'],
+                    "task_type": task_item['task_type'],
+                    "pid": task_item['pid'],
+                    "id": task_item['id'],
+                    "ground_truth": task_item['ground_truth'],
+                    "error": str(e)
+                }
     return {
         "status": "error",
-        "llm_label": "hulu-med",
+        "llm_label": model_config['label'],
         "task_type": task_item['task_type'],
         "pid": task_item['pid'],
         "id": task_item['id'],
         "ground_truth": task_item['ground_truth'],
-        "error": "Max retries exceeded."
+        "error": "Max retries exceeded due to rate limit."
     }
 
-# ------------------------------------------------------------
-# Resume failed items (simplified stub, not implemented)
-# ------------------------------------------------------------
 def run_resume_failed(config):
-    """Stub for resume functionality – not implemented in this local version."""
-    print("⚠️ resume_failed is not supported in this local script. Exiting.")
-    return
+    """根据失败日志重新运行失败的任务（修复了模型过滤的 bug）"""
+    from collections import defaultdict
+    import threading
+    import os
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
-def main():
-    config = load_config(CONFIG_PATH)          # now returns the hard‑coded configuration
+    # ---------- 1. 解析重跑配置 ----------
+    resume_cfg = config["resume_failed"]
+    if isinstance(resume_cfg, dict):
+        enabled = resume_cfg.get("enabled", True)
+        model_filter = resume_cfg.get("model_filter")
+        task_filter = resume_cfg.get("task_filter")
+    else:
+        enabled = bool(resume_cfg)
+        model_filter = None
+        task_filter = None
 
-    # ---------- Decide mode (normal or resume) ----------
-    if config.get("resume_failed"):
-        run_resume_failed(config)
+    if not enabled:
+        print("⚠️ resume_failed is not enabled, but function called.")
         return
 
-    # ---------- Extract settings ----------
-    raw_models = config["models"]               # e.g. ["HULU"] or ["HULU_THINKING"]
+    # ---------- 2. 读取失败记录 ----------
+    failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
+    if not os.path.isdir(failed_dir):
+        print(f"❌ Failed directory not found: {failed_dir}")
+        return
+
+    failed_files = glob.glob(os.path.join(failed_dir, "*_failed_summary.json"))
+    if not failed_files:
+        print("❌ No failed summary files found.")
+        return
+
+    failed_items = []  # (model_label, task, pid, id)
+    for ff in failed_files:
+        with open(ff, 'r', encoding='utf-8') as f:
+            failures = json.load(f)
+        basename = os.path.basename(ff).replace("_failed_summary.json", "")
+        parts = basename.split("_", 1)
+        if len(parts) != 2:
+            print(f"⚠️ Skipping file with unexpected name: {ff}")
+            continue
+        model_label, task = parts
+        for fail in failures:
+            pid = fail.get("pid")
+            item_id = fail.get("id")
+            if pid and item_id:
+                failed_items.append((model_label, task, pid, item_id))
+
+    print(f"📦 Total failed items to retry: {len(failed_items)}")
+
+    # ---------- 3. 构建有效模型配置 ----------
+    raw_models = config["models"]
+    model_list = []
+    for m in raw_models:
+        if m.endswith("_THINKING"):
+            base_name = m[:-9]
+            model_list.append({"name": m, "env_name": base_name, "params": {"extra_body": {"enable_thinking": True}}})
+        else:
+            model_list.append({"name": m, "env_name": m, "params": {}})
+
+    model_configs = {}
+    label_to_name = {}
+    name_to_label = {}                     # 反向映射：原始名 -> 标签
+    for m in model_list:
+        name = m["name"]
+        env_name = m["env_name"]
+        params = m["params"]
+        api_key = os.getenv(f"{env_name}_API_KEY")
+        base_url = os.getenv(f"{env_name}_BASE_URL")
+        if not api_key:
+            continue
+        label = name.lower().replace("_", "-")
+        default_model_id = env_name.lower().replace("_", "-")
+        model_configs[name] = {
+            "name": name,
+            "label": label,
+            "default_model_id": default_model_id,
+            "api_key": api_key,
+            "base_url": base_url,
+            "params": params,
+            "env_prefix": env_name
+        }
+        label_to_name[label] = name
+        name_to_label[name] = label
+
+    # ---------- 4. 构建重跑任务列表 ----------
+    tasks_to_run = []
+    file_cache = {}          # key: (task, pid) -> list of items
+    file_cache_lock = threading.Lock()
+
+    for model_label, task, pid, item_id in failed_items:
+        # 应用过滤器（使用原始模型名转换后的标签）
+        if model_filter:
+            # 将 model_filter 中的原始模型名转换为标签
+            filter_labels = [name_to_label.get(m, m) for m in model_filter]
+            if model_label not in filter_labels:
+                continue
+        if task_filter and task not in task_filter:
+            continue
+        model_name = label_to_name.get(model_label)
+        if not model_name:
+            print(f"⚠️ Unknown model label: {model_label}, skipping.")
+            continue
+
+        cache_key = (task, pid)
+        with file_cache_lock:
+            if cache_key not in file_cache:
+                input_path = os.path.join(ROOT_DIR, "context_data", task, f"{pid}.jsonl")
+                if not os.path.exists(input_path):
+                    print(f"⚠️ Original data file not found: {input_path}, skipping {pid} {item_id}")
+                    continue
+                items = []
+                with open(input_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip():
+                            items.append(json.loads(line))
+                file_cache[cache_key] = items
+            else:
+                items = file_cache[cache_key]
+
+        target_item = next((it for it in items if it["id"] == item_id), None)
+        if not target_item:
+            print(f"⚠️ Item id {item_id} not found in {task}/{pid}.jsonl, skipping.")
+            continue
+
+        tasks_to_run.append({
+            "task_type": task,
+            "pid": pid,
+            "id": item_id,
+            "messages": target_item["messages"],
+            "ground_truth": target_item["ground_truth"],
+            "llm_name": model_name
+        })
+
+    print(f"🚀 Retrying {len(tasks_to_run)} tasks after filtering.")
+
+    if not tasks_to_run:
+        print("No tasks to run.")
+        return
+
+    # ---------- 5. 并发执行，实时更新输出文件 ----------
+    file_write_locks = defaultdict(threading.Lock)
+    token_usage = defaultdict(lambda: defaultdict(lambda: {"prompt": 0, "completion": 0, "total": 0}))
+    new_failures = defaultdict(list)
+
+    run_dir = os.path.join(ROOT_DIR, "run_llm")
+
+    with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
+        future_map = {
+            executor.submit(call_llm_task, t, model_configs[t['llm_name']]): t
+            for t in tasks_to_run
+        }
+
+        for future in tqdm(as_completed(future_map), total=len(tasks_to_run), desc="Retrying Failed Tasks"):
+            res = future.result()
+            if res['status'] == 'success':
+                if res.get('usage'):
+                    model = res['llm_label']
+                    task = res['task_type']
+                    token_usage[model][task]["prompt"] += res['usage']['prompt_tokens']
+                    token_usage[model][task]["completion"] += res['usage']['completion_tokens']
+                    token_usage[model][task]["total"] += res['usage']['total_tokens']
+
+                task = res['task_type']
+                model_label = res['llm_label']
+                pid = res['pid']
+                out_dir = os.path.join(run_dir, task, model_label)
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"{pid}.jsonl")
+
+                new_entry = {
+                    "id": res['id'],
+                    "prediction": res['prediction'],
+                    "ground_truth": res['ground_truth']
+                }
+
+                with file_write_locks[out_path]:
+                    existing = {}
+                    if os.path.exists(out_path):
+                        with open(out_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                if line.strip():
+                                    item = json.loads(line)
+                                    existing[item["id"]] = item
+                    existing[res['id']] = new_entry
+                    sorted_items = sorted(existing.values(), key=lambda x: x['id'])
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        for item in sorted_items:
+                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            else:
+                model_label = res['llm_label']
+                task = res['task_type']
+                new_failures[(model_label, task)].append({
+                    "pid": res['pid'],
+                    "id": res['id'],
+                    "error": res['error']
+                })
+
+    # ---------- 6. 保存 token 使用情况 ----------
+    stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
+    os.makedirs(stats_dir, exist_ok=True)
+    for model, tasks in token_usage.items():
+        for task, tokens in tasks.items():
+            safe_model = model.replace("/", "_")
+            safe_task = task.replace("/", "_")
+            filename = f"{safe_model}_{safe_task}_usage_retry.json"
+            filepath = os.path.join(stats_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "model": model,
+                    "task": task,
+                    "prompt_tokens": tokens["prompt"],
+                    "completion_tokens": tokens["completion"],
+                    "total_tokens": tokens["total"]
+                }, f, indent=2)
+            print(f"📊 Token usage (retry) saved: {filepath}")
+
+    # ---------- 7. 保存新的失败记录 ----------
+    retry_failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed_retry")
+    os.makedirs(retry_failed_dir, exist_ok=True)
+    if new_failures:
+        for (model_label, task), failures in new_failures.items():
+            safe_model = model_label.replace("/", "_")
+            safe_task = task.replace("/", "_")
+            filename = f"{safe_model}_{safe_task}_failed_retry.json"
+            filepath = os.path.join(retry_failed_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(failures, f, indent=2, ensure_ascii=False)
+            print(f"❌ New failures during retry: {len(failures)} items saved to {filepath}")
+    else:
+        print("✅ All failed tasks retried successfully.")
+
+    print(f"\n✅ Retry done. Updated results in '{run_dir}', token stats in '{stats_dir}', new failures in '{retry_failed_dir}'.")
+
+def main():
+    config = load_config(CONFIG_PATH)
+
+    # ---------- 模式选择 ----------
+    resume_cfg = config.get("resume_failed")
+    if resume_cfg:
+        if isinstance(resume_cfg, dict):
+            enabled = resume_cfg.get("enabled", True)
+        else:
+            enabled = bool(resume_cfg)
+        if enabled:
+            run_resume_failed(config)
+            return
+        # 否则 enabled == False，继续正常模式
+
+    # ---------- 正常模式（支持 specific_items 精确到 ID） ----------
+    raw_models = config["models"]
     task_types = config["tasks"]
     demo_n = config["demo_n"]
     max_workers = config["max_workers"]
     specific_patients = config.get("specific_patients")
-    specific_items = config.get("specific_items")
+    specific_items = config.get("specific_items")  # 新配置，精确到 ID
 
-    # ---------- Build model configuration list ----------
-    # We support only one model; determine whether thinking is enabled.
+    # 处理模型，添加 thinking 参数
     model_list = []
     for m in raw_models:
         if m.endswith("_THINKING"):
@@ -177,27 +373,40 @@ def main():
             model_list.append({
                 "name": m,
                 "env_name": base_name,
-                "enable_thinking": True
+                "params": {"extra_body": {"enable_thinking": True}}
             })
         else:
             model_list.append({
                 "name": m,
                 "env_name": m,
-                "enable_thinking": False
+                "params": {}
             })
 
-    # Convert to the format expected by the rest of the code (similar to run_llm.py)
+    # 构建有效模型配置
     model_configs = {}
     valid_models = []
     for m in model_list:
         name = m["name"]
-        enable_thinking = m["enable_thinking"]
+        env_name = m["env_name"]
+        params = m["params"]
 
-        label = "hulu-med"      # fixed label for output directory
+        api_key = os.getenv(f"{env_name}_API_KEY")
+        base_url = os.getenv(f"{env_name}_BASE_URL")
+        if not api_key:
+            print(f"⚠️ Skipping {name} (env name: {env_name}): API key missing.")
+            continue
+
+        label = name.lower().replace("_", "-")
+        default_model_id = env_name.lower().replace("_", "-")
+
         model_configs[name] = {
             "name": name,
             "label": label,
-            "enable_thinking": enable_thinking,
+            "default_model_id": default_model_id,
+            "api_key": api_key,
+            "base_url": base_url,
+            "params": params,
+            "env_prefix": env_name
         }
         valid_models.append(name)
 
@@ -205,29 +414,33 @@ def main():
         print("❌ No valid models. Exiting.")
         return
 
-    # ---------- Build task list ----------
+    # ---------- 任务构建 ----------
     all_tasks = []
-    expected_counts = defaultdict(int)          # key: (task, model_label, pid) -> number of items
+    expected_counts = defaultdict(int)  # key: (task, model_label, pid) -> number of items
 
-    # Process specific_items if provided
+    # 如果配置了 specific_items，则以此为准（忽略 specific_patients 和 demo_n）
     if specific_items:
-        patient_whitelist = {}
+        # 构建 patient -> allowed_ids 映射
+        patient_id_whitelist = {}
         for item in specific_items:
             pid = item.get("patient")
             if not pid:
-                print(f"⚠️ Skipping specific_items entry without patient: {item}")
+                print(f"⚠️ specific_items 条目缺少 patient 字段，已跳过: {item}")
                 continue
             ids = item.get("ids")
             if ids is None:
-                patient_whitelist[pid] = None          # all items for this patient
+                # 没有 ids 字段，视为处理该患者的所有条目
+                patient_id_whitelist[pid] = None
             elif isinstance(ids, list):
-                patient_whitelist[pid] = set(ids)
+                # 有 ids 列表，转换为 set
+                patient_id_whitelist[pid] = set(ids)
             else:
-                print(f"⚠️ Invalid ids format for patient {pid}, ignoring ids restriction.")
-                patient_whitelist[pid] = None
-        target_patients = set(patient_whitelist.keys())
+                print(f"⚠️ patient {pid} 的 ids 格式不正确，应为列表，将忽略 ids 限制")
+                patient_id_whitelist[pid] = None
+        target_patients = set(patient_id_whitelist.keys())
     else:
-        patient_whitelist = None
+        # 未配置 specific_items，使用原有的筛选逻辑
+        patient_id_whitelist = None
         target_patients = None
 
     for task in task_types:
@@ -238,8 +451,9 @@ def main():
 
         files = sorted(glob.glob(os.path.join(input_dir, "P*.jsonl")))
 
-        # Filter patient files
+        # 根据配置筛选患者文件
         if specific_items:
+            # 只保留在 target_patients 中的文件
             files = [f for f in files if os.path.basename(f).replace(".jsonl", "") in target_patients]
         else:
             if specific_patients:
@@ -259,11 +473,12 @@ def main():
             with open(fpath, 'r', encoding='utf-8') as f:
                 items = [json.loads(line) for line in f if line.strip()]
 
-            # Further filter by specific_items if needed
+            # 如果启用了 specific_items，进一步过滤 items
             if specific_items:
-                allowed_ids = patient_whitelist.get(pid)
-                if allowed_ids is not None:
+                allowed_ids = patient_id_whitelist.get(pid)
+                if allowed_ids is not None:  # 有明确的 ID 限制
                     items = [it for it in items if it["id"] in allowed_ids]
+                # 如果 allowed_ids 为 None，表示该患者所有 ID 都保留
 
             num_items = len(items)
             for model in valid_models:
@@ -279,34 +494,20 @@ def main():
                         "llm_name": model
                     })
 
-    print(f"🚀 Running local Hulu-Med on {len(valid_models)} model, {len(task_types)} tasks.")
+    print(f"🚀 Benchmarking {len(valid_models)} models on {len(task_types)} tasks.")
     print(f"📦 Total requests: {len(all_tasks)}")
 
-    if not all_tasks:
-        print("No tasks to run.")
-        return
-
-    # ---------- Concurrent execution and result saving ----------
+    # ---------- 并发执行与结果保存 ----------
     results = {}
-    token_usage = defaultdict(lambda: defaultdict(lambda: {"prompt": 0, "completion": 0, "total": 0}))
+    token_usage = {}
     completed_counts = defaultdict(int)
     lock = threading.Lock()
     run_dir = os.path.join(ROOT_DIR, "run_llm")
     failed_by_model_task = defaultdict(list)
 
-    # Because the local model is not thread‑safe, we use a lock to serialize calls.
-    # (MAX_WORKERS can be >1 but actual execution will be sequential.)
-    inference_lock = threading.Lock()
-    def wrapped_call(task_item):
-        with inference_lock:
-            return call_hulu_task(
-                task_item,
-                enable_thinking=model_configs[task_item['llm_name']]['enable_thinking']
-            )
-
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(wrapped_call, t): t
+            executor.submit(call_llm_task, t, model_configs[t['llm_name']]): t
             for t in all_tasks
         }
 
@@ -328,6 +529,7 @@ def main():
                     if res.get('usage'):
                         model = res['llm_label']
                         task = res['task_type']
+                        token_usage.setdefault(model, {}).setdefault(task, {"prompt":0, "completion":0, "total":0})
                         token_usage[model][task]["prompt"] += res['usage']['prompt_tokens']
                         token_usage[model][task]["completion"] += res['usage']['completion_tokens']
                         token_usage[model][task]["total"] += res['usage']['total_tokens']
@@ -366,7 +568,7 @@ def main():
                             "ground_truth": entry['ground_truth']
                         }, ensure_ascii=False) + "\n")
 
-    # Write any remaining incomplete results (should not happen normally)
+    # 处理剩余结果（一般不会发生）
     if results:
         print("\n📦 Writing remaining results (incomplete patients)...")
         for (task, model, pid), data in results.items():
@@ -382,13 +584,13 @@ def main():
                         "ground_truth": entry['ground_truth']
                     }, ensure_ascii=False) + "\n")
 
-    # ---------- Token usage summary ----------
+    # 打印 token 使用摘要
     print("\n🔢 Token Usage Summary:")
     for model, tasks in token_usage.items():
         for task, tokens in tasks.items():
             print(f"  {model} | {task}: prompt={tokens['prompt']}, completion={tokens['completion']}, total={tokens['total']}")
 
-    # Save token usage statistics
+    # 保存 token 使用统计
     stats_dir = os.path.join(ROOT_DIR, "agents", "llm", "usage")
     os.makedirs(stats_dir, exist_ok=True)
     for model, tasks in token_usage.items():
@@ -407,7 +609,7 @@ def main():
                 }, f, indent=2)
             print(f"📊 Token usage saved: {filepath}")
 
-    # Save failure logs
+    # 保存失败日志
     failed_dir = os.path.join(ROOT_DIR, "agents", "llm", "failed")
     os.makedirs(failed_dir, exist_ok=True)
     if failed_by_model_task:
