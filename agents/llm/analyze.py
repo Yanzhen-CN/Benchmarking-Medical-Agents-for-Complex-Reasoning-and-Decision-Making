@@ -31,7 +31,7 @@ SCORE_DIR = PROJECT_ROOT / "score_data"
 ANALYSIS_DIR = PROJECT_ROOT / "analysis_data"
 ANALYSIS_DIR.mkdir(exist_ok=True)
 
-TASKS = ['trajectory_sorting', 'visit_cloze', 'visit_sorting']
+TASKS = ['joint_sorting', 'visit_cloze', 'visit_sorting']
 MODELS = ['deepseek-v3.2', 'gpt-5-mini', 'deepseek-v3.2-thinking', 'qwen-turbo']
 
 sns.set_theme(style="whitegrid")
@@ -271,7 +271,7 @@ def plot_option_complexity(samples_df):
     plt.close()
 
 def plot_sorting_difficulty_reduction(samples_df, subset_name=None):
-    df = samples_df[samples_df['task'].isin(['trajectory_sorting', 'visit_sorting'])].copy()
+    df = samples_df[samples_df['task'].isin(['joint_sorting', 'visit_sorting'])].copy()
     if df.empty:
         return
     
