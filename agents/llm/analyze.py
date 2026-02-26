@@ -291,7 +291,7 @@ def plot_sorting_difficulty_comparison(samples_df, subset_name=None):
     plt.xlabel('Task')
     plt.ylabel("Kendall's τ")
     plt.ylim(-1, 1)
-    title = 'Difficulty Increase: Visit Sorting vs. Joint Sorting Version'
+    title = 'Difficulty Increase: Visit Sorting vs. Joint Sorting'
     if subset_name == 'first50':
         title += ' (First 50 Patients)'
     plt.title(title)
