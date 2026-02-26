@@ -19,7 +19,7 @@ invalid_lock = threading.Lock()
 
 def load_config():
     default = {
-        "tasks": ["trajectory_sorting", "visit_cloze"],
+        "tasks": ["joint_sorting", "visit_cloze"],
         "models": None,
         "metric": "kendall_tau"
     }

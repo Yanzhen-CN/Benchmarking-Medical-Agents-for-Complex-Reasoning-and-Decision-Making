@@ -20,7 +20,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "run_config.yaml"
 def load_config(config_path):
     default = {
         "models": ["QWEN_TURBO"],
-        "tasks": ["trajectory_sorting", "visit_cloze"],
+        "tasks": ["joint_sorting", "visit_cloze"],
         "demo_n": None,
         "max_workers": 10,
         "specific_patients": None,
