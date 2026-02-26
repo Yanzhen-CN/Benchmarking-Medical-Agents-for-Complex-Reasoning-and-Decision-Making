@@ -111,7 +111,7 @@ def generate_jsonl_content(patient_events, patient_id, config=None):
     if total_visits < window_size:
         return []
 
-    # Sliding window over visits (same as trajectory_sorting but window_size applies directly)
+    # Sliding window over visits (same as joint_sorting but window_size applies directly)
     start_indices = list(range(0, total_visits - window_size + 1, stride))
     if not start_indices and total_visits >= window_size:
         start_indices = [0]

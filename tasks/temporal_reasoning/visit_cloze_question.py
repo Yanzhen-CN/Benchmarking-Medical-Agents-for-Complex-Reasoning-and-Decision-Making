@@ -25,7 +25,7 @@ except ImportError:
             self.RANDOM_SEED = 42
             self.MIN_TARGETS_FOR_CLOZE = 4
             self.PATIENTS_SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
-            self.TRAJECTORY_DIR = PROJECT_ROOT / "question_data" / "visit_cloze"
+            self.JOINT_DIR = PROJECT_ROOT / "question_data" / "visit_cloze"
 
 def is_precise_timestamp(ts_str):
     if not ts_str: return False

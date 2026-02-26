@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 MODEL_LABEL = "deepseek-v3.2"
-TASK_TYPES = ["trajectory_sorting", "visit_cloze"]
+TASK_TYPES = ["joint_sorting", "visit_cloze"]
 CONTEXT_DIR = ROOT_DIR / "context_data"
 RUN_DIR = ROOT_DIR / "run_llm"
 OUTPUT_FILE = ROOT_DIR / "agents" / "llm" / "missing_patients.yaml"

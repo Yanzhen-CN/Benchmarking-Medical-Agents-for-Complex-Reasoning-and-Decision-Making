@@ -25,10 +25,10 @@ except ImportError:
     class TimelineGenConfig:
         def __init__(self):
             self.RANDOM_SEED = 42
-            self.TRAJECTORY_WINDOW_SIZE = 5
-            self.TRAJECTORY_STRIDE = 1
+            self.JOINT_WINDOW_SIZE = 5
+            self.JOINT_STRIDE = 1
             self.PATIENTS_SEQ_DIR = PROJECT_ROOT / "bench_data" / "patients_sequence"
-            self.TRAJECTORY_DIR = PROJECT_ROOT / "question_data" / "joint_sorting"
+            self.JOINT_DIR = PROJECT_ROOT / "question_data" / "joint_sorting"
 
 def parse_ts(ts_str):
     if not ts_str: return None
@@ -106,8 +106,8 @@ def extract_split_items(visit_events, visit_ref):
 def generate_jsonl_content(patient_events, patient_id, config=None):
     if config is None: config = TimelineGenConfig()
     
-    window_size = config.TRAJECTORY_WINDOW_SIZE
-    stride = config.TRAJECTORY_STRIDE
+    window_size = config.JOINT_WINDOW_SIZE
+    stride = config.JOINT_STRIDE
 
     visits_map = {}
     for event in patient_events:
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", type=str, default=str(cfg.PATIENTS_SEQ_DIR))
-    parser.add_argument("--output_dir", type=str, default=str(cfg.TRAJECTORY_DIR))
+    parser.add_argument("--output_dir", type=str, default=str(cfg.JOINT_DIR))
     args = parser.parse_args()
 
     print(f"[Config] Seed: {cfg.RANDOM_SEED}")
@@ -231,7 +231,7 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     
     count = 0
-    for fpath in tqdm(files, desc="Trajectory Gen"):
+    for fpath in tqdm(files, desc="JOINT Gen"):
         try:
             pid = os.path.basename(fpath).split('_')[0]
             with open(fpath, 'r', encoding='utf-8') as f_in:

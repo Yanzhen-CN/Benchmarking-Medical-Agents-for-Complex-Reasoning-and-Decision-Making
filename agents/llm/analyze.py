@@ -270,18 +270,18 @@ def plot_option_complexity(samples_df):
     plt.savefig(ANALYSIS_DIR / 'option_complexity_all.png', dpi=300)
     plt.close()
 
-def plot_sorting_difficulty_reduction(samples_df, subset_name=None):
+def plot_sorting_difficulty_comparison(samples_df, subset_name=None):
     df = samples_df[samples_df['task'].isin(['joint_sorting', 'visit_sorting'])].copy()
     if df.empty:
         return
-    
+    order = ['visit_sorting', 'joint_sorting']
     plt.figure(figsize=(10, 6))
     # 小提琴图（半透明）
     sns.violinplot(x='task', y='tau', hue='model', data=df,
-                   inner=None, linewidth=1, palette='Set2', alpha=0.5)
+                   inner=None, linewidth=1, palette='Set2', alpha=0.5, order=order)
     # 散点（使用 stripplot 避免 swarmplot 的避让计算，适合较多数据）
     sns.stripplot(x='task', y='tau', hue='model', data=df,
-                  dodge=True, size=2, palette='Set2', alpha=0.7, jitter=0.2)
+                  dodge=True, size=2, palette='Set2', alpha=0.7, jitter=0.2, order = order)
     
     # 去重图例
     handles, labels = plt.gca().get_legend_handles_labels()
@@ -291,12 +291,12 @@ def plot_sorting_difficulty_reduction(samples_df, subset_name=None):
     plt.xlabel('Task')
     plt.ylabel("Kendall's τ")
     plt.ylim(-1, 1)
-    title = 'Difficulty Reduction: Trajectory Sorting vs. Simplified Version'
+    title = 'Difficulty Increase: Visit Sorting vs. Joint Sorting Version'
     if subset_name == 'first50':
         title += ' (First 50 Patients)'
     plt.title(title)
     plt.tight_layout()
-    plt.savefig(ANALYSIS_DIR / f'sorting_reduction_{subset_name or "all"}.png', dpi=300, bbox_inches='tight')
+    plt.savefig(ANALYSIS_DIR / f'sorting_comparison_{subset_name or "all"}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def plot_patient_visits_distribution(patient_df, suffix):
@@ -379,9 +379,9 @@ def main():
             return
         samples_all = pd.read_csv(samples_all_file)
         
-        # plot_model_performance_bar(samples_all)
-        # plot_option_complexity(samples_all)
-        plot_sorting_difficulty_reduction(samples_all)
+        plot_model_performance_bar(samples_all)
+        plot_option_complexity(samples_all)
+        plot_sorting_difficulty_comparison(samples_all)
         
         # 绘制患者住院次数分布图
         patient_meta_all_file = ANALYSIS_DIR / 'patient_metadata_all.csv'

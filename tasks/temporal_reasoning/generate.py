@@ -32,7 +32,7 @@ def run_script(script_name: str, description: str = ""):
         print(f"=== Finished: {description or script_name} ===\n")
 
 if __name__ == "__main__":
-    # 1. Trajectory sorting task
+    # 1. joint sorting task
     run_script("joint_sorting_question.py", description="Generate joint sorting questions")
     run_script("joint_sorting_context.py",   description="Generate joint sorting context")
 

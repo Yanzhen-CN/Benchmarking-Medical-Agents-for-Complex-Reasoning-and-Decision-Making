@@ -205,14 +205,14 @@ class TimelineGenConfig:
         # --- 输出路径 ---
         self.TASK_ROOT: Path = Path("./question_data")
         self.MICRO_CLOZE_DIR: Path = self.TASK_ROOT / "visit_cloze"
-        self.TRAJECTORY_DIR: Path = self.TASK_ROOT / "trajectory_sorting"
+        self.JOINT_DIR: Path = self.TASK_ROOT / "joint_sorting"
         # 新增 visit_sorting 目录
         self.VISIT_SORTING_DIR: Path = self.TASK_ROOT / "visit_sorting"
 
         # --- 参数配置 ---
         self.RANDOM_SEED: int = int(os.getenv("TIMELINE_SEED", "42"))
 
-        # 排序任务通用窗口大小（用于 trajectory_sorting 和 visit_sorting）
+        # 排序任务通用窗口大小（用于 joint_sorting 和 visit_sorting）
         self.SORTING_WINDOW_SIZE: int = int(os.getenv("SORTING_WINDOW", "5"))
         # 步长
         self.SORTING_STRIDE: int = int(os.getenv("SORTING_STRIDE", "1"))
